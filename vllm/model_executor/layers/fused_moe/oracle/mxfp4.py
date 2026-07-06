@@ -648,6 +648,23 @@ def select_deepseek_v4_mxfp4_moe_backend(
             else:
                 logger.debug_once(_make_log_unsupported(backend, reason), scope="local")
 
+    # VLLM_BATCH_INVARIANT fallback: when batch invariance is requested and
+    # no priority backend supports it, try the EMULATION backend which inherits
+    # TritonExperts._supports_batch_invariance() == True.
+    if envs.VLLM_BATCH_INVARIANT:
+        emu_backend = Mxfp4MoeBackend.EMULATION
+        for k_cls in backend_to_kernel_cls(emu_backend):
+            supported, reason = k_cls.is_supported_config(
+                k_cls, config, kMxfp4Static,
+                _backend_activation_key(emu_backend), activation_format
+            )
+            if supported:
+                logger.info(
+                    "VLLM_BATCH_INVARIANT: falling back to EMULATION backend "
+                    "for batch-invariant MXFP4 MoE inference."
+                )
+                return emu_backend, k_cls
+
     raise NotImplementedError(
         "No MXFP4 MoE backend supports the deployment configuration."
     )
@@ -1517,6 +1534,17 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         )
     elif mxfp4_backend == Mxfp4MoeBackend.XPU:
         # No additional transformation needed for XPU backend
+        return (
+            w13_weight,
+            w2_weight,
+            w13_weight_scale,
+            w2_weight_scale,
+            w13_bias,
+            w2_bias,
+        )
+    elif mxfp4_backend == Mxfp4MoeBackend.EMULATION:
+        # No additional transformation needed for emulation backend,
+        # weights are dequantized on the fly in the experts class.
         return (
             w13_weight,
             w2_weight,
