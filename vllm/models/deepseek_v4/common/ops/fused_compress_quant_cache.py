@@ -67,6 +67,17 @@ def compress_norm_rope_store_triton(
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
 
+    # SM90+ can emit tl.float8e4nv (E4M3, bias 7, max 448). SM80 Triton only has
+    # tl.float8e4b15 (E4M3, bias 15) whose max magnitude is ~1.75 and whose
+    # fp16->e4b15 downcast hard-clamps the input at 1.5. Scaling values into the
+    # 448 range (correct for e4nv) would saturate almost every element on SM80,
+    # so the e4b15 path must normalize into e4b15's own range instead. 1.0 sits
+    # safely below the 1.5 clamp while preserving full 3-bit mantissa precision
+    # (relative precision is scale-invariant); the per-block ue8m0/fp32 scale
+    # absorbs the different magnitude, so store/read stay self-consistent.
+    use_e4nv = torch.cuda.get_device_capability()[0] >= 9
+    fp8_max = 448.0 if use_e4nv else 1.0
+
     kernel[(num_actual,)](
         # state cache
         state_cache,
@@ -96,12 +107,12 @@ def compress_norm_rope_store_triton(
         COMPRESS_RATIO=compress_ratio,
         OVERLAP=overlap,
         ROPE_HEAD_DIM=rope_head_dim,
-        FP8_MAX=448.0,
+        FP8_MAX=fp8_max,
         QUANT_BLOCK=quant_block,
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
-        USE_FP8E4NV=torch.cuda.get_device_capability()[0] >= 9,
+        USE_FP8E4NV=use_e4nv,
         num_warps=num_warps,
         **pdl_kwargs,
     )

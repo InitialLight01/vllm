@@ -413,7 +413,12 @@ class DeepseekCompressor(nn.Module):
             _fp8_dim = self.nope_head_dim if self.head_dim == 512 else self.head_dim
             requantize_kv_cache_fp8e4nv(
                 kv_cache=kv_cache,
-                slot_mapping=slot_mapping,
+                # The kernel writes the KV cache at k_cache_metadata.slot_mapping
+                # (addressed with the KV-cache block size), NOT the state-cache
+                # slot_mapping used above (state pages have block_size 4/8). The
+                # requantize pass re-derives byte offsets from the KV-cache block
+                # size, so it must use the same KV-cache slot mapping.
+                slot_mapping=k_cache_metadata.slot_mapping,
                 token_stride=self._token_stride,
                 scale_dim=self._scale_dim,
                 fp8_dim=_fp8_dim,

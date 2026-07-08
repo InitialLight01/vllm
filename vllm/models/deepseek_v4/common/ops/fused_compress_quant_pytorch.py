@@ -16,22 +16,27 @@ _FP8_MAX = 448.0  # clamping value used by the kernel (safe upper bound)
 def _decode_fp8e4b15(uint8_bytes: torch.Tensor) -> torch.Tensor:
     """Decode fp8e4b15 uint8 bytes to float32 values.
 
-    fp8e4b15 is E4M3 format where exp=15 (1111) encodes large normal
-    values (unlike fp8e4nv where exp=15 is NaN). Exponent bias = 7.
+    fp8e4b15 is a variant of E4M3 that Triton emits on SM80 (no native
+    float8e4nv). It differs from float8e4nv only in the exponent bias: the
+    bias is **15** (not 7), and the codes 0x7f/0xff map to +-1.75 rather than
+    +-NaN (see triton.language.extra.cuda.utils). The compress kernel
+    normalizes values into e4b15's small range (max magnitude <= 1.0) before
+    storing, so the 0x7f/0xff special case is never produced and the standard
+    normal / subnormal formulae below reproduce the stored value exactly.
     """
     sign = (uint8_bytes >> 7) & 1
     exp = (uint8_bytes >> 3) & 0xF
     man = uint8_bytes & 0x7
 
     is_normal = exp > 0
-    # Normal: (-1)^s * 2^(e-7) * (1 + m/8)
+    # Normal: (-1)^s * 2^(e-15) * (1 + m/8)
     normal_val = (
         ((-1.0) ** sign.float())
-        * (2.0 ** (exp.float() - 7.0))
+        * (2.0 ** (exp.float() - 15.0))
         * (1.0 + man.float() / 8.0)
     )
-    # Subnormal: (-1)^s * 2^(-6) * (m/8)
-    subnormal_val = ((-1.0) ** sign.float()) * (2.0 ** (-6.0)) * (man.float() / 8.0)
+    # Subnormal (exp==0): (-1)^s * 2^(1-15) * (m/8) = 2^-14 * (m/8)
+    subnormal_val = ((-1.0) ** sign.float()) * (2.0 ** (-14.0)) * (man.float() / 8.0)
 
     return torch.where(is_normal, normal_val, subnormal_val)
 
