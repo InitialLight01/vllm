@@ -135,6 +135,80 @@ def _fused_inv_rope_fp8_quant_per_head(
         tl.store(scale_addrs, scales)
 
 
+def _fused_inv_rope_fp8_quant_pytorch(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    quant_group_size: int,
+    tma_aligned_T: int,
+    fp8_max: float,
+    d: int,
+    scale_inner: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure PyTorch fallback for SM80 where Triton fp8e4nv dtype is unsupported.
+
+    Performs inverse RoPE + block-wise FP8 quantization using PyTorch ops
+    instead of Triton. Produces identical output to the Triton kernel path.
+    """
+    num_tokens, num_heads, head_dim = o.shape
+    half_rope = rope_dim // 2
+    chunks_per_head = head_dim // quant_group_size
+    rope_abs_start = nope_dim
+
+    # --- Step 1: Inverse RoPE on the last rope_dim dimensions ---
+    x = o.float()  # [T, H, D]
+
+    # Fetch cos/sin for each token position
+    cos_sin = cos_sin_cache[positions.long()]  # [T, rope_dim]
+    cos_t = cos_sin[:, :half_rope]             # [T, half_rope]
+    sin_t = cos_sin[:, half_rope:]             # [T, half_rope]
+
+    # Apply inverse RoPE: rotate each pair (a, b) -> (a*cos+b*sin, b*cos-a*sin)
+    rope_region = x[:, :, rope_abs_start:rope_abs_start + rope_dim]  # [T, H, rope_dim]
+    rope_pairs = rope_region.reshape(num_tokens, num_heads, half_rope, 2)
+    a = rope_pairs[..., 0]  # [T, H, half_rope]
+    b = rope_pairs[..., 1]  # [T, H, half_rope]
+
+    cos_exp = cos_t[:, None, :]  # [T, 1, half_rope]
+    sin_exp = sin_t[:, None, :]  # [T, 1, half_rope]
+
+    a_rot = a * cos_exp + b * sin_exp
+    b_rot = b * cos_exp - a * sin_exp
+
+    rotated = torch.stack([a_rot, b_rot], dim=-1).reshape(num_tokens, num_heads, rope_dim)
+    x[:, :, rope_abs_start:rope_abs_start + rope_dim] = rotated
+
+    # --- Step 2: Block-wise absmax FP8 quantization ---
+    x_blocks = x.reshape(num_tokens, num_heads, chunks_per_head, quant_group_size)
+    block_absmax = torch.amax(torch.abs(x_blocks), dim=-1, keepdim=True)
+    block_absmax = torch.clamp(block_absmax, min=1e-10)
+
+    scale_raw = block_absmax / fp8_max
+    scales = torch.exp2(torch.ceil(torch.log2(scale_raw)))  # [T, H, chunks, 1]
+
+    x_quant = x_blocks / scales
+    x_quant = torch.clamp(x_quant, -fp8_max, fp8_max)
+    x_fp8 = x_quant.to(torch.float8_e4m3fn)
+
+    # --- Step 3: Reshape to [T, G, D] ---
+    x_flat = x_fp8.reshape(num_tokens, num_heads, head_dim)
+    x_grouped = x_flat.reshape(num_tokens, n_groups, heads_per_group * head_dim)
+    o_fp8 = x_grouped  # [T, G, D] = [T, G, d]
+
+    # --- Step 4: Reshape scales to [T, G, scale_inner] ---
+    scales_sq = scales.squeeze(-1)                    # [T, H, chunks]
+    scales_grouped = scales_sq.reshape(
+        num_tokens, n_groups, heads_per_group * chunks_per_head
+    )                                                  # [T, G, num_scale_blocks]
+    o_scale = scales_grouped                           # [T, G, scale_inner]
+
+    return o_fp8, o_scale
+
+
 def fused_inv_rope_fp8_quant(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -188,6 +262,26 @@ def fused_inv_rope_fp8_quant(
         scale_inner = packed_sf_k
     else:
         scale_inner = num_scale_blocks
+
+    # SM80 (Ampere) Triton does not support fp8e4nv dtype; use PyTorch fallback.
+    cap = torch.cuda.get_device_capability()
+    use_pytorch_fallback = cap[0] < 9 and not tma_aligned_scales
+
+    if use_pytorch_fallback:
+        return _fused_inv_rope_fp8_quant_pytorch(
+            o=o,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            n_groups=n_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            quant_group_size=quant_group_size,
+            tma_aligned_T=tma_aligned_T,
+            fp8_max=fp8_max,
+            d=d,
+            scale_inner=scale_inner,
+        )
 
     # Run kernel through a custom op so inductor sees an opaque boundary.
     # It's a pytorch bug, see https://github.com/vllm-project/vllm/issues/41106

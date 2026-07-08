@@ -86,7 +86,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         return deep_gemm_fp8_o_proj(
             o,
             positions,
-            self.rotary_emb.cos_sin_cache,
+            self.rotary_emb,
             self.wo_a,
             self.wo_b,
             n_groups=self.n_local_groups,

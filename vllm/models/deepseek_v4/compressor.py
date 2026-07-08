@@ -15,6 +15,9 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
 )
+from vllm.models.deepseek_v4.common.ops.fused_compress_quant_pytorch import (
+    requantize_kv_cache_fp8e4nv,
+)
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
@@ -353,7 +356,11 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        # SM80 (compute capability < 9) has no CUTLASS DSL support, so route
+        # head_dim==512 through the Triton launcher (sparse kernel branch) and
+        # requantize fp8e4b15 -> fp8e4nv afterwards.
+        is_sm80 = torch.cuda.get_device_capability()[0] < 9
+        if current_platform.is_cuda() and self.head_dim == 512 and not is_sm80:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
@@ -397,3 +404,20 @@ class DeepseekCompressor(nn.Module):
             scale_dim=self._scale_dim,
             **extra_kwargs,
         )
+
+        # SM80: the Triton kernel emitted fp8e4b15 bytes (USE_FP8E4NV=False)
+        # because Triton lacks fp8e4nv on that arch. Convert them to fp8e4nv
+        # in-place. The MXFP4 cache path stores fp4 (not fp8e4b15) and is
+        # already rejected on SM80, so skip requantization there.
+        if is_sm80 and not self.use_fp4_cache:
+            _fp8_dim = self.nope_head_dim if self.head_dim == 512 else self.head_dim
+            requantize_kv_cache_fp8e4nv(
+                kv_cache=kv_cache,
+                slot_mapping=slot_mapping,
+                token_stride=self._token_stride,
+                scale_dim=self._scale_dim,
+                fp8_dim=_fp8_dim,
+                n_blocks=_fp8_dim // self._quant_block,
+                quant_block=self._quant_block,
+                scale_is_fp32=self.head_dim == 128,
+            )

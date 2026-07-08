@@ -139,6 +139,73 @@ def quantize_and_insert_k_kernel(
         tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
 
 
+def _quantize_and_insert_k_cache_pytorch(
+    k: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int = 64,
+):
+    """PyTorch fallback for SM80 where Triton fp8e4nv is unsupported."""
+    num_tokens = slot_mapping.shape[0]
+    TOKEN_FP8_DIM = 448
+    TOKEN_BF16_DIM = 64
+    QUANT_BLOCK_SIZE = 64
+    FP8_MAX = 448.0
+    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+    TOKEN_SCALE_DIM = 8
+    block_stride = k_cache.stride(0)
+
+    k_float = k.float()  # [T, 512]
+    k_fp8_part = k_float[:, :TOKEN_FP8_DIM]  # [T, 448]
+    k_bf16_part = k[:, TOKEN_FP8_DIM:]  # [T, 64] keep as bf16
+
+    for t in range(num_tokens):
+        slot = slot_mapping[t].item()
+        block_idx = slot // block_size
+        pos_in_block = slot % block_size
+
+        # Quantize FP8 portion
+        x = k_fp8_part[t]  # [448]
+        x_blocks = x.reshape(-1, QUANT_BLOCK_SIZE)  # [7, 64]
+        amax = torch.amax(torch.abs(x_blocks), dim=-1)
+        amax = torch.clamp(amax, min=1e-4)
+        raw_scale = amax / FP8_MAX
+        log_scale = torch.log2(raw_scale)
+        exponent = torch.ceil(log_scale).to(torch.int32)
+        scale = torch.exp2(exponent.float())
+        x_scaled = x_blocks / scale.unsqueeze(-1)
+        x_clamped = torch.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+        x_fp8 = x_clamped.to(torch.float8_e4m3fn)
+        x_uint8 = x_fp8.view(torch.uint8).flatten()  # [448]
+
+        # Flatten to 1D byte view (k_cache may be 2D [num_blocks, block_bytes]).
+        k_flat = k_cache.reshape(-1)
+
+        # Store FP8 data
+        token_base = block_idx * block_stride + pos_in_block * TOKEN_DATA_SIZE
+        fp8_base = token_base
+        k_flat[fp8_base : fp8_base + TOKEN_FP8_DIM].copy_(x_uint8)
+
+        # Store BF16 data
+        bf16_base = token_base + TOKEN_FP8_DIM
+        bf16_bytes = k_bf16_part[t].view(torch.int16).flatten()  # [64]
+        k_flat[bf16_base : bf16_base + TOKEN_BF16_DIM * 2].copy_(
+            bf16_bytes.view(torch.uint8)
+        )
+
+        # Store UE8M0 scales
+        scale_base = (
+            block_idx * block_stride
+            + block_size * TOKEN_DATA_SIZE
+            + pos_in_block * TOKEN_SCALE_DIM
+        )
+        encoded_scale = (exponent + 127).clamp(0, 255).to(torch.uint8)
+        # Pad to 8 bytes
+        padded = torch.zeros(TOKEN_SCALE_DIM, dtype=torch.uint8, device=k.device)
+        padded[:7] = encoded_scale[:7]
+        k_flat[scale_base : scale_base + TOKEN_SCALE_DIM].copy_(padded)
+
+
 def quantize_and_insert_k_cache(
     k: torch.Tensor,  # [num_tokens, 512] bf16
     k_cache: torch.Tensor,  # [num_blocks, block_bytes] uint8
@@ -161,6 +228,11 @@ def quantize_and_insert_k_cache(
     )
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert is_ue8m0, "Only support ue8m0 quantization."
+
+    # SM80: Triton fp8e4nv unsupported — use PyTorch fallback.
+    if torch.cuda.get_device_capability()[0] < 9:
+        _quantize_and_insert_k_cache_pytorch(k, k_cache, slot_mapping, block_size)
+        return
 
     # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
     # padding. Always use slot_mapping.shape[0] as the token count.
@@ -350,6 +422,101 @@ def dequantize_and_gather_k_cache_triton(
     )
 
 
+def _dequantize_and_gather_k_cache_pytorch(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    """PyTorch fallback for SM80 where Triton fp8e4nv bitcast is unsupported.
+
+    Handles both fp8_ds_mla formats:
+      - SWA:  584 B/token (448 fp8 + 8 ue8m0 scale + 128 bf16 RoPE)
+      - Idx:  656 B/token (512 fp8 + 16 fp32 scale + 128 bf16 RoPE)
+    """
+    head_bytes = k_cache.shape[-1]
+    if head_bytes == 584:
+        FP8_DIM = 448
+        QUANT_BLOCK_SIZE = 64
+        N_QUANT_BLOCKS = 7
+        SCALE_DIM = 8
+        SCALE_IS_FP32 = False
+    elif head_bytes == 656:
+        FP8_DIM = 512
+        QUANT_BLOCK_SIZE = 128
+        N_QUANT_BLOCKS = 4
+        SCALE_DIM = 16
+        SCALE_IS_FP32 = True
+    else:
+        raise ValueError(f"Unsupported fp8_ds_mla head_bytes={head_bytes}")
+    BF16_DIM = 64
+    TOKEN_DATA_SIZE = FP8_DIM + BF16_DIM * 2
+
+    block_stride = k_cache.stride(0)  # = block_size * head_bytes (in uint8)
+    num_local_blocks = k_cache.shape[0]
+    cache_uint8 = k_cache.reshape(-1)  # full 1D byte view
+
+    for b in range(seq_lens.shape[0]):
+        seq_len = seq_lens[b].item()
+        g_len = gather_lens[b].item() if gather_lens is not None else seq_len
+        start_pos = seq_len - g_len
+        for i in range(g_len):
+            pos = start_pos + i
+            block_in_seq = pos // block_size
+            pos_in_block = pos % block_size
+
+            # Map global block ID → local block ID for this cache layer.
+            # Cache blocks are numbered 0..num_local_blocks-1 locally, so if the
+            # global block ID exceeds that range fall back to the sequence block.
+            global_block = block_table[b, block_in_seq].item()
+            if global_block >= num_local_blocks:
+                local_block = block_in_seq
+            else:
+                local_block = global_block
+
+            token_base = local_block * block_stride + pos_in_block * TOKEN_DATA_SIZE
+            # Scales live in the block-level scale section, NOT inline within
+            # the token data region.
+            scale_base = (
+                local_block * block_stride
+                + block_size * TOKEN_DATA_SIZE
+                + pos_in_block * SCALE_DIM
+            )
+
+            out_row = out[b, offset + i]  # [FP8_DIM + BF16_DIM] bf16
+
+            # Dequantize FP8 portion
+            for qb in range(N_QUANT_BLOCKS):
+                qb_start = qb * QUANT_BLOCK_SIZE
+                fp8_base = token_base + qb_start
+                x_uint8 = cache_uint8[fp8_base : fp8_base + QUANT_BLOCK_SIZE]
+                x_fp8 = x_uint8.view(torch.float8_e4m3fn)
+                x_float = x_fp8.float()
+
+                if SCALE_IS_FP32:
+                    scale_bytes = cache_uint8[
+                        scale_base + qb * 4 : scale_base + qb * 4 + 4
+                    ]
+                    s = scale_bytes.view(torch.float32).item()
+                else:
+                    encoded_scale = cache_uint8[scale_base + qb].item()
+                    exponent = float(encoded_scale) - 127.0
+                    s = 2**exponent
+                x_dequant = x_float * s
+                out_row[qb_start : qb_start + QUANT_BLOCK_SIZE] = x_dequant.to(
+                    torch.bfloat16
+                )
+
+            # Copy BF16 portion (RoPE)
+            bf16_base = token_base + FP8_DIM
+            bf16_bytes = cache_uint8[bf16_base : bf16_base + BF16_DIM * 2]
+            bf16_vals = bf16_bytes.view(torch.bfloat16)
+            out_row[FP8_DIM:] = bf16_vals
+
+
 def dequantize_and_gather_k_cache(
     # [num_reqs, max_num_tokens, head_size]
     out: torch.Tensor,
@@ -371,6 +538,13 @@ def dequantize_and_gather_k_cache(
         )
 
         dequantize_and_gather_k_cache_cutedsl(
+            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+        )
+        return
+
+    # SM80: Triton fp8e4nv bitcast unsupported — use PyTorch fallback.
+    if torch.cuda.get_device_capability()[0] < 9:
+        _dequantize_and_gather_k_cache_pytorch(
             out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
         )
         return

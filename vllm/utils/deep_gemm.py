@@ -176,6 +176,79 @@ def _import_deep_gemm():
     return None
 
 
+def _broadcast_fp8_scale(data_shape, scale_bf16):
+    """Broadcast per-block FP8 scale to match data shape across all dims.
+
+    FP8 block quantization partitions elements into groups of N (typically 128).
+    Scales have shape [..., D//N, ...] while data has shape [..., D, ...].
+    This helper repeats scales along mismatched dimensions so they broadcast.
+    """
+    for d in range(len(data_shape)):
+        if d < scale_bf16.ndim and data_shape[d] != scale_bf16.shape[d]:
+            if data_shape[d] % scale_bf16.shape[d] == 0:
+                repeat = data_shape[d] // scale_bf16.shape[d]
+                scale_bf16 = scale_bf16.repeat_interleave(repeat, dim=d)
+    return scale_bf16
+
+
+def _setup_torch_fallbacks():
+    """Set up PyTorch fallbacks for all DeepGEMM functions (SM80 compatibility)."""
+    import torch
+
+    def _torch_fp8_gemm_nt(A, As, B, Bs, out, disable_ue8m0_cast=False, **__):
+        As_bf16 = _broadcast_fp8_scale(A.shape, As.to(torch.bfloat16))
+        Bs_bf16 = _broadcast_fp8_scale(B.shape, Bs.to(torch.bfloat16))
+        A_bf16 = A.to(torch.bfloat16) * As_bf16
+        B_bf16 = B.to(torch.bfloat16) * Bs_bf16
+        torch.matmul(A_bf16, B_bf16.t(), out=out)
+
+    def _torch_fp8_einsum(equation, operand1, operand2, out, recipe=None, **__):
+        a, a_scale = operand1
+        b, b_scale = operand2
+        a_bf16 = a.to(torch.bfloat16) * _broadcast_fp8_scale(a.shape, a_scale.to(torch.bfloat16))
+        b_bf16 = b.to(torch.bfloat16) * _broadcast_fp8_scale(b.shape, b_scale.to(torch.bfloat16))
+        result = torch.einsum(equation, a_bf16, b_bf16)
+        out.copy_(result)
+
+    def _torch_noop(*args, **kwargs):
+        pass
+
+    def _torch_return_none(*args, **kwargs):
+        return None
+
+    def _torch_return_mk(*args, **kwargs):
+        return [8, 8]
+
+    global _fp8_gemm_nt_impl, _fp8_einsum_impl
+    global _grouped_impl, _grouped_masked_impl, _grouped_fp4_impl
+    global _cublaslt_gemm_nt_impl
+    global _get_mk_alignment_for_contiguous_layout_impl
+    global _get_mn_major_tma_aligned_tensor_impl
+    global _transform_sf_into_required_layout_impl
+    global _fp8_fp4_mqa_logits_impl, _fp8_fp4_paged_mqa_logits_impl
+    global _get_paged_mqa_logits_metadata_impl
+    global _tf32_hc_prenorm_gemm_impl
+
+    _fp8_gemm_nt_impl = _torch_fp8_gemm_nt
+    _fp8_einsum_impl = _torch_fp8_einsum
+    _grouped_impl = _torch_noop
+    _grouped_masked_impl = _torch_noop
+    _grouped_fp4_impl = _torch_noop
+    _cublaslt_gemm_nt_impl = _torch_noop
+    _get_mk_alignment_for_contiguous_layout_impl = _torch_return_mk
+    _get_mn_major_tma_aligned_tensor_impl = _torch_return_none
+    _transform_sf_into_required_layout_impl = _torch_noop
+    _fp8_fp4_mqa_logits_impl = _torch_noop
+    _fp8_fp4_paged_mqa_logits_impl = _torch_noop
+    _get_paged_mqa_logits_metadata_impl = _torch_return_none
+    _tf32_hc_prenorm_gemm_impl = _torch_noop
+
+    logger.warning_once(
+        "DeepGEMM not available; all FP8 kernels will use PyTorch fallback. "
+        "Performance will be lower on SM80."
+    )
+
+
 def _lazy_init() -> None:
     """Import deep_gemm and resolve symbols on first use."""
     global _cublaslt_gemm_nt_impl
@@ -205,6 +278,7 @@ def _lazy_init() -> None:
         return
 
     if not has_deep_gemm():
+        _setup_torch_fallbacks()
         return
 
     # Set up deep_gemm cache path
@@ -287,7 +361,12 @@ def cublaslt_gemm_nt(*args, **kwargs):
 def fp8_gemm_nt(*args, **kwargs):
     _lazy_init()
     if _fp8_gemm_nt_impl is None:
-        return _missing(*args, **kwargs)
+        # PyTorch fallback for SM80 (no FP8 hardware, no DeepGEMM)
+        logger.warning_once(
+            "DeepGEMM fp8_gemm_nt not available; using PyTorch fallback. "
+            "Performance will be lower."
+        )
+        return _fp8_gemm_nt_torch(*args, **kwargs)
     if "is_deep_gemm_e8m0_used" in kwargs:
         use_ue8m0 = kwargs["is_deep_gemm_e8m0_used"]
         del kwargs["is_deep_gemm_e8m0_used"]
@@ -296,11 +375,37 @@ def fp8_gemm_nt(*args, **kwargs):
     return _fp8_gemm_nt_impl(*args, disable_ue8m0_cast=not use_ue8m0, **kwargs)
 
 
+def _fp8_gemm_nt_torch(A, As, B, Bs, out, is_deep_gemm_e8m0_used=None, **__):
+    """PyTorch fallback: dequantize FP8 → BF16 → torch.matmul."""
+    import torch
+    As_bf16 = _broadcast_fp8_scale(A.shape, As.to(torch.bfloat16))
+    Bs_bf16 = _broadcast_fp8_scale(B.shape, Bs.to(torch.bfloat16))
+    A_bf16 = A.to(torch.bfloat16) * As_bf16
+    B_bf16 = B.to(torch.bfloat16) * Bs_bf16
+    torch.matmul(A_bf16, B_bf16.t(), out=out)
+
+
 def fp8_einsum(*args, **kwargs):
     _lazy_init()
     if _fp8_einsum_impl is None:
-        return _missing(*args, **kwargs)
+        # PyTorch fallback for SM80 (no FP8 hardware, no DeepGEMM)
+        logger.warning_once(
+            "DeepGEMM fp8_einsum not available; using PyTorch fallback. "
+            "Performance will be lower."
+        )
+        return _fp8_einsum_torch(*args, **kwargs)
     return _fp8_einsum_impl(*args, **kwargs)
+
+
+def _fp8_einsum_torch(equation, operand1, operand2, out, recipe=None, **__):
+    """PyTorch fallback: dequantize FP8 → BF16 → torch.einsum."""
+    import torch
+    a, a_scale = operand1
+    b, b_scale = operand2
+    a_bf16 = a.to(torch.bfloat16) * _broadcast_fp8_scale(a.shape, a_scale.to(torch.bfloat16))
+    b_bf16 = b.to(torch.bfloat16) * _broadcast_fp8_scale(b.shape, b_scale.to(torch.bfloat16))
+    result = torch.einsum(equation, a_bf16, b_bf16)
+    out.copy_(result)
 
 
 def m_grouped_fp8_gemm_nt_contiguous(*args, **kwargs):
