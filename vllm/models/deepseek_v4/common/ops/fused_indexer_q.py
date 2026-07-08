@@ -281,6 +281,94 @@ def _fused_indexer_q_rope_mxfp4_kernel(
     )
 
 
+def _fused_indexer_q_rope_quant_pytorch(
+    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    index_q_cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch fallback for SM80 where Triton fp8e4nv is unsupported.
+
+    Performs GPT-J interleaved RoPE + FP8 quantization on the last ROPE_DIM
+    dims, and folds q_scale into index_weights_out.
+    """
+    num_tokens = positions.shape[0]
+    num_heads = index_q.shape[1]
+    head_dim = index_q.shape[2]
+    rope_dim = index_q_cos_sin_cache.shape[-1]
+    half_rot = rope_dim // 2
+    nope_dim = head_dim - rope_dim
+
+    # 1. Fetch cos/sin
+    pos_vals = positions.long()
+    cos_sin = index_q_cos_sin_cache[pos_vals]  # [T, rope_dim]
+    cos_t = cos_sin[:, :half_rot].to(torch.float32)  # [T, half_rot]
+    sin_t = cos_sin[:, half_rot:].to(torch.float32)  # [T, half_rot]
+
+    # 2. GPT-J interleaved RoPE on dims [nope_dim, head_dim)
+    q_float = index_q.float()  # [T, H, D]
+    rot_base = q_float[:, :, nope_dim:]  # [T, H, rope_dim]
+
+    x_even = rot_base[:, :, 0::2]  # [T, H, half_rot]
+    x_odd = rot_base[:, :, 1::2]   # [T, H, half_rot]
+
+    r_even = x_even * cos_t[:, None, :] - x_odd * sin_t[:, None, :]
+    r_odd = x_odd * cos_t[:, None, :] + x_even * sin_t[:, None, :]
+
+    r_even = r_even.to(torch.bfloat16).to(torch.float32)
+    r_odd = r_odd.to(torch.bfloat16).to(torch.float32)
+
+    # Interleave back
+    rot_out = torch.empty_like(rot_base)
+    rot_out[:, :, 0::2] = r_even
+    rot_out[:, :, 1::2] = r_odd
+
+    # 3. Per-token-per-head scalar quantization
+    if nope_dim > 0:
+        x_nope = q_float[:, :, :nope_dim]
+        amax = torch.maximum(
+            torch.amax(torch.abs(r_even), dim=-1),
+            torch.amax(torch.abs(r_odd), dim=-1),
+        )
+        amax = torch.maximum(amax, torch.amax(torch.abs(x_nope), dim=-1))
+    else:
+        amax = torch.maximum(
+            torch.amax(torch.abs(r_even), dim=-1),
+            torch.amax(torch.abs(r_odd), dim=-1),
+        )
+    amax = torch.clamp(amax, min=1e-4)  # [T, H]
+
+    index_q_scale = amax / 448.0
+    index_q_scale = torch.exp2(torch.ceil(torch.log2(index_q_scale)))  # [T, H]
+
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+    # 4. Quantize and store
+    index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
+    scale_exp = index_q_scale[:, :, None]  # [T, H, 1]
+
+    if nope_dim > 0:
+        q_scaled = q_float[:, :, :nope_dim] / scale_exp
+        q_scaled = torch.clamp(q_scaled, -fp8_max, fp8_max)
+        index_q_fp8[:, :, :nope_dim] = q_scaled.to(torch.float8_e4m3fn)
+
+    rot_out[:, :, :rope_dim] = rot_out[:, :, :rope_dim] / scale_exp
+    rot_out = torch.clamp(rot_out, -fp8_max, fp8_max)
+    index_q_fp8[:, :, nope_dim:] = rot_out.to(torch.float8_e4m3fn)
+
+    # 5. Fold q_scale into index weights
+    index_weights_out = (
+        index_weights.float() *
+        index_q_scale *
+        index_weights_softmax_scale *
+        index_weights_head_scale
+    )
+
+    return index_q_fp8, index_weights_out
+
+
 def fused_indexer_q_rope_quant(
     positions: torch.Tensor,
     index_q: torch.Tensor,
@@ -398,6 +486,16 @@ def fused_indexer_q_rope_quant(
         ), index_weights_out
 
     index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
+
+    # SM80 (Ampere): Triton does not support fp8e4nv dtype. Use PyTorch fallback.
+    is_sm80 = torch.cuda.get_device_capability()[0] < 9
+    if is_sm80 and not use_fp4:
+        return _fused_indexer_q_rope_quant_pytorch(
+            positions, index_q, index_q_cos_sin_cache,
+            index_weights, index_weights_softmax_scale,
+            index_weights_head_scale,
+        )
+
     if has_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (

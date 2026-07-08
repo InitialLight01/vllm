@@ -26,7 +26,7 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
 def deep_gemm_fp8_o_proj(
     o: torch.Tensor,
     positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
+    rotary_emb: nn.Module,
     wo_a: nn.Module,
     wo_b: nn.Module,
     *,
@@ -42,11 +42,35 @@ def deep_gemm_fp8_o_proj(
 
     Shared by the FlashMLA and FlashInfer CUDA backends. ``einsum_recipe`` /
     ``tma_aligned_scales`` come from ``compute_fp8_einsum_recipe``.
+
+    On SM80 (Ampere) there is no FP8 tensor-core support and the fused
+    inverse-RoPE FP8-quant Triton kernel (``fp8e4nv``) plus DeepGEMM
+    ``fp8_einsum`` are unavailable. We route to the BF16 reference path
+    (``rocm_inv_rope_einsum``), the same one v0.23.0 already uses for the
+    ROCm and XPU backends; it dequantizes the block-scaled FP8 ``wo_a``
+    weight to BF16 and runs a plain ``torch.einsum``.
     """
+    cap = current_platform.get_device_capability()
+    if cap is not None and cap.major < 9:
+        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+            rocm_inv_rope_einsum,
+        )
+
+        z = rocm_inv_rope_einsum(
+            rotary_emb,
+            o,
+            positions,
+            rope_dim,
+            n_groups,
+            o_lora_rank,
+            wo_a,
+        )
+        return wo_b(z.flatten(1))
+
     o_fp8, o_scale = fused_inv_rope_fp8_quant(
         o,
         positions,
-        cos_sin_cache,
+        rotary_emb.cos_sin_cache,
         n_groups=n_groups,
         heads_per_group=heads_per_group,
         nope_dim=nope_dim,

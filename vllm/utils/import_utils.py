@@ -444,8 +444,23 @@ def has_triton_kernels() -> bool:
 
 @cache
 def has_tilelang() -> bool:
-    """Whether the optional `tilelang` package is available."""
-    return _has_module("tilelang")
+    """Whether the optional `tilelang` package is available.
+
+    TileLang kernels rely on PDL (Programmatic Dependent Launch) which
+    requires SM90+ (Hopper/Blackwell). On SM80 (Ampere) these fail, so we
+    force-disable it here; the MHC ops then fall back to the torch kernels
+    via the existing ``HAS_TILELANG`` guards.
+    """
+    if not _has_module("tilelang"):
+        return False
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9:
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def has_arctic_inference() -> bool:
@@ -485,5 +500,18 @@ def has_fbgemm_gpu() -> bool:
 
 
 def has_cutedsl() -> bool:
-    """Whether the optional `cutelass` package is available."""
-    return _has_module("cutlass")
+    """Whether the optional `cutelass` package is available.
+
+    CUTLASS DSL JIT-compiles kernels that require SM89+ PTX instructions
+    (e.g. cvt.f16x2.e4m3x2, mul.bf16x2). On SM80 (Ampere) these fail at
+    ptxas time, so we force-disabled it to use PyTorch fallbacks instead.
+    """
+    if not _has_module("cutlass"):
+        return False
+    try:
+        import torch
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9:
+            return False
+    except Exception:
+        pass
+    return True
