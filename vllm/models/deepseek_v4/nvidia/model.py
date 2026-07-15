@@ -18,11 +18,21 @@ from vllm.distributed import (
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
-from vllm.model_executor.kernels.mhc.tilelang import (
-    hc_head_fused_kernel_tilelang,
-    mhc_fused_post_pre_tilelang,
-    mhc_post_tilelang,
-    mhc_pre_tilelang,
+try:
+    from vllm.model_executor.kernels.mhc.tilelang import (
+        hc_head_fused_kernel_tilelang,
+        mhc_fused_post_pre_tilelang,
+        mhc_post_tilelang,
+        mhc_pre_tilelang,
+    )
+    _has_tilelang_kernels = True
+except (ImportError, RuntimeError):
+    _has_tilelang_kernels = False
+from vllm.model_executor.kernels.mhc.torch import (
+    hc_head_fused_torch,
+    mhc_fused_post_pre_torch,
+    mhc_post_torch,
+    mhc_pre_torch,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -872,12 +882,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from vllm.platforms import current_platform
+        _sm80 = current_platform.is_sm80_context() or not _has_tilelang_kernels
+        _pre = mhc_pre_torch if _sm80 else mhc_pre_tilelang
+        _fused = mhc_fused_post_pre_torch if _sm80 else mhc_fused_post_pre_tilelang
+        _post = mhc_post_torch if _sm80 else mhc_post_tilelang
+
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
-            # Run standalone mhc_pre on first layer
             residual = x
-            post_mix, res_mix, x = mhc_pre_tilelang(
+            post_mix, res_mix, x = _pre(
                 x,
                 self.hc_attn_fn,
                 self.hc_attn_scale,
@@ -891,7 +906,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=attn_norm_eps,
             )
         else:
-            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+            residual, post_mix, res_mix, x = _fused(
                 x,
                 residual,
                 post_mix,
@@ -915,7 +930,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+        residual, post_mix, res_mix, x = _fused(
             x,
             residual,
             post_mix,
@@ -1065,6 +1080,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        from vllm.platforms import current_platform
+        _sm80_m = current_platform.is_sm80_context() or not _has_tilelang_kernels
+        _post_m = mhc_post_torch if _sm80_m else mhc_post_tilelang
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1095,7 +1113,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
+                aux_recon = _post_m(
                     hidden_states, residual, post_mix, res_mix
                 )
                 aux_hidden_states.append(aux_recon.mean(dim=1))
@@ -1105,7 +1123,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
             else:
-                hidden_states = mhc_post_tilelang(
+                hidden_states = _post_m(
                     hidden_states, residual, post_mix, res_mix
                 )
 
@@ -1116,7 +1134,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = hc_head_fused_kernel_tilelang(
+        _hc_head = hc_head_fused_torch if (current_platform.is_sm80_context() or not _has_tilelang_kernels) else hc_head_fused_kernel_tilelang
+        hidden_states = _hc_head(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,

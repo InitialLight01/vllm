@@ -15,6 +15,9 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
 )
+from vllm.models.deepseek_v4.common.ops.fused_compress_quant_pytorch import (
+    requantize_kv_cache_fp8e4nv,
+)
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,

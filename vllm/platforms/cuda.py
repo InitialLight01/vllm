@@ -665,6 +665,15 @@ class CudaPlatformBase(Platform):
         )
 
     @classmethod
+    def is_sm80_context(cls) -> bool:
+        """True when SM80 (Ampere) code paths should be used."""
+        from vllm.envs import VLLM_FORCE_SM80
+        cap = cls.get_device_capability()
+        if cap is None:
+            return False
+        return cap.major < 9 or VLLM_FORCE_SM80
+
+    @classmethod
     def is_integrated_gpu(cls, device_id: int = 0) -> bool:
         return bool(torch.cuda.get_device_properties(device_id).is_integrated)
 

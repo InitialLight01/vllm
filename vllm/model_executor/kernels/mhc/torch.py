@@ -14,6 +14,8 @@ def mhc_pre_torch(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward pass for mHC pre block.
@@ -84,10 +86,17 @@ def mhc_pre_torch(
     layer_input = torch.sum(
         pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
     ).to(torch.bfloat16)
+    layer_input = layer_input.view(*outer_shape, hidden_size)
+
+    if norm_weight is not None:
+        norm_w = norm_weight.float()
+        rms = torch.rsqrt(layer_input.float().pow(2).mean(-1, keepdim=True) + norm_eps)
+        layer_input = (layer_input.float() * rms * norm_w).to(torch.bfloat16)
+
     return (
         post_mix.view(*outer_shape, hc_mult, 1),
         comb_mix.view(*outer_shape, hc_mult, hc_mult),
-        layer_input.view(*outer_shape, hidden_size),
+        layer_input,
     )
 
 
@@ -104,3 +113,46 @@ def mhc_post_torch(
     )
     post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
     return (mixed_residual + post_term).to(residual.dtype)
+
+
+def mhc_fused_post_pre_torch(
+    x: torch.Tensor, residual: torch.Tensor,
+    post_layer_mix: torch.Tensor, comb_res_mix: torch.Tensor,
+    fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor,
+    rms_eps: float, hc_pre_eps: float, hc_sinkhorn_eps: float,
+    hc_post_mult_value: float, sinkhorn_repeat: int,
+    n_splits: int = 1, tile_n: int = 1,
+    norm_weight: torch.Tensor | None = None, norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    residual_cur = mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+    post_mix_cur, comb_mix_cur, layer_input_cur = mhc_pre_torch(
+        residual_cur, fn, hc_scale, hc_base,
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+        hc_post_mult_value, sinkhorn_repeat, n_splits,
+        norm_weight=norm_weight, norm_eps=norm_eps,
+    )
+    return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+
+
+def hc_head_fused_torch(
+    hs_flat: torch.Tensor, fn: torch.Tensor,
+    hc_scale: torch.Tensor, hc_base: torch.Tensor,
+    rms_eps: float, hc_eps: float,
+) -> torch.Tensor:
+    num_tokens, hc_mult, hidden_size = hs_flat.shape
+    if num_tokens == 0:
+        return torch.empty(0, hidden_size, dtype=torch.bfloat16, device=hs_flat.device)
+    hc_dim = hc_mult * hidden_size
+    hs_f32 = hs_flat.float()
+    sqrsum = hs_f32.pow(2).sum(dim=[1, 2], keepdim=True)
+    rsqrt = torch.rsqrt(sqrsum.reshape(num_tokens, 1) / hc_dim + rms_eps)
+    hs_flat_f32 = hs_f32.reshape(num_tokens, hc_dim)
+    fn_f32 = fn[:hc_mult].to(torch.float32)
+    mixes = torch.matmul(hs_flat_f32, fn_f32.T)
+    hc_scale_val = hc_scale.to(torch.float32).view(1)
+    hc_base_val = hc_base.to(torch.float32).view(1, hc_mult)
+    pre_mix = torch.sigmoid(mixes * rsqrt * hc_scale_val + hc_base_val) + hc_eps
+    out = torch.einsum("tch,tc->th", hs_flat.to(torch.bfloat16), pre_mix.to(torch.bfloat16))
+    return out
+
+

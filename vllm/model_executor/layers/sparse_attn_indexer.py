@@ -718,6 +718,7 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        self._use_triton_fallback = False
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
@@ -726,10 +727,17 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
-            )
+            if current_platform.is_sm80_context():
+                logger.warning_once(
+                    "DeepGEMM not supported on this platform; "
+                    "using Triton fallback for sparse attention indexer."
+                )
+                self._use_triton_fallback = True
+            else:
+                raise RuntimeError(
+                    "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
+                    "the current vLLM environment."
+                )
 
     def forward_native(
         self,

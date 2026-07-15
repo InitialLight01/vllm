@@ -67,6 +67,8 @@ def compress_norm_rope_store_triton(
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
 
+    use_e4nv = torch.cuda.get_device_capability()[0] >= 9
+    fp8_max = 448.0 if use_e4nv else 1.0
     kernel[(num_actual,)](
         # state cache
         state_cache,
@@ -96,7 +98,7 @@ def compress_norm_rope_store_triton(
         COMPRESS_RATIO=compress_ratio,
         OVERLAP=overlap,
         ROPE_HEAD_DIM=rope_head_dim,
-        FP8_MAX=448.0,
+        FP8_MAX=fp8_max,
         QUANT_BLOCK=quant_block,
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
