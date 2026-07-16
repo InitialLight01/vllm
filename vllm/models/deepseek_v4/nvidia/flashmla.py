@@ -65,11 +65,12 @@ def _o_proj_bf16_sm80(
     rope_part = o[..., nope_dim:]                       # [T, H, rope]
     # Reshape rope to pair format: [T, H, half_rope, 2]
     rope_pairs = rope_part.reshape(num_tokens, num_heads, half_rope, 2)
-    cos = cos.view(num_tokens, 1, half_rope, 1)
-    sin = sin.view(num_tokens, 1, half_rope, 1)
-    # Inverse rotation: (x*cos - y*sin, x*sin + y*cos) → rotated back
-    # For inverse: (x*cos + y*sin, -x*sin + y*cos) ... actually standard RoPE
-    # formula applied in reverse direction for inverse RoPE.
+    # cos/sin: [T, 1, half_rope] — broadcast over heads, NOT [T, 1, R, 1]
+    # which would collide with x's token dim when broadcast (→ [T, T, H, R] OOM).
+    cos = cos.view(num_tokens, 1, half_rope)
+    sin = sin.view(num_tokens, 1, half_rope)
+    # Inverse RoPE (GPT-J interleaved): inv(x_2i, x_2i+1) =
+    #   (x_2i*cos + x_2i+1*sin,  -x_2i*sin + x_2i+1*cos)
     x, y = rope_pairs[..., 0], rope_pairs[..., 1]
     x_inv = x * cos + y * sin
     y_inv = -x * sin + y * cos
