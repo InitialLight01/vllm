@@ -795,6 +795,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     ):
         return DeepseekV4FlashMLAAttention
 
+    # SM80 (Ampere/A800): use FlashMLAAttention layer with BF16 O-proj
+    # fallback and MHU torch functions. The SM120 check below would normally
+    # route to FlashInfer, but under FORCE_SM80 we must simulate SM80 paths.
+    if current_platform.is_sm80_context():
+        return DeepseekV4FlashMLAAttention
     if device_capability is not None and device_capability.major == 12:
         return DeepseekV4FlashInferSM120Attention
     return DeepseekV4FlashMLAAttention
@@ -956,6 +961,17 @@ class DeepseekV4DecoderLayer(nn.Module):
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
+        # SM80 (Ampere/A800): override sparse MLA backend to pure-Triton
+        # path.  FlashMLA (SM90+) and FlashInfer (SM120) backends are not
+        # available on SM80.
+        if current_platform.is_sm80_context():
+            from vllm.v1.attention.backends.registry import (
+                AttentionBackendEnum,
+            )
+            vllm_config.attention_config.backend = (
+                AttentionBackendEnum.TRITON_MLA_SPARSE
+            )
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config

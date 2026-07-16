@@ -20,6 +20,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
 )
+from vllm.platforms import current_platform
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
@@ -28,6 +29,57 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+
+def _o_proj_bf16_sm80(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a: torch.nn.Module,
+    wo_b: torch.nn.Module,
+    *,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    o_lora_rank: int,
+) -> torch.Tensor:
+    """O-projection BF16 fallback for SM80 (no DeepGEMM/fp8_einsum).
+
+    Replaces fused_inv_rope_fp8_quant + fp8_einsum with pure torch ops.
+    Follows the same inverse-RoPE logic as the FP8 path but skips quantization.
+    """
+    num_tokens, num_heads, head_dim = o.shape
+    assert head_dim == nope_dim + rope_dim, f"{head_dim} != {nope_dim}+{rope_dim}"
+    assert rope_dim % 2 == 0
+    assert cos_sin_cache.shape[-1] == rope_dim
+
+    # Inverse RoPE: follow the same pattern as fused_inv_rope_fp8_quant.
+    # cos_sin_cache layout: [max_pos, rope_dim], first half cos, second half sin.
+    # For GPT-J (interleaved pairs): pair (2i, 2i+1) shares one (cos, sin).
+    half_rope = rope_dim // 2
+    cos = cos_sin_cache[positions][:, :half_rope]   # [T, half_rope]
+    sin = cos_sin_cache[positions][:, half_rope:]   # [T, half_rope]
+
+    nope_part = o[..., :nope_dim]                      # [T, H, nope]
+    rope_part = o[..., nope_dim:]                       # [T, H, rope]
+    # Reshape rope to pair format: [T, H, half_rope, 2]
+    rope_pairs = rope_part.reshape(num_tokens, num_heads, half_rope, 2)
+    cos = cos.view(num_tokens, 1, half_rope, 1)
+    sin = sin.view(num_tokens, 1, half_rope, 1)
+    # Inverse rotation: (x*cos - y*sin, x*sin + y*cos) → rotated back
+    # For inverse: (x*cos + y*sin, -x*sin + y*cos) ... actually standard RoPE
+    # formula applied in reverse direction for inverse RoPE.
+    x, y = rope_pairs[..., 0], rope_pairs[..., 1]
+    x_inv = x * cos + y * sin
+    y_inv = -x * sin + y * cos
+    rope_inv = torch.stack([x_inv, y_inv], dim=-1).reshape(num_tokens, num_heads, rope_dim)
+
+    o_full = torch.cat([nope_part, rope_inv], dim=-1)
+    o_flat = o_full.reshape(num_tokens, n_groups, heads_per_group * head_dim)
+    o_flat = o_flat.to(torch.bfloat16)
+    z = wo_a(o_flat).to(torch.bfloat16)
+    return wo_b(z.flatten(1))
 
 
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
@@ -40,6 +92,19 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if current_platform.is_sm80_context():
+            return _o_proj_bf16_sm80(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a,
+                self.wo_b,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                o_lora_rank=self.o_lora_rank,
+            )
         return deep_gemm_fp8_o_proj(
             o,
             positions,
