@@ -9,7 +9,12 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-if current_platform.is_cuda():
+import os
+
+if (
+    current_platform.is_cuda()
+    and not os.environ.get("VLLM_FORCE_TRITON_MLA", "")
+):
     try:
         import vllm._flashmla_C  # noqa: F401
 
