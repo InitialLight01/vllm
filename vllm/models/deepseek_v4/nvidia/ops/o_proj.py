@@ -63,7 +63,7 @@ def deep_gemm_fp8_o_proj(
     fp8_einsum(
         "bhr,hdr->bhd",
         (o_fp8, o_scale),
-        (wo_a.weight, wo_a.weight_scale_inv),
+        (wo_a.weight, getattr(wo_a, "weight_scale_inv", wo_a.weight_scale)),
         z,
         recipe=einsum_recipe,
     )
