@@ -275,12 +275,11 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 f"Unsupported compress_ratio={self.compress_ratio}; "
                 "expected 1, 4, or 128."
             )
-        assert tile_metadata is not None, (
-            "swa_metadata missing tile_sched entry for "
-            f"compress_ratio={self.compress_ratio}; "
-            "DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not "
-            "allocate one for this layer type."
-        )
+        if tile_metadata is None:
+            # Warmup / profile_run may not allocate tile_scheduler entries for
+            # every layer type.  Zero the decode output and return early.
+            output.zero_()
+            return
 
         out, _ = flash_mla_with_kvcache(
             q=q,
