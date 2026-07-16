@@ -1,0 +1,462 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Triton sparse MLA attention kernels for DeepSeek-V4 (head_dim=512).
+
+Adapted from ``rocm_aiter_mla_sparse.py`` (PR #41812), which targets
+ROCm but uses architecture-agnostic Triton.  V4 constants:
+
+    NOPE_DIM = 448   (head_dim - qk_rope_head_dim)
+    ROPE_DIM = 64    (qk_rope_head_dim)
+    COMB_DIM = 512   (head_dim)
+
+These replace the V3.2 ``triton_mla_sparse_kernel.py`` values that
+hard-code ``_DIM_QK=576``.
+"""
+
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+# ---------------------------------------------------------------------------
+# V4 constants
+# ---------------------------------------------------------------------------
+NOPE_DIM = 448
+ROPE_DIM = 64
+COMB_DIM = NOPE_DIM + ROPE_DIM  # 512
+NOPE_BLOCK = triton.next_power_of_2(NOPE_DIM)  # 512
+
+
+# ---------------------------------------------------------------------------
+# Prefill kernel — standard softmax attention over ragged KV indices
+# ---------------------------------------------------------------------------
+@triton.jit
+def _prefill_kernel(
+    q_ptr,
+    kv_ptr,
+    kv_indices_ptr,
+    kv_indptr_ptr,
+    attn_sink_ptr,
+    out_ptr,
+    q_stride_t,
+    q_stride_h,
+    q_stride_d,
+    kv_stride_n,
+    kv_stride_d,
+    out_stride_t,
+    out_stride_h,
+    out_stride_d,
+    num_heads,
+    head_dim,
+    num_kv,
+    scale,
+    HAS_ATTN_SINK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Online-softmax attention over a ragged list of KV tokens per query.
+
+    Each query ``t`` attends to KV slots
+    ``kv_indices[kv_indptr[t] : kv_indptr[t+1]]``.
+    """
+    query_idx = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_offsets < num_heads
+    d_offsets = tl.arange(0, BLOCK_D)
+    d_mask = d_offsets < head_dim
+
+    # load Q  [BLOCK_H, head_dim]
+    q_row = q_ptr + query_idx * q_stride_t + head_offsets[:, None] * q_stride_h
+    q_val = tl.load(q_row + d_offsets[None, :],
+                    mask=head_mask[:, None] & d_mask[None, :], other=0.0)
+
+    # online softmax state
+    neg_inf = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg_inf, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+
+    kv_start = tl.load(kv_indptr_ptr + query_idx)
+    kv_end = tl.load(kv_indptr_ptr + query_idx + 1)
+    kv_len = kv_end - kv_start
+    k_offsets = tl.arange(0, BLOCK_K)
+
+    for k_start in tl.range(0, kv_len, BLOCK_K):
+        k_pos = k_start + k_offsets
+        in_range = k_pos < kv_len
+        slot = tl.load(kv_indices_ptr + kv_start + k_pos,
+                       mask=in_range, other=-1)
+        valid = in_range & (slot >= 0) & (slot < num_kv)
+        safe_slot = tl.where(valid, slot, 0)
+
+        # load K  [BLOCK_K, head_dim]
+        k_row = kv_ptr + safe_slot[:, None] * kv_stride_n
+        k_val = tl.load(k_row + d_offsets[None, :],
+                        mask=valid[:, None] & d_mask[None, :], other=0.0)
+
+        # S = Q @ K^T * scale  [BLOCK_H, BLOCK_K]
+        scores = tl.dot(q_val, tl.trans(k_val)) * scale
+        scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_inf)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(k_val.dtype), k_val)
+        m_i = m_new
+
+    # attn sink (if present)
+    if HAS_ATTN_SINK:
+        sink = tl.load(attn_sink_ptr + head_offsets,
+                       mask=head_mask, other=neg_inf).to(tl.float32)
+        m_final = tl.maximum(m_i, sink)
+        alpha = tl.exp(m_i - m_final)
+        l_final = l_i * alpha + tl.exp(sink - m_final)
+        denom = tl.maximum(l_final, 1e-30)
+        out_val = tl.where(l_final[:, None] > 0, (acc * alpha[:, None]) / denom[:, None], 0.0)
+    else:
+        denom = tl.maximum(l_i, 1e-30)
+        out_val = tl.where(l_i[:, None] > 0, acc / denom[:, None], 0.0)
+
+    # store O  [BLOCK_H, head_dim]
+    out_row = out_ptr + query_idx * out_stride_t + head_offsets[:, None] * out_stride_h
+    tl.store(out_row + d_offsets[None, :], out_val,
+             mask=head_mask[:, None] & d_mask[None, :])
+
+
+# ---------------------------------------------------------------------------
+# Decode kernel — FP8 NOPE dequant + BF16 ROPE, online softmax
+# ---------------------------------------------------------------------------
+@triton.jit
+def _decode_kernel(
+    q_ptr,
+    main_cache_ptr,
+    main_indices_ptr,
+    main_indptr_ptr,
+    extra_cache_ptr,
+    extra_indices_ptr,
+    extra_indptr_ptr,
+    attn_sink_ptr,
+    out_ptr,
+    q_stride0,
+    q_stride1,
+    out_stride0,
+    out_stride1,
+    main_cache_stride0,
+    extra_cache_stride0,
+    main_num_rows,
+    extra_num_rows,
+    main_block_size,
+    extra_block_size,
+    scale,
+    num_heads,
+    HAS_ATTN_SINK: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    HEAD_BYTES: tl.constexpr,  # per-token stride in bytes (584 for V4)
+    NOPE_DIM_C: tl.constexpr,  # 448
+    NOPE_BLOCK_C: tl.constexpr,  # triton.next_power_of_2(448)
+    ROPE_DIM_C: tl.constexpr,  # 64
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Single-launch decode attention over two ragged KV lists.
+
+    KV cache layout (per token, HEAD_BYTES bytes, 584 for V4):
+        [0..447]     NOPE as uint8 (FP8 e4m3nv) — 448 bytes
+        [448..575]   ROPE as bf16 — 64×2 = 128 bytes
+        [576..583]   UE8M0 scales inline — 8 bytes (1/group of 64)
+
+    Scales are UE8M0 (exponent-only): ``scale = 2^(encoded - 127)``.
+    """
+    query_idx = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_offsets < num_heads
+    nope_offsets = tl.arange(0, NOPE_BLOCK_C)
+    nope_mask = nope_offsets < NOPE_DIM_C
+    rope_offsets = tl.arange(0, ROPE_DIM_C)
+
+    # load Q nope + rope  [BLOCK_H, NOPE_BLOCK] + [BLOCK_H, ROPE_DIM]
+    q_row = q_ptr + query_idx * q_stride0 + head_offsets[:, None] * q_stride1
+    q_nope = tl.load(q_row + nope_offsets[None, :],
+                     mask=head_mask[:, None] & nope_mask[None, :], other=0.0)
+    q_rope = tl.load(q_row + NOPE_DIM_C + rope_offsets[None, :],
+                     mask=head_mask[:, None], other=0.0)
+
+    neg_inf = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg_inf, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc_nope = tl.zeros((BLOCK_H, NOPE_BLOCK_C), dtype=tl.float32)
+    acc_rope = tl.zeros((BLOCK_H, ROPE_DIM_C), dtype=tl.float32)
+
+    k_offsets = tl.arange(0, BLOCK_K)
+    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK_C), dtype=tl.bfloat16)
+    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM_C), dtype=tl.bfloat16)
+
+    # Helper macro: one ragged-KV attention loop
+    # (inlined — Triton JIT does not support nested def)
+
+    # ---- main (SWA) attention ---------------------------------------------
+    main_start = tl.load(main_indptr_ptr + query_idx)
+    main_end = tl.load(main_indptr_ptr + query_idx + 1)
+    main_len = main_end - main_start
+    for k_start in tl.range(0, main_len, BLOCK_K):
+        k_pos = k_start + k_offsets
+        in_range = k_pos < main_len
+        slot = tl.load(main_indices_ptr + main_start + k_pos,
+                       mask=in_range, other=-1)
+        valid = in_range & (slot >= 0) & (slot < main_num_rows)
+        safe_slot = tl.where(valid, slot, 0)
+        block_idx = safe_slot // main_block_size
+        pos_in_block = safe_slot % main_block_size
+        block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
+        token_data = block_ptr + pos_in_block * HEAD_BYTES
+
+        x_uint8 = tl.load(token_data[:, None] + nope_offsets[None, :],
+                          mask=valid[:, None] & nope_mask[None, :], other=0)
+        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+        scale_ptr = token_data + NOPE_DIM_C + ROPE_DIM_C * 2  # offset 576
+        encoded = tl.load(scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                          mask=valid[:, None] & nope_mask[None, :], other=127)
+        scales = tl.exp2(encoded.to(tl.float32) - 127.0)
+        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+        k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+
+        rope_ptr = (token_data + NOPE_DIM_C).to(tl.pointer_type(tl.bfloat16))
+        k_rope = tl.load(rope_ptr[:, None] + rope_offsets[None, :],
+                         mask=valid[:, None], other=0.0)
+        k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+        k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+
+        scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
+        scores *= scale
+        scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_inf)
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
+        m_i = m_new
+
+    # ---- extra (compressed) attention ------------------------------------
+    if HAS_EXTRA:
+        extra_start = tl.load(extra_indptr_ptr + query_idx)
+        extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
+        extra_len = extra_end - extra_start
+        for k_start in tl.range(0, extra_len, BLOCK_K):
+            k_pos = k_start + k_offsets
+            in_range = k_pos < extra_len
+            slot = tl.load(extra_indices_ptr + extra_start + k_pos,
+                           mask=in_range, other=-1)
+            valid = in_range & (slot >= 0) & (slot < extra_num_rows)
+            safe_slot = tl.where(valid, slot, 0)
+            block_idx = safe_slot // extra_block_size
+            pos_in_block = safe_slot % extra_block_size
+            block_ptr = extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
+            token_data = block_ptr + pos_in_block * HEAD_BYTES
+
+            x_uint8 = tl.load(token_data[:, None] + nope_offsets[None, :],
+                              mask=valid[:, None] & nope_mask[None, :], other=0)
+            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            scale_ptr = token_data + NOPE_DIM_C + ROPE_DIM_C * 2
+            encoded = tl.load(scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                              mask=valid[:, None] & nope_mask[None, :], other=127)
+            scales = tl.exp2(encoded.to(tl.float32) - 127.0)
+            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+            k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+
+            rope_ptr = (token_data + NOPE_DIM_C).to(tl.pointer_type(tl.bfloat16))
+            k_rope = tl.load(rope_ptr[:, None] + rope_offsets[None, :],
+                             mask=valid[:, None], other=0.0)
+            k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+            k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+
+            scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
+            scores *= scale
+            scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_inf)
+            m_block = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_block)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+            acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
+            m_i = m_new
+
+    # ---- finalize ---------------------------------------------------------
+    if HAS_ATTN_SINK:
+        sink = tl.load(attn_sink_ptr + head_offsets,
+                       mask=head_mask, other=neg_inf).to(tl.float32)
+        m_final = tl.maximum(m_i, sink)
+        alpha = tl.exp(m_i - m_final)
+        l_final = l_i * alpha + tl.exp(sink - m_final)
+        denom = tl.maximum(l_final, 1e-30)
+        out_nope = tl.where(l_final[:, None] > 0,
+                            (acc_nope * alpha[:, None]) / denom[:, None], 0.0)
+        out_rope = tl.where(l_final[:, None] > 0,
+                            (acc_rope * alpha[:, None]) / denom[:, None], 0.0)
+    else:
+        denom = tl.maximum(l_i, 1e-30)
+        out_nope = tl.where(l_i[:, None] > 0, acc_nope / denom[:, None], 0.0)
+        out_rope = tl.where(l_i[:, None] > 0, acc_rope / denom[:, None], 0.0)
+
+    # store output  [BLOCK_H, NOPE_DIM] + [BLOCK_H, ROPE_DIM]
+    out_row = (out_ptr + query_idx * out_stride0
+               + head_offsets[:, None] * out_stride1)
+    tl.store(out_row + nope_offsets[None, :], out_nope,
+             mask=head_mask[:, None] & nope_mask[None, :])
+    tl.store(out_row + NOPE_DIM_C + rope_offsets[None, :], out_rope,
+             mask=head_mask[:, None])
+
+
+# ---------------------------------------------------------------------------
+# Host-side launchers
+# ---------------------------------------------------------------------------
+
+def _dense_to_ragged(
+    indices: torch.Tensor,   # [T, 1, K]
+    lengths: torch.Tensor,   # [T]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert dense indices to ragged (indptr, values) format.
+
+    Returns ``(indptr, ragged_indices)`` where
+    ``ragged_indices[indptr[t]:indptr[t+1]]`` are the valid slots for query ``t``.
+    """
+    T = lengths.shape[0]
+    L = lengths.to(torch.int64)
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=indices.device)
+    indptr[1:] = L.cumsum(0).to(torch.int32)
+    # gather valid elements
+    K = indices.shape[-1]
+    idx = indices.squeeze(1)  # [T, K]
+    mask = torch.arange(K, device=indices.device).unsqueeze(0) < L.unsqueeze(1)
+    ragged = idx[mask].contiguous()
+    return indptr, ragged
+
+
+def sparse_attn_prefill(
+    q: torch.Tensor,          # [T, H, head_dim]  bf16
+    kv: torch.Tensor,         # [N, 1, head_dim]  bf16
+    indices: torch.Tensor,    # [T, 1, topk]  int32
+    sm_scale: float,
+    attn_sink: torch.Tensor | None,  # [H]  bf16
+    topk_length: torch.Tensor,       # [T]  int32
+    out: torch.Tensor,               # [T, H, head_dim]  bf16
+) -> None:
+    """Prefill sparse MLA attention for DeepSeek-V4 (head_dim=512)."""
+    T, H, head_dim = q.shape
+    assert head_dim == COMB_DIM, f"expected head_dim={COMB_DIM}, got {head_dim}"
+    N = kv.shape[0]
+    assert kv.shape[1] == 1 and kv.shape[2] == head_dim
+
+    indptr, ragged_idx = _dense_to_ragged(indices, topk_length)
+
+    BLOCK_H = min(16, triton.next_power_of_2(H))
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    BLOCK_K = 16 if head_dim < 256 else 32
+
+    grid = (T, triton.cdiv(H, BLOCK_H))
+    _prefill_kernel[grid](
+        q, kv.squeeze(1), ragged_idx, indptr,
+        attn_sink if attn_sink is not None else q,  # dummy ptr if no sink
+        out,
+        q.stride(0), q.stride(1), q.stride(2),
+        kv.stride(0), kv.stride(2),  # squeezed: [N, head_dim]
+        out.stride(0), out.stride(1), out.stride(2),
+        H, head_dim, N, sm_scale,
+        HAS_ATTN_SINK=attn_sink is not None,
+        BLOCK_H=BLOCK_H, BLOCK_D=BLOCK_D, BLOCK_K=BLOCK_K,
+    )
+
+
+def sparse_attn_decode(
+    q: torch.Tensor,                # [D, 1, head_dim]  bf16
+    k_cache: torch.Tensor,          # [num_blocks, block_size, 1, head_bytes]  uint8
+    indices: torch.Tensor,          # [D, 1, max_swa]  int32
+    topk_length: torch.Tensor,      # [D]  int32
+    softmax_scale: float,
+    attn_sink: torch.Tensor | None, # [padded_heads]
+    extra_k_cache: torch.Tensor | None,
+    extra_indices: torch.Tensor | None,
+    extra_topk_length: torch.Tensor | None,
+    out: torch.Tensor,              # [D, 1, head_dim]  bf16
+) -> None:
+    """Decode sparse MLA attention for DeepSeek-V4 (head_dim=512).
+
+    KV cache is in fp8_ds_mla layout: per-token 576 bytes =
+    448B FP8 NOPE + 128B BF16 ROPE + 8B UE8M0 scales (at block tail).
+    """
+    D, _, _ = q.shape
+    num_heads = q.shape[1]  # typically 1 for decode, or padded_heads
+    assert q.shape[2] == COMB_DIM
+
+    # build ragged index lists
+    main_indptr, main_ragged = _dense_to_ragged(indices, topk_length)
+    has_extra = extra_k_cache is not None and extra_indices is not None
+    extra_indptr = extra_ragged = None
+    extra_rows = extra_bs = 0
+    if has_extra:
+        assert extra_topk_length is not None
+        extra_indptr, extra_ragged = _dense_to_ragged(extra_indices, extra_topk_length)
+        extra_rows = extra_k_cache.shape[0] * extra_k_cache.shape[1]
+        extra_bs = extra_k_cache.shape[1]
+
+    # cache shape → compute cache_stride0 and head_bytes
+    main_cache = k_cache.squeeze(2)  # [num_blocks, block_size, head_bytes]
+    head_bytes = main_cache.shape[2]  # per-token stride, typically 584
+    main_stride0 = main_cache.shape[1] * head_bytes  # block_size * head_bytes
+    main_rows = main_cache.shape[0] * main_cache.shape[1]
+    main_bs = main_cache.shape[1]
+    extra_stride0 = 0
+    extra_cache_flat = extra_k_cache
+    extra_rows = extra_bs = 0
+    if has_extra:
+        extra_cache_flat = extra_k_cache.squeeze(2)
+        extra_stride0 = extra_cache_flat.shape[1] * extra_cache_flat.shape[2]
+        extra_rows = extra_cache_flat.shape[0] * extra_cache_flat.shape[1]
+        extra_bs = extra_cache_flat.shape[1]
+
+    BLOCK_H = min(16, triton.next_power_of_2(num_heads))
+    BLOCK_K = 16  # 32 may be faster on SM80; tune later
+
+    # re-interpret cache as raw uint8 (Triton kernel does its own FP8 dequant)
+    main_cache_flat = main_cache.contiguous().view(torch.uint8).reshape(-1, head_bytes)
+    extra_cache_flat_u8 = None
+    if has_extra:
+        ec = extra_cache_flat.contiguous().view(torch.uint8)
+        extra_cache_flat_u8 = ec.reshape(-1, ec.shape[-1])
+
+    grid = (D, triton.cdiv(num_heads, BLOCK_H))
+    _decode_kernel[grid](
+        q, main_cache_flat, main_ragged, main_indptr,
+        extra_cache_flat_u8 if has_extra else main_cache_flat,
+        extra_ragged if has_extra else main_ragged,
+        extra_indptr if has_extra else main_indptr,
+        attn_sink if attn_sink is not None else q,
+        out,
+        q.stride(0), q.stride(1),
+        out.stride(0), out.stride(1),
+        main_stride0, extra_stride0,
+        main_rows, extra_rows, main_bs, extra_bs,
+        softmax_scale, num_heads,
+        HAS_ATTN_SINK=attn_sink is not None,
+        HAS_EXTRA=has_extra,
+        HEAD_BYTES=head_bytes,
+        NOPE_DIM_C=NOPE_DIM,
+        NOPE_BLOCK_C=NOPE_BLOCK,
+        ROPE_DIM_C=ROPE_DIM,
+        BLOCK_H=BLOCK_H, BLOCK_K=BLOCK_K,
+    )

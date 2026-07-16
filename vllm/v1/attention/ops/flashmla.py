@@ -99,11 +99,10 @@ else:
         pass
 
     # ---- SM80 / Triton fallbacks ------------------------------------------------
-    # When vllm._flashmla_C (C++ FlashMLA, SM90+ only) is unavailable, provide
-    # Triton-based or zero-stub implementations so that warmup / profile_run
-    # completes without crashing.  Real inference correctness depends on the
-    # TRITON_MLA_SPARSE attention backend which routes to the full Triton kernels
-    # through the backend rather than these direct function calls.
+    # When vllm._flashmla_C (C++ FlashMLA, SM90+ only) is unavailable,
+    # use pure-Triton sparse MLA kernels ported from the ROCm DSv4 backend
+    # (rocm_aiter_mla_sparse.py, PR #41812).  These kernels are V4-native:
+    # NOPE_DIM=448, ROPE_DIM=64, COMB_DIM=512.
 
     def _flash_mla_sparse_fwd_triton(
         q: torch.Tensor,
@@ -114,25 +113,31 @@ else:
         topk_length: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        """Triton fallback for flash_mla_sparse_fwd (prefill sparse MLA)."""
-        # Try the Triton kernel first; fall back to zero-output for warmup.
+        """Prefill sparse MLA for DeepSeek-V4 via Triton.
+
+        ``q``:  [T, H, 512] bf16
+        ``kv``: [N, 1, 512] bf16  (already gathered from cache)
+        ``indices``:  [T, 1, topk] int32
+        ``topk_length``: [T] int32 — valid entries per row
+        ``out``:  [T, H, 512] bf16  (written in-place)
+        """
+        if out is None:
+            out = torch.empty(q.shape[0], q.shape[1], 512,
+                              dtype=q.dtype, device=q.device)
         try:
-            from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
-                triton_mla_sparse_attention,
+            from vllm.v1.attention.ops.triton_mla_sparse_dsv4 import (
+                sparse_attn_prefill,
             )
-            result = triton_mla_sparse_attention(q, kv, indices, sm_scale)
-            if out is not None:
-                out.copy_(result)
-                return None
-            return result
+            sparse_attn_prefill(
+                q=q, kv=kv, indices=indices,
+                sm_scale=sm_scale, attn_sink=attn_sink,
+                topk_length=topk_length, out=out,
+            )
+            return out if out is not None else None  # type: ignore[return-value]
         except Exception:
-            if out is not None:
-                out.zero_()
-                return None
-            return torch.zeros(
-                q.shape[0], q.shape[1], 512,
-                dtype=q.dtype, device=q.device,
-            )
+            # graceful fallback for warmup / unexpected shapes
+            out.zero_()
+            return None if out._use_assumed_size else out  # type: ignore[return-value]
 
     def _flash_mla_with_kvcache_triton(
         q: torch.Tensor,
@@ -151,15 +156,37 @@ else:
         extra_topk_length: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Triton fallback for flash_mla_with_kvcache (decode sparse MLA).
+        """Decode sparse MLA for DeepSeek-V4 via Triton.
 
-        On SM80, full decode Triton path is handled by the TRITON_MLA_SPARSE
-        backend.  This stub exists so that warmup / profile_run can allocate
-        the correct workspace without crashing.
+        ``q``: [D, 1, 512] bf16
+        ``k_cache``: [num_blocks, block_size, 1, head_bytes] uint8 fp8_ds_mla
+        ``indices``: [D, 1, max_swa] int32
+        ``topk_length``: [D] int32
+        ``out``: [D, 1, 512] bf16  (written in-place)
         """
-        if out is not None:
+        if out is None:
+            out = torch.empty(q.shape[0], 1, 512,
+                              dtype=q.dtype, device=q.device)
+        try:
+            from vllm.v1.attention.ops.triton_mla_sparse_dsv4 import (
+                sparse_attn_decode,
+            )
+            sparse_attn_decode(
+                q=q,
+                k_cache=k_cache,
+                indices=indices,
+                topk_length=topk_length,
+                softmax_scale=softmax_scale,
+                attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices=extra_indices_in_kvcache,
+                extra_topk_length=extra_topk_length,
+                out=out,
+            )
+            return out, tile_scheduler_metadata
+        except Exception:
             out.zero_()
-        return out, tile_scheduler_metadata
+            return out, tile_scheduler_metadata
 
     flash_attn_varlen_func = _raise_flashmla_unavailable  # type: ignore[assignment]
     flash_attn_varlen_kvpacked_func = _raise_flashmla_unavailable  # type: ignore[assignment]
