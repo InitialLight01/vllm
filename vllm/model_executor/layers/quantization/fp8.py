@@ -502,13 +502,11 @@ class Fp8LinearMethod(LinearMethodBase):
             d = w_bf16.shape[1]
             w_3d = w_bf16.view(g, r, d)
             # x: [T, g, d],  w_3d: [g, r, d].
-            # torch.bmm requires matching batch dims (T vs g mismatch), so use
-            # torch.matmul with broadcasting: [T, g, 1, d] @ [1, g, d, r] → [T, g, 1, r]
-            # (equivalent to the FP8 einsum "bhr,hdr->bhd" with h=g, r=contracted).
-            return torch.matmul(
-                x.unsqueeze(2),            # [T, g, 1, d]
-                w_3d.transpose(1, 2).unsqueeze(0),  # [1, g, d, r]
-            ).squeeze(2)                   # [T, g, r]
+            # Equivalent to the FP8 DeepGEMM einsum "bhr,hdr->bhd" where
+            # h=g (groups), r=d (contracted dim), d=r (output dim).
+            # torch.einsum avoids the batch-size mismatch issue of torch.bmm
+            # and the broadcasting complexity of torch.matmul.
+            return torch.einsum("bgd,grd->bgr", x, w_3d)
 
         # ---- plain linear -----------------------------------------------------
         return torch.nn.functional.linear(x, w_bf16, bias)
