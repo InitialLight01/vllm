@@ -163,19 +163,30 @@ else:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Decode sparse MLA for DeepSeek-V4 via Triton.
 
-        ``q``: [D, 1, 512] bf16
+        ``q``: [D, 1, padded_H, 512] bf16 (4D from FlashMLA interface, or 3D)
         ``k_cache``: [num_blocks, block_size, 1, head_bytes] uint8 fp8_ds_mla
         ``indices``: [D, 1, max_swa] int32
         ``topk_length``: [D] int32
-        ``out``: [D, 1, 512] bf16  (written in-place)
+        ``out``: [D, 1, padded_H, 512] bf16  (written in-place)
         """
+        # q arrives as [D, 1, padded_H, 512] (FlashMLA 4D convention).
+        # Our Triton kernel expects 3D [D, num_heads, 512].
+        is_4d = q.ndim == 4
+        if is_4d:
+            D, one, padded_H, head_dim = q.shape
+            q = q.squeeze(1)             # [D, padded_H, 512]
+        else:
+            D, num_heads, head_dim = q.shape
+
         if out is None:
-            out = torch.empty(q.shape[0], 1, 512,
+            out = torch.empty(D, 1, 512 if not is_4d else q.shape[1], q.shape[2],
                               dtype=q.dtype, device=q.device)
         try:
             from vllm.v1.attention.ops.triton_mla_sparse_dsv4 import (
                 sparse_attn_decode,
             )
+            # Reshape out to match q: [D, padded_H, 512] for the kernel
+            out_3d = out.squeeze(1) if is_4d else out
             sparse_attn_decode(
                 q=q,
                 k_cache=k_cache,
@@ -186,10 +197,13 @@ else:
                 extra_k_cache=extra_k_cache,
                 extra_indices=extra_indices_in_kvcache,
                 extra_topk_length=extra_topk_length,
-                out=out,
+                out=out_3d,
             )
             return out, tile_scheduler_metadata
-        except Exception:
+        except Exception as e:
+            import sys, traceback
+            print(f"[DEBUG] sparse_attn_decode FAILED: {e}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
             out.zero_()
             return out, tile_scheduler_metadata
 
