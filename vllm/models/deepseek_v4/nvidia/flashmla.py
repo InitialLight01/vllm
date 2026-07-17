@@ -275,9 +275,11 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 f"Unsupported compress_ratio={self.compress_ratio}; "
                 "expected 1, 4, or 128."
             )
-        if tile_metadata is None:
+        if tile_metadata is None and not current_platform.is_sm80_context():
             # Warmup / profile_run may not allocate tile_scheduler entries for
-            # every layer type.  Zero the decode output and return early.
+            # every layer type on non-SM80 paths.  On SM80 the pure-Triton
+            # fallback (_flash_mla_with_kvcache_triton) does not require
+            # tile_scheduler_metadata.
             output.zero_()
             return
 

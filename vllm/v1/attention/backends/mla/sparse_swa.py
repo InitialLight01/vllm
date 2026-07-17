@@ -569,6 +569,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
+            or current_platform.is_sm80_context()
         ):
             return out
         for layer_type in self._layer_types:
