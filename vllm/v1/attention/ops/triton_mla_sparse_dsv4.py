@@ -438,12 +438,14 @@ def sparse_attn_decode(
     BLOCK_H = min(16, triton.next_power_of_2(num_heads))
     BLOCK_K = 16  # 32 may be faster on SM80; tune later
 
-    # re-interpret cache as raw uint8 (Triton kernel does its own FP8 dequant)
-    main_cache_flat = main_cache.contiguous().view(torch.uint8).reshape(-1, head_bytes)
+    # Pass a 1D byte view so the kernel's byte-offset arithmetic
+    # (block_ptr + pos*TOKEN_STRIDE for data, block_ptr + BLOCK_SIZE*TOKEN_STRIDE
+    # + pos*SCALE_DIM for scales) works correctly regardless of how the
+    # compressor packs data and scales within the 584-byte per-token slot.
+    main_cache_flat = main_cache.contiguous().view(torch.uint8).reshape(-1)
     extra_cache_flat_u8 = None
     if has_extra:
-        ec = extra_cache_flat.contiguous().view(torch.uint8)
-        extra_cache_flat_u8 = ec.reshape(-1, ec.shape[-1])
+        extra_cache_flat_u8 = extra_cache_flat.contiguous().view(torch.uint8).reshape(-1)
 
     grid = (D, triton.cdiv(num_heads, BLOCK_H))
     _decode_kernel[grid](
