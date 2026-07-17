@@ -158,7 +158,10 @@ def _decode_kernel(
     num_heads,
     HAS_ATTN_SINK: tl.constexpr,
     HAS_EXTRA: tl.constexpr,
-    HEAD_BYTES: tl.constexpr,  # per-token stride in bytes (584 for V4)
+    HEAD_BYTES: tl.constexpr,  # per-token cache stride (584 for V4)
+    TOKEN_STRIDE: tl.constexpr,  # data bytes per token (576 = 448 nope + 128 rope)
+    SCALE_DIM: tl.constexpr,  # scale bytes per token (8)
+    BLOCK_SIZE: tl.constexpr,  # tokens per block (64)
     NOPE_DIM_C: tl.constexpr,  # 448
     NOPE_BLOCK_C: tl.constexpr,  # triton.next_power_of_2(448)
     ROPE_DIM_C: tl.constexpr,  # 64
@@ -168,9 +171,11 @@ def _decode_kernel(
     """Single-launch decode attention over two ragged KV lists.
 
     KV cache layout (per token, HEAD_BYTES bytes, 584 for V4):
-        [0..447]     NOPE as uint8 (FP8 e4m3nv) — 448 bytes
-        [448..575]   ROPE as bf16 — 64×2 = 128 bytes
-        [576..583]   UE8M0 scales inline — 8 bytes (1/group of 64)
+        Data region: TOKEN_STRIDE bytes (576) per token
+            [0..447]     NOPE as uint8 (FP8 e4m3nv)
+            [448..575]   ROPE as bf16 — 64×2 = 128 bytes
+        Scale region: SCALE_DIM bytes (8) per token, stored AFTER all
+            token data in the block (at offset BLOCK_SIZE * TOKEN_STRIDE)
 
     Scales are UE8M0 (exponent-only): ``scale = 2^(encoded - 127)``.
     """
@@ -217,12 +222,13 @@ def _decode_kernel(
         block_idx = safe_slot // main_block_size
         pos_in_block = safe_slot % main_block_size
         block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
-        token_data = block_ptr + pos_in_block * HEAD_BYTES
+        token_data = block_ptr + pos_in_block * TOKEN_STRIDE
 
         x_uint8 = tl.load(token_data[:, None] + nope_offsets[None, :],
                           mask=valid[:, None] & nope_mask[None, :], other=0)
         x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        scale_ptr = token_data + NOPE_DIM_C + ROPE_DIM_C * 2  # offset 576
+        # scales stored in separate region: block_base + BLOCK_SIZE*TOKEN_STRIDE + pos*SCALE_DIM
+        scale_ptr = block_ptr + BLOCK_SIZE * TOKEN_STRIDE + pos_in_block * SCALE_DIM
         encoded = tl.load(scale_ptr[:, None] + nope_offsets[None, :] // 64,
                           mask=valid[:, None] & nope_mask[None, :], other=127)
         scales = tl.exp2(encoded.to(tl.float32) - 127.0)
@@ -264,7 +270,7 @@ def _decode_kernel(
             block_idx = safe_slot // extra_block_size
             pos_in_block = safe_slot % extra_block_size
             block_ptr = extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
-            token_data = block_ptr + pos_in_block * HEAD_BYTES
+            token_data = block_ptr + pos_in_block * TOKEN_STRIDE
 
             x_uint8 = tl.load(token_data[:, None] + nope_offsets[None, :],
                               mask=valid[:, None] & nope_mask[None, :], other=0)
@@ -455,6 +461,9 @@ def sparse_attn_decode(
         HAS_ATTN_SINK=attn_sink is not None,
         HAS_EXTRA=has_extra,
         HEAD_BYTES=head_bytes,
+        TOKEN_STRIDE=NOPE_DIM + ROPE_DIM * 2,  # 448 + 128 = 576
+        SCALE_DIM=NOPE_DIM // 64 + 1,  # 7 + 1 = 8
+        BLOCK_SIZE=main_bs,
         NOPE_DIM_C=NOPE_DIM,
         NOPE_BLOCK_C=NOPE_BLOCK,
         ROPE_DIM_C=ROPE_DIM,
