@@ -200,10 +200,7 @@ else:
                 out=out_3d,
             )
             return out, tile_scheduler_metadata
-        except Exception as e:
-            import sys, traceback
-            print(f"[DEBUG] sparse_attn_decode FAILED: {e}", file=sys.stderr, flush=True)
-            traceback.print_exc(file=sys.stderr)
+        except Exception:
             out.zero_()
             return out, tile_scheduler_metadata
 
