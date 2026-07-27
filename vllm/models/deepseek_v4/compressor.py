@@ -352,13 +352,20 @@ class DeepseekCompressor(nn.Module):
 
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
+        # SM80 / FORCE_SM80: use Triton compressor — CuTeDSL is compiled for
+        # the real hardware arch and its output format may differ from what the
+        # pure-Triton decode kernel expects.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if (
+            current_platform.is_cuda()
+            and self.head_dim == 512
+            and not current_platform.is_sm80_context()
+        ):
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
 
-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
+            # head=512 on CUDA (SM90+) uses cutedsl, for both the fp8_ds_mla
             # layout and the plain full-cache layout. The full-cache flags
             # are consumed only here.
             compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl

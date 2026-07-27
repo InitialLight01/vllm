@@ -666,12 +666,13 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def is_sm80_context(cls) -> bool:
-        """True when SM80 (Ampere) code paths should be used."""
-        from vllm.envs import VLLM_FORCE_SM80
+        """True when SM80 (Ampere) code paths should be used.
+
+        Relies on ``get_device_capability()`` which returns (8,0) when
+        ``VLLM_FORCE_SM80=1``, so no separate env-var check is needed here.
+        """
         cap = cls.get_device_capability()
-        if cap is None:
-            return False
-        return cap.major < 9 or VLLM_FORCE_SM80
+        return cap is not None and cap.major < 9
 
     @classmethod
     def is_integrated_gpu(cls, device_id: int = 0) -> bool:
@@ -735,6 +736,10 @@ class NvmlCudaPlatform(CudaPlatformBase):
     @cache
     @with_nvml_context
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+        from vllm.envs import VLLM_FORCE_SM80
+
+        if VLLM_FORCE_SM80:
+            return DeviceCapability(major=8, minor=0)
         try:
             physical_device_id = cls.device_id_to_physical_device_id(device_id)
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
