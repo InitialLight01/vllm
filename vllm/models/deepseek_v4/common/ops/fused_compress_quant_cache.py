@@ -252,7 +252,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     # Clip each element to a fixed global bound (the typical RMSNorm output
     # range is [-5, 5]; attention spikes can reach ±100+ but contribute
     # negligible signal).
-    quant_2d = tl.clamp(quant_2d, -10.0, 10.0)
+    quant_2d = tl.clamp(quant_2d, -5.0, 5.0)
     # Recompute absmax from clipped data
     block_absmax = tl.max(tl.abs(quant_2d), axis=1)
     block_absmax = tl.maximum(block_absmax, 1e-4)
