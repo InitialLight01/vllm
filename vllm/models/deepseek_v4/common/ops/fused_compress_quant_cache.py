@@ -247,6 +247,16 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     block_absmax = tl.max(abs_2d, axis=1)  # [N_QUANT_BLOCKS] fp32
     block_absmax = tl.maximum(block_absmax, 1e-4)
 
+    # --- outlier suppression ---
+    # Outliers inflate per-block scales and crush small values to zero in FP8.
+    # Clip each element to a fixed global bound (the typical RMSNorm output
+    # range is [-5, 5]; attention spikes can reach ±100+ but contribute
+    # negligible signal).
+    quant_2d = tl.clamp(quant_2d, -10.0, 10.0)
+    # Recompute absmax from clipped data
+    block_absmax = tl.max(tl.abs(quant_2d), axis=1)
+    block_absmax = tl.maximum(block_absmax, 1e-4)
+
     raw_scales = block_absmax * INV_FP8_MAX
     exponents = tl.ceil(tl.log2(raw_scales))
     inv_scales = tl.exp2(-exponents)

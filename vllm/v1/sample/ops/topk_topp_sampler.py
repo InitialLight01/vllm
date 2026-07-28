@@ -35,6 +35,10 @@ def flashinfer_sampler_supported() -> bool:
     """
     if not current_platform.is_cuda():
         return False
+    if current_platform.is_sm80_context():
+        # SM80 has no FP8 tensor cores; FlashInfer cubins may not be compiled
+        # for SM80.  Use the native PyTorch fallback instead.
+        return False
     if not envs.VLLM_USE_FLASHINFER_SAMPLER:
         logger.info_once(
             "FlashInfer top-p/top-k sampling disabled via "
