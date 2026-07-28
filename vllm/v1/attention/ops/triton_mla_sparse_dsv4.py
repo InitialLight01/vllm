@@ -158,10 +158,11 @@ def _decode_kernel(
     num_heads,
     HAS_ATTN_SINK: tl.constexpr,
     HAS_EXTRA: tl.constexpr,
-    HEAD_BYTES: tl.constexpr,  # per-token cache stride (584 for V4)
-    TOKEN_STRIDE: tl.constexpr,  # data bytes per token (576 = 448 nope + 128 rope)
-    SCALE_DIM: tl.constexpr,  # scale bytes per token (8)
+    HEAD_BYTES: tl.constexpr,  # per-token cache stride (584 FP8, 512 BF16)
+    TOKEN_STRIDE: tl.constexpr,  # data bytes per token (576 FP8, 512 BF16)
+    SCALE_DIM: tl.constexpr,  # scale bytes per token (8 FP8, 0 BF16)
     BLOCK_SIZE: tl.constexpr,  # tokens per block (64)
+    IS_BF16_CACHE: tl.constexpr,  # True → read NOPE as bf16; False → read FP8
     NOPE_DIM_C: tl.constexpr,  # 448
     NOPE_BLOCK_C: tl.constexpr,  # triton.next_power_of_2(448)
     ROPE_DIM_C: tl.constexpr,  # 64
@@ -170,14 +171,16 @@ def _decode_kernel(
 ):
     """Single-launch decode attention over two ragged KV lists.
 
-    KV cache layout (per token, HEAD_BYTES bytes, 584 for V4):
+    FP8 cache layout (IS_BF16_CACHE=False, HEAD_BYTES=584):
         Data region: TOKEN_STRIDE bytes (576) per token
             [0..447]     NOPE as uint8 (FP8 e4m3nv)
-            [448..575]   ROPE as bf16 — 64×2 = 128 bytes
-        Scale region: SCALE_DIM bytes (8) per token, stored AFTER all
-            token data in the block (at offset BLOCK_SIZE * TOKEN_STRIDE)
+            [448..575]   ROPE as bf16
+        Scale region: SCALE_DIM bytes (8) per token, stored at offset
+            BLOCK_SIZE * TOKEN_STRIDE in the block.
 
-    Scales are UE8M0 (exponent-only): ``scale = 2^(encoded - 127)``.
+    BF16 cache layout (IS_BF16_CACHE=True, HEAD_BYTES=512):
+        Each token: [0..447] NOPE bf16, [448..511] ROPE bf16.
+        No scale region (SCALE_DIM=0, TOKEN_STRIDE=512).
     """
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -224,17 +227,23 @@ def _decode_kernel(
         block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
         token_data = block_ptr + pos_in_block * TOKEN_STRIDE
 
-        x_uint8 = tl.load(token_data[:, None] + nope_offsets[None, :],
-                          mask=valid[:, None] & nope_mask[None, :], other=0)
-        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        # scales stored in separate region: block_base + BLOCK_SIZE*TOKEN_STRIDE + pos*SCALE_DIM
-        scale_ptr = block_ptr + BLOCK_SIZE * TOKEN_STRIDE + pos_in_block * SCALE_DIM
-        encoded = tl.load(scale_ptr[:, None] + nope_offsets[None, :] // 64,
-                          mask=valid[:, None] & nope_mask[None, :], other=127)
-        scales = tl.exp2(encoded.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
-        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
-        k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+        if IS_BF16_CACHE:
+            nope_ptr = token_data.to(tl.pointer_type(tl.bfloat16))
+            k_nope = tl.load(nope_ptr[:, None] + nope_offsets[None, :],
+                             mask=valid[:, None] & nope_mask[None, :], other=0.0)
+            k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+            k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+        else:
+            x_uint8 = tl.load(token_data[:, None] + nope_offsets[None, :],
+                              mask=valid[:, None] & nope_mask[None, :], other=0)
+            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            scale_ptr = block_ptr + BLOCK_SIZE * TOKEN_STRIDE + pos_in_block * SCALE_DIM
+            encoded = tl.load(scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                              mask=valid[:, None] & nope_mask[None, :], other=127)
+            scales = tl.exp2(encoded.to(tl.float32) - 127.0)
+            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+            k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
         rope_ptr = (token_data + NOPE_DIM_C).to(tl.pointer_type(tl.bfloat16))
         k_rope = tl.load(rope_ptr[:, None] + rope_offsets[None, :],
@@ -402,12 +411,17 @@ def sparse_attn_decode(
 ) -> None:
     """Decode sparse MLA attention for DeepSeek-V4 (head_dim=512).
 
-    KV cache is in fp8_ds_mla layout: per-token 576 bytes =
-    448B FP8 NOPE + 128B BF16 ROPE + 8B UE8M0 scales (at block tail).
+    Supports both fp8_ds_mla and bf16 KV cache formats.
     """
     D, _, _ = q.shape
-    num_heads = q.shape[1]  # typically 1 for decode, or padded_heads
+    num_heads = q.shape[1]
     assert q.shape[2] == COMB_DIM
+
+    # Detect cache format: uint8 → fp8_ds_mla, bf16 → pure bf16
+    is_bf16_cache = k_cache.dtype == torch.bfloat16
+    head_bytes = 512 if is_bf16_cache else 584
+    token_stride = 512 if is_bf16_cache else NOPE_DIM + ROPE_DIM * 2  # 576
+    scale_dim = 0 if is_bf16_cache else NOPE_DIM // 64 + 1  # 8
 
     # build ragged index lists
     main_indptr, main_ragged = _dense_to_ragged(indices, topk_length)
@@ -420,9 +434,8 @@ def sparse_attn_decode(
         extra_rows = extra_k_cache.shape[0] * extra_k_cache.shape[1]
         extra_bs = extra_k_cache.shape[1]
 
-    # cache shape → compute cache_stride0 and head_bytes
+    # cache shape → compute stride parameters
     main_cache = k_cache.squeeze(2)  # [num_blocks, block_size, head_bytes]
-    head_bytes = main_cache.shape[2]  # per-token stride, typically 584
     main_stride0 = main_cache.shape[1] * head_bytes  # block_size * head_bytes
     main_rows = main_cache.shape[0] * main_cache.shape[1]
     main_bs = main_cache.shape[1]
@@ -431,19 +444,24 @@ def sparse_attn_decode(
     extra_rows = extra_bs = 0
     if has_extra:
         extra_cache_flat = extra_k_cache.squeeze(2)
-        extra_stride0 = extra_cache_flat.shape[1] * extra_cache_flat.shape[2]
+        extra_stride0 = extra_cache_flat.shape[1] * head_bytes
         extra_rows = extra_cache_flat.shape[0] * extra_cache_flat.shape[1]
         extra_bs = extra_cache_flat.shape[1]
 
     BLOCK_H = min(16, triton.next_power_of_2(num_heads))
-    BLOCK_K = 16  # 32 may be faster on SM80; tune later
+    BLOCK_K = 16
 
-    # Pass a 1D byte view so the kernel's byte-offset arithmetic
-    # (block_ptr + pos*TOKEN_STRIDE for data, block_ptr + BLOCK_SIZE*TOKEN_STRIDE
-    # + pos*SCALE_DIM for scales) works correctly regardless of how the
-    # compressor packs data and scales within the 584-byte per-token slot.
-    main_cache_flat = main_cache.contiguous().view(torch.uint8).reshape(-1)
-    extra_cache_flat_u8 = None
+    # Pass a 1D byte view for FP8, or as bf16 for BF16 cache
+    if is_bf16_cache:
+        main_cache_flat = main_cache.contiguous().view(torch.bfloat16).reshape(-1)
+        extra_cache_flat_u8 = None
+        if has_extra:
+            extra_cache_flat_u8 = extra_cache_flat.contiguous().view(torch.bfloat16).reshape(-1)
+    else:
+        main_cache_flat = main_cache.contiguous().view(torch.uint8).reshape(-1)
+        extra_cache_flat_u8 = None
+        if has_extra:
+            extra_cache_flat_u8 = extra_cache_flat.contiguous().view(torch.uint8).reshape(-1)
     if has_extra:
         extra_cache_flat_u8 = extra_cache_flat.contiguous().view(torch.uint8).reshape(-1)
 
@@ -463,9 +481,10 @@ def sparse_attn_decode(
         HAS_ATTN_SINK=attn_sink is not None,
         HAS_EXTRA=has_extra,
         HEAD_BYTES=head_bytes,
-        TOKEN_STRIDE=NOPE_DIM + ROPE_DIM * 2,  # 448 + 128 = 576
-        SCALE_DIM=NOPE_DIM // 64 + 1,  # 7 + 1 = 8
+        TOKEN_STRIDE=token_stride,
+        SCALE_DIM=scale_dim,
         BLOCK_SIZE=main_bs,
+        IS_BF16_CACHE=is_bf16_cache,
         NOPE_DIM_C=NOPE_DIM,
         NOPE_BLOCK_C=NOPE_BLOCK,
         ROPE_DIM_C=ROPE_DIM,
