@@ -197,46 +197,45 @@ else:
             tstride = 448 + 64 * 2  # 576
             sdim = 448 // 64 + 1  # 8
 
-            # Gather NOPE+ROPE from cache into BF16 for each required token
+            # Vectorized gather: dequantize all KV slots at once
             idx = indices.squeeze(1)  # [D, max_swa]
             lens = topk_length  # [D]
 
             D = q.shape[0]
             max_len = lens.max().item()
-            # Accumulate all unique KV slots
-            kv_slots = idx[:, :max_len].unique()
+            total_slots = D * max_len  # over-allocate, mask later
+            flat_idx = idx[:, :max_len].reshape(-1)  # [D*max_len]
 
-            # Build gathered KV: [num_kv, 1, 512]
-            kv_bf16 = torch.zeros(len(kv_slots), 1, 512, dtype=torch.bfloat16, device=q.device)
-            for i, slot in enumerate(kv_slots.tolist()):
-                block_idx = slot // bs
-                pos_in_block = slot % bs
-                base = block_idx * bs * hb
-                data_off = base + pos_in_block * tstride
-                scale_off = base + bs * tstride + pos_in_block * sdim
+            # Compute block/position for each slot
+            block_idx = flat_idx // bs
+            pos_in_block = flat_idx % bs
 
-                # Decode NOPE (FP8 → BF16)
-                nope_raw = cache_u8[data_off : data_off + 448]
-                nope_fp8 = nope_raw.view(torch.float8_e4m3fn)
-                scale_u8 = cache_u8[scale_off : scale_off + sdim]
-                scale_f32 = 2.0 ** (scale_u8.float() - 127.0)
-                nope_deq = torch.empty(448, dtype=torch.bfloat16, device=q.device)
-                for g in range(7):
-                    nope_deq[g*64:(g+1)*64] = nope_fp8[g*64:(g+1)*64].to(torch.bfloat16) * scale_f32[g].to(torch.bfloat16)
+            # Byte offsets for NOPE data
+            data_off = (block_idx * bs * hb + pos_in_block * tstride).long()
+            # Byte offsets for scales
+            scale_off = (block_idx * bs * hb + bs * tstride + pos_in_block * sdim).long()
 
-                # ROPE is bf16 directly
-                rope_bf16 = cache_u8[data_off + 448 : data_off + 448 + 128].view(torch.bfloat16)
+            # Gather NOPE as FP8 → dequant to BF16 (use index_select for speed)
+            nope_deq = torch.empty(total_slots, 448, dtype=torch.bfloat16, device=q.device)
+            for g in range(7):
+                off_g = data_off + g * 64
+                nope_g = cache_u8[off_g.unsqueeze(1) + torch.arange(64, device=q.device)]
+                nope_f8_g = nope_g.view(torch.float8_e4m3fn)
+                scale_g = 2.0 ** (cache_u8[scale_off + g].float() - 127.0).to(torch.bfloat16)
+                nope_deq[:, g*64:(g+1)*64] = nope_f8_g.to(torch.bfloat16) * scale_g.unsqueeze(1)
 
-                kv_bf16[i, 0, :448] = nope_deq
-                kv_bf16[i, 0, 448:] = rope_bf16
+            # Gather ROPE as BF16 (use index_select)
+            rope_off = data_off + 448
+            rope_deq = torch.empty(total_slots, 64, dtype=torch.bfloat16, device=q.device)
+            for r in range(4):
+                off_r = rope_off + r * 16
+                rope_deq[:, r*16:(r+1)*16] = cache_u8[off_r.unsqueeze(1) + torch.arange(16, device=q.device)].view(torch.bfloat16)
 
-            # Map slot → index in kv_bf16
-            slot_to_idx = {s.item(): i for i, s in enumerate(kv_slots)}
-            kv_indices = torch.zeros(D, 1, max_len, dtype=torch.int32, device=q.device)
-            for d in range(D):
-                L = lens[d].item()
-                for k in range(L):
-                    kv_indices[d, 0, k] = slot_to_idx[idx[d, k].item()]
+            # Build KV: [num_kv, 1, 512]
+            kv_bf16 = torch.cat([nope_deq, rope_deq], dim=1).unsqueeze(1)  # [total_slots, 1, 512]
+
+            # Indices: map flat positions to KV slots
+            kv_indices = torch.arange(total_slots, dtype=torch.int32, device=q.device).view(D, 1, max_len)
 
             # Reshape out: [D, padded_H, 512]
             out_3d = out.squeeze(1) if is_4d else out
