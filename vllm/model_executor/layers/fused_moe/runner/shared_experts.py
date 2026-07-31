@@ -162,6 +162,23 @@ class SharedExperts(torch.nn.Module):
         if order != experts_order:
             return None
 
+        # PR #46950 / Issue #46857: During model compilation or warmup, a
+        # failed forward pass (e.g. AOT shape mismatch) can leave a stale
+        # tensor in the output slot.  The next warmup attempt would then hit
+        # the assertion below.  Clear the stale slot with a warning instead
+        # of crashing — this is safe because the stale tensor was produced by
+        # a failed pass and will never be consumed.
+        stale = self._output[self._output_idx]
+        if stale is not None:
+            logger.warning_once(
+                "shared_experts output slot [%d] was not consumed before "
+                "the next forward() call; clearing stale tensor (shape=%s). "
+                "This can happen during a failed compilation / warmup pass.",
+                self._output_idx,
+                tuple(stale.shape),
+            )
+            self._output[self._output_idx] = None
+
         assert self._output[self._output_idx] is None
 
         if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
