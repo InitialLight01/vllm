@@ -188,55 +188,67 @@ else:
             # GATHER: dequantize KV from fp8 cache to BF16, then use
             # the prefill kernel (which takes BF16) for decode attention.
             # This avoids FP8 decode-kernel dequant routing altogether.
+            # Vectorized: process all unique KV slots in parallel.
             import torch
 
-            # Build dense KV from cache: [num_kv, 1, head_dim] bf16
             cache_u8 = k_cache.contiguous().view(torch.uint8).reshape(-1)
             bs = k_cache.shape[1]  # block_size
             hb = k_cache.shape[3]  # head_bytes
             tstride = 448 + 64 * 2  # 576
             sdim = 448 // 64 + 1  # 8
+            device = q.device
 
-            # Gather NOPE+ROPE from cache into BF16 for each required token
             idx = indices.squeeze(1)  # [D, max_swa]
             lens = topk_length  # [D]
-
             D = q.shape[0]
             max_len = lens.max().item()
-            # Accumulate all unique KV slots
             kv_slots = idx[:, :max_len].unique()
+            num_kv = len(kv_slots)
 
-            # Build gathered KV: [num_kv, 1, 512]
-            kv_bf16 = torch.zeros(len(kv_slots), 1, 512, dtype=torch.bfloat16, device=q.device)
-            for i, slot in enumerate(kv_slots.tolist()):
-                block_idx = slot // bs
-                pos_in_block = slot % bs
-                base = block_idx * bs * hb
-                data_off = base + pos_in_block * tstride
-                scale_off = base + bs * tstride + pos_in_block * sdim
+            # ---- vectorized: compute offsets for all slots --------
+            block_idx = (kv_slots // bs).long()       # [num_kv]
+            pos_in_block = (kv_slots % bs).long()     # [num_kv]
+            block_base = block_idx * (bs * hb)        # [num_kv]
+            data_offs = block_base + pos_in_block * tstride   # [num_kv]
+            scale_offs = block_base + bs * tstride + pos_in_block * sdim  # [num_kv]
 
-                # Decode NOPE (FP8 → BF16)
-                nope_raw = cache_u8[data_off : data_off + 448]
-                nope_fp8 = nope_raw.view(torch.float8_e4m3fn)
-                scale_u8 = cache_u8[scale_off : scale_off + sdim]
-                scale_f32 = 2.0 ** (scale_u8.float() - 127.0)
-                nope_deq = torch.empty(448, dtype=torch.bfloat16, device=q.device)
-                for g in range(7):
-                    nope_deq[g*64:(g+1)*64] = nope_fp8[g*64:(g+1)*64].to(torch.bfloat16) * scale_f32[g].to(torch.bfloat16)
+            # ---- read NOPE + ROPE data bytes in bulk -------------
+            # data region: 576 bytes per slot (448 fp8 nope + 128 bf16 rope)
+            byte_arange = torch.arange(tstride, device=device)  # [576]
+            all_data_offs = data_offs.unsqueeze(1) + byte_arange.unsqueeze(0)  # [num_kv, 576]
+            data_bytes = cache_u8[all_data_offs]  # [num_kv, 576] uint8
 
-                # ROPE is bf16 directly
-                rope_bf16 = cache_u8[data_off + 448 : data_off + 448 + 128].view(torch.bfloat16)
+            # ---- dequantize NOPE: fp8→bf16 per-group ------------
+            nope_bytes = data_bytes[:, :448]  # [num_kv, 448]
+            nope_fp8 = nope_bytes.reshape(-1).view(torch.float8_e4m3fn).reshape(num_kv, 448)
+            nope_bf16 = nope_fp8.to(torch.bfloat16)  # [num_kv, 448]
 
-                kv_bf16[i, 0, :448] = nope_deq
-                kv_bf16[i, 0, 448:] = rope_bf16
+            # read UE8M0 scales
+            scale_arange = torch.arange(sdim, device=device)  # [8]
+            all_scale_offs = scale_offs.unsqueeze(1) + scale_arange.unsqueeze(0)  # [num_kv, 8]
+            scale_u8 = cache_u8[all_scale_offs]  # [num_kv, 8]
+            scale_f32 = 2.0 ** (scale_u8.float() - 127.0)  # [num_kv, 8]
+            scale_bf16 = scale_f32.to(torch.bfloat16)  # [num_kv, 8]
 
-            # Map slot → index in kv_bf16
-            slot_to_idx = {s.item(): i for i, s in enumerate(kv_slots)}
-            kv_indices = torch.zeros(D, 1, max_len, dtype=torch.int32, device=q.device)
-            for d in range(D):
-                L = lens[d].item()
-                for k in range(L):
-                    kv_indices[d, 0, k] = slot_to_idx[idx[d, k].item()]
+            # apply per-group scales: 7 groups of 64
+            for g in range(7):
+                nope_bf16[:, g * 64 : (g + 1) * 64] *= scale_bf16[:, g : g + 1]
+
+            # ---- read ROPE (bf16 stored as raw bytes) ------------
+            rope_bytes = data_bytes[:, 448:576].reshape(num_kv, -1)
+            rope_bf16 = rope_bytes.reshape(-1).view(torch.bfloat16).reshape(num_kv, 64)
+
+            # ---- assemble gathered KV -----------------------------
+            kv_bf16 = torch.empty(num_kv, 1, 512, dtype=torch.bfloat16, device=device)
+            kv_bf16[:, 0, :448] = nope_bf16
+            kv_bf16[:, 0, 448:] = rope_bf16
+
+            # ---- vectorized slot→index mapping -------------------
+            flat_idx = idx[:, :max_len].reshape(-1)  # [D * max_len]
+            sorted_slots, sort_idx = kv_slots.sort()
+            sorted_positions = torch.searchsorted(sorted_slots, flat_idx)
+            kv_indices_flat = sort_idx[sorted_positions]
+            kv_indices = kv_indices_flat.view(D, 1, max_len)
 
             # Reshape out: [D, padded_H, 512]
             out_3d = out.squeeze(1) if is_4d else out
