@@ -109,6 +109,30 @@ else:
     # (rocm_aiter_mla_sparse.py, PR #41812).  These kernels are V4-native:
     # NOPE_DIM=448, ROPE_DIM=64, COMB_DIM=512.
 
+    # Buffer cache for CUDA-graph-compatible gather — avoids allocations
+    # inside the capture region (torch.arange / empty / advanced indexing
+    # all trigger cudaErrorStreamCaptureUnsupported).
+    _gather_cache: dict[tuple[int, torch.device], dict[str, torch.Tensor]] = {}
+
+    @staticmethod
+    def _get_gather_buffers(
+        num_kv: int, device: torch.device
+    ) -> dict[str, torch.Tensor]:
+        """Return (or allocate) reusable gather buffers sized for ``num_kv``."""
+        cache = _flash_mla_with_kvcache_triton._gather_cache  # type: ignore[attr-defined]
+        key = (num_kv, device)
+        if key not in cache:
+            # allocate once, reuse across decode steps
+            cache[key] = {
+                "byte_arange": torch.arange(576, device=device),
+                "scale_arange": torch.arange(8, device=device),
+                "nope_bf16": torch.empty(num_kv, 448, dtype=torch.bfloat16, device=device),
+                "kv_bf16": torch.empty(num_kv, 1, 512, dtype=torch.bfloat16, device=device),
+                "data_bytes": torch.empty(num_kv, 576, dtype=torch.uint8, device=device),
+                "scale_bytes": torch.empty(num_kv, 8, dtype=torch.uint8, device=device),
+            }
+        return cache[key]
+
     def _flash_mla_sparse_fwd_triton(
         q: torch.Tensor,
         kv: torch.Tensor,
@@ -212,43 +236,43 @@ else:
             data_offs = block_base + pos_in_block * tstride   # [num_kv]
             scale_offs = block_base + bs * tstride + pos_in_block * sdim  # [num_kv]
 
-            # ---- read NOPE + ROPE data bytes in bulk -------------
-            # data region: 576 bytes per slot (448 fp8 nope + 128 bf16 rope)
-            byte_arange = torch.arange(tstride, device=device)  # [576]
-            all_data_offs = data_offs.unsqueeze(1) + byte_arange.unsqueeze(0)  # [num_kv, 576]
-            data_bytes = cache_u8[all_data_offs]  # [num_kv, 576] uint8
+            # ---- read NOPE + ROPE data bytes in bulk (CUDA-graph-safe) ----
+            bufs = _flash_mla_with_kvcache_triton._get_gather_buffers(num_kv, device)
+            byte_arange = bufs["byte_arange"]   # pre-allocated [576]
+            all_data_offs = data_offs.unsqueeze(1) + byte_arange.unsqueeze(0)
+            data_bytes = bufs["data_bytes"][:num_kv]  # slice pre-allocated
+            data_bytes.copy_(cache_u8[all_data_offs])  # copy into pre-allocated
 
-            # ---- dequantize NOPE: fp8→bf16 per-group ------------
-            nope_bytes = data_bytes[:, :448]  # [num_kv, 448]
-            nope_fp8 = nope_bytes.reshape(-1).view(torch.float8_e4m3fn).reshape(num_kv, 448)
-            nope_bf16 = nope_fp8.to(torch.bfloat16)  # [num_kv, 448]
+            # ---- dequantize NOPE: fp8→bf16 per-group, in-place on pre-allocated ----
+            nope_fp8 = data_bytes[:, :448].reshape(-1).view(torch.float8_e4m3fn).reshape(num_kv, 448)
+            nope_bf16 = bufs["nope_bf16"][:num_kv]
+            nope_bf16.copy_(nope_fp8.to(torch.bfloat16))
 
-            # read UE8M0 scales
-            scale_arange = torch.arange(sdim, device=device)  # [8]
-            all_scale_offs = scale_offs.unsqueeze(1) + scale_arange.unsqueeze(0)  # [num_kv, 8]
-            scale_u8 = cache_u8[all_scale_offs]  # [num_kv, 8]
-            scale_f32 = 2.0 ** (scale_u8.float() - 127.0)  # [num_kv, 8]
-            scale_bf16 = scale_f32.to(torch.bfloat16)  # [num_kv, 8]
+            # read UE8M0 scales (CUDA-graph-safe)
+            scale_arange = bufs["scale_arange"]  # pre-allocated [8]
+            all_scale_offs = scale_offs.unsqueeze(1) + scale_arange.unsqueeze(0)
+            scale_bytes = bufs["scale_bytes"][:num_kv]
+            scale_bytes.copy_(cache_u8[all_scale_offs])
+            scale_f32 = 2.0 ** (scale_bytes.float() - 127.0)
+            scale_bf16 = scale_f32.to(torch.bfloat16)
 
-            # apply per-group scales: 7 groups of 64
+            # apply per-group scales: 7 groups of 64 (in-place, CUDA-graph-safe)
             for g in range(7):
                 nope_bf16[:, g * 64 : (g + 1) * 64] *= scale_bf16[:, g : g + 1]
 
-            # ---- read ROPE (bf16 stored as raw bytes) ------------
-            rope_bytes = data_bytes[:, 448:576].reshape(num_kv, -1)
-            rope_bf16 = rope_bytes.reshape(-1).view(torch.bfloat16).reshape(num_kv, 64)
+            # ---- read ROPE (bf16 stored as raw bytes) --------------------
+            rope_bf16 = data_bytes[:, 448:576].reshape(-1).view(torch.bfloat16).reshape(num_kv, 64)
 
-            # ---- assemble gathered KV -----------------------------
-            kv_bf16 = torch.empty(num_kv, 1, 512, dtype=torch.bfloat16, device=device)
+            # ---- assemble gathered KV into pre-allocated buffer ----------
+            kv_bf16 = bufs["kv_bf16"][:num_kv]
             kv_bf16[:, 0, :448] = nope_bf16
             kv_bf16[:, 0, 448:] = rope_bf16
 
-            # ---- vectorized slot→index mapping -------------------
+            # ---- vectorized slot→index mapping (allocates, but small) ----
             flat_idx = idx[:, :max_len].reshape(-1)  # [D * max_len]
             sorted_slots, sort_idx = kv_slots.sort()
             sorted_positions = torch.searchsorted(sorted_slots, flat_idx)
-            kv_indices_flat = sort_idx[sorted_positions]
-            kv_indices = kv_indices_flat.view(D, 1, max_len)
+            kv_indices = sort_idx[sorted_positions].view(D, 1, max_len)
 
             # Reshape out: [D, padded_H, 512]
             out_3d = out.squeeze(1) if is_4d else out
