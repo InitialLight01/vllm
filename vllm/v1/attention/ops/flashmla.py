@@ -225,9 +225,13 @@ else:
             idx = indices.squeeze(1)  # [D, max_swa]
             lens = topk_length  # [D]
             D = q.shape[0]
-            max_len = lens.max().item()
-            kv_slots = idx[:, :max_len].unique()
-            num_kv = len(kv_slots)
+            # Use tensor-only path for CUDA graph safety (avoids .item() CPU sync
+            # and torch.unique which allocates under capture).  For decode, SWA
+            # positions are nearly all unique anyway — processing duplicates is
+            # harmless (same KV values at same positions).
+            max_len = int(idx.shape[-1])  # max_swa window size, constant per capture
+            kv_slots = idx[:, :max_len].reshape(-1)  # [D * max_len], no unique()!
+            num_kv = int(kv_slots.shape[0])
 
             # ---- vectorized: compute offsets for all slots --------
             block_idx = (kv_slots // bs).long()       # [num_kv]
@@ -268,11 +272,8 @@ else:
             kv_bf16[:, 0, :448] = nope_bf16
             kv_bf16[:, 0, 448:] = rope_bf16
 
-            # ---- vectorized slot→index mapping (allocates, but small) ----
-            flat_idx = idx[:, :max_len].reshape(-1)  # [D * max_len]
-            sorted_slots, sort_idx = kv_slots.sort()
-            sorted_positions = torch.searchsorted(sorted_slots, flat_idx)
-            kv_indices = sort_idx[sorted_positions].view(D, 1, max_len)
+            # ---- vectorized slot→index mapping (sequential, no unique()) ----
+            kv_indices = torch.arange(num_kv, dtype=torch.int32, device=device).view(D, 1, max_len)
 
             # Reshape out: [D, padded_H, 512]
             out_3d = out.squeeze(1) if is_4d else out
