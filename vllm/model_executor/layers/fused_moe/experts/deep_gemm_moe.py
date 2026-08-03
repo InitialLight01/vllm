@@ -424,7 +424,8 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         from vllm.platforms import current_platform
 
         return is_deep_gemm_supported() and (
-            current_platform.is_device_capability_family(100)
+            current_platform.is_sm80_context()
+            or current_platform.is_device_capability_family(100)
             or current_platform.is_device_capability_family(120)
         )
 

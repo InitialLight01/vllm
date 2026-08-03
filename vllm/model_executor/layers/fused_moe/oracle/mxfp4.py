@@ -310,6 +310,7 @@ def _get_priority_backends_for_gpt_oss() -> list[Mxfp4MoeBackend]:
         Mxfp4MoeBackend.AITER_MXFP4_BF16,
         Mxfp4MoeBackend.AITER_MXFP4_FP8,
         Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
+        Mxfp4MoeBackend.DEEPGEMM_MXFP4,
         Mxfp4MoeBackend.TRITON,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
@@ -335,18 +336,27 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
         return [Mxfp4MoeBackend.AITER_MXFP4_BF16]
     if current_platform.is_xpu():
         return [Mxfp4MoeBackend.XPU]
-    _AVAILABLE_BACKENDS = [
-        Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
-        # SM80: use EMULATION (lazy dequant) instead of DeepGEMM which
-        # requires SM90+.  On SM90/SM120, DeepGEMM is preferred.
-        Mxfp4MoeBackend.EMULATION if current_platform.is_sm80_context()
-        else Mxfp4MoeBackend.DEEPGEMM_MXFP4,
-        # TRITON_UNFUSED has bug with MTP support
-        # TODO re-enable after kernel is fixed
-        # TRITON_UNFUSED
-        Mxfp4MoeBackend.MARLIN,
-        Mxfp4MoeBackend.BATCHED_MARLIN,
-    ]
+    if current_platform.is_sm80_context():
+        # SM80 emulation on real >=SM120 hardware: DeepGEMM .so files are
+        # compiled for the actual GPU and work.  Try DeepGEMM first; fall
+        # back to EMULATION (pure-Python FP4→BF16 dequant) on real A800.
+        _AVAILABLE_BACKENDS = [
+            Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
+            Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+            Mxfp4MoeBackend.EMULATION,
+            Mxfp4MoeBackend.MARLIN,
+            Mxfp4MoeBackend.BATCHED_MARLIN,
+        ]
+    else:
+        _AVAILABLE_BACKENDS = [
+            Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
+            Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+            # TRITON_UNFUSED has bug with MTP support
+            # TODO re-enable after kernel is fixed
+            # TRITON_UNFUSED
+            Mxfp4MoeBackend.MARLIN,
+            Mxfp4MoeBackend.BATCHED_MARLIN,
+        ]
     return _AVAILABLE_BACKENDS
 
 
@@ -436,7 +446,14 @@ def _filter_by_activation(
             if _backend_activation_key(b) == requested_activation_key
             or b == Mxfp4MoeBackend.EMULATION
         ]
-    bf16 = [b for b in backends if _backend_activation_key(b) is None]
+    # Preserve the original priority order from `backends`.
+    # SM80 emulation on real >=SM120 hardware: DeepGEMM is compiled for the
+    # actual GPU and should be available despite the emulated capability.
+    bf16 = [
+        b for b in backends
+        if _backend_activation_key(b) is None
+        or (current_platform.is_sm80_context() and b == Mxfp4MoeBackend.DEEPGEMM_MXFP4)
+    ]
     return bf16 if bf16 else backends
 
 

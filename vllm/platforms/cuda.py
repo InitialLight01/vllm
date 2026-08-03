@@ -657,7 +657,13 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def support_deep_gemm(cls) -> bool:
-        """Currently, only Hopper and Blackwell GPUs are supported."""
+        """Currently, only Hopper and Blackwell GPUs are supported.
+
+        SM80 emulation (VLLM_FORCE_SM80=1): The actual GPU is >=SM120;
+        DeepGEMM .so files are compiled for the real hardware and work.
+        """
+        if cls.is_sm80_context():
+            return True
         return (
             cls.is_device_capability(90)
             or cls.is_device_capability_family(100)
