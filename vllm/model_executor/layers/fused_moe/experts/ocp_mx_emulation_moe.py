@@ -147,10 +147,11 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         """
         Apply emulated quantized MoE computation.
 
-        Dequantizes only the routed-to experts using **vectorized** FP4→BF16
-        unpack (one batched PyTorch call instead of a Python loop).  No
-        persistent cache — the dequant result is a temporary tensor freed
-        after the parent forward returns.
+        Dequantizes only the routed-to experts in **chunks** and calls the
+        parent forward once per chunk, accumulating into ``output``.  This
+        bounds peak temporary memory: prefill activating all 256 experts
+        would otherwise need a ~15 GB BF16 tensor; chunking (≤16 experts)
+        keeps it under ~1 GB.
         """
         assert w1.dtype == torch.uint8
         assert w2.dtype == torch.uint8
@@ -160,50 +161,13 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         # ---- find which experts are actually active ---------------------------
         active_experts = topk_ids.unique()
         num_active = active_experts.numel()
-
-        # ---- chunked-vectorized dequant ---------------------------------------
-        # Dequantize active experts in chunks to bound peak temporary memory.
-        # Prefill with many tokens may activate all 256 experts (→ ~17 GB temp);
-        # we cap at 16 experts per chunk (→ ~700 MB temp per chunk).
         MAX_CHUNK = 16
 
-        if self.ocp_mx_scheme.startswith("w_mxfp4"):  # type: ignore[union-attr]
-            w1_dequant = torch.empty(
-                num_active, w1.shape[1], w1.shape[2] * 2,
-                dtype=target_dtype, device=w1.device,
-            )
-            w2_dequant = torch.empty(
-                num_active, w2.shape[1], w2.shape[2] * 2,
-                dtype=target_dtype, device=w2.device,
-            )
-            for c in range(0, num_active, MAX_CHUNK):
-                chunk = active_experts[c : c + MAX_CHUNK]
-                w1_dequant[c : c + len(chunk)] = dq_mxfp4_pytorch(
-                    w1[chunk], self.w1_scale_val[chunk], target_dtype,
-                )
-                w2_dequant[c : c + len(chunk)] = dq_mxfp4_pytorch(
-                    w2[chunk], self.w2_scale_val[chunk], target_dtype,
-                )
-            a1q_scale_arg = None
-            a2_scale_arg = None
-        elif self.ocp_mx_scheme.startswith("w_mxfp6"):  # type: ignore[union-attr]
-            qtype = "fp6_e3m2" if "e3m2" in self.ocp_mx_scheme else "fp6_e2m3"  # type: ignore[union-attr]
-            w1_list, w2_list = [], []
-            for eid in active_experts.tolist():
-                w1_list.append(dequant_mxfp6(
-                    w1[eid], self.w1_scale_val[eid],
-                    quant_dtype=qtype, float_dtype=target_dtype,
-                ))
-                w2_list.append(dequant_mxfp6(
-                    w2[eid], self.w2_scale_val[eid],
-                    quant_dtype=qtype, float_dtype=target_dtype,
-                ))
-            w1_dequant = torch.stack(w1_list, dim=0)
-            w2_dequant = torch.stack(w2_list, dim=0)
-            a1q_scale_arg = None
-            a2_scale_arg = None
-        else:
-            # Non-FP4/FP6 path: full dequant (rare)
+        # Non-FP4/FP6 path: full dequant (rare)
+        if not (
+            self.ocp_mx_scheme.startswith("w_mxfp4")  # type: ignore[union-attr]
+            or self.ocp_mx_scheme.startswith("w_mxfp6")  # type: ignore[union-attr]
+        ):
             w1_full = self._dequantize_weights(w1, self.w1_scale_val, target_dtype)
             w2_full = self._dequantize_weights(w2, self.w2_scale_val, target_dtype)
             super().apply(
@@ -219,27 +183,69 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             )
             return
 
-        # ---- remap expert IDs  global → local ---------------------------------
-        global_to_local = {eid.item(): i for i, eid in enumerate(active_experts)}
-        local_ids = topk_ids.clone()
-        for gid, lid in global_to_local.items():
-            local_ids[topk_ids == gid] = lid
+        is_mxfp6 = self.ocp_mx_scheme.startswith("w_mxfp6")  # type: ignore[union-attr]
+        qtype = None
+        if is_mxfp6:
+            qtype = "fp6_e3m2" if "e3m2" in self.ocp_mx_scheme else "fp6_e2m3"  # type: ignore[union-attr]
 
-        # ---- forward to parent with reduced weight set -------------------------
-        super().apply(
-            output=output,
-            hidden_states=hidden_states,
-            w1=w1_dequant,
-            w2=w2_dequant,
-            topk_weights=topk_weights,
-            topk_ids=local_ids,
-            activation=activation,
-            global_num_experts=num_active,
-            expert_map=None,
-            a1q_scale=a1q_scale_arg,
-            a2_scale=a2_scale_arg,
-            workspace13=workspace13,
-            workspace2=workspace2,
-            expert_tokens_meta=expert_tokens_meta,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )
+        # Accumulate per-chunk parent-forward results.  ``moe_sum`` in the
+        # parent sums over top_k slots; slots whose weight is zero contribute
+        # nothing, so summing chunk outputs is exact.
+        acc = torch.zeros_like(output)
+
+        for c in range(0, num_active, MAX_CHUNK):
+            chunk = active_experts[c : c + MAX_CHUNK]
+
+            # ---- dequantize only this chunk's experts -------------------------
+            if is_mxfp6:
+                w1_chunk = torch.stack([
+                    dequant_mxfp6(w1[eid], self.w1_scale_val[eid],
+                                  quant_dtype=qtype, float_dtype=target_dtype)
+                    for eid in chunk.tolist()
+                ], dim=0)
+                w2_chunk = torch.stack([
+                    dequant_mxfp6(w2[eid], self.w2_scale_val[eid],
+                                  quant_dtype=qtype, float_dtype=target_dtype)
+                    for eid in chunk.tolist()
+                ], dim=0)
+            else:
+                w1_chunk = dq_mxfp4_pytorch(
+                    w1[chunk], self.w1_scale_val[chunk], target_dtype,
+                )
+                w2_chunk = dq_mxfp4_pytorch(
+                    w2[chunk], self.w2_scale_val[chunk], target_dtype,
+                )
+
+            # ---- remap this chunk's experts  global → local -------------------
+            # Slots not routed to this chunk get id 0 with zero weight, so
+            # they are computed (redundantly) but contribute nothing.
+            local_ids = torch.zeros_like(topk_ids)
+            for i, eid in enumerate(chunk.tolist()):
+                local_ids[topk_ids == eid] = i
+            in_chunk = torch.isin(topk_ids, chunk)
+            local_weights = torch.where(
+                in_chunk, topk_weights, torch.zeros_like(topk_weights)
+            )
+
+            # ---- forward this chunk into a temp output, then accumulate ------
+            temp_out = torch.empty_like(output)
+            super().apply(
+                output=temp_out,
+                hidden_states=hidden_states,
+                w1=w1_chunk,
+                w2=w2_chunk,
+                topk_weights=local_weights,
+                topk_ids=local_ids,
+                activation=activation,
+                global_num_experts=len(chunk),
+                expert_map=None,
+                a1q_scale=None,
+                a2_scale=None,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=expert_tokens_meta,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+            acc.add_(temp_out)
+
+        output.copy_(acc)
