@@ -69,6 +69,11 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         self.quant_config._w1.scale = None
         self.quant_config._w2.scale = None
 
+        # Per-expert dequant cache: key = global expert id,
+        # value = (w1_bf16, w2_bf16).  Avoids re-dequantizing the
+        # same expert weights on every forward during decode.
+        self._dequant_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
         self.quantization_emulation = True
 
         if self.ocp_mx_scheme in {
@@ -147,9 +152,9 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         """
         Apply emulated quantized MoE computation.
 
-        Dequantizes **only the routed-to experts** (not all experts) to avoid
-        the 4× memory spike of full FP4→BF16 expansion.  Uses pure-PyTorch
-        FP4 unpack (no ``amd-quark`` dependency).
+        Caches dequantized weights per expert to avoid re-dequantizing the
+        same expert on every forward during decode (where routing is stable).
+        Uses pure-PyTorch FP4 unpack (no ``amd-quark`` dependency).
         """
         assert w1.dtype == torch.uint8
         assert w2.dtype == torch.uint8
@@ -157,78 +162,80 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         target_dtype = hidden_states.dtype
 
         # ---- find which experts are actually active ---------------------------
-        # topk_ids: [num_tokens, top_k]  — expert indices each token routes to
         active_experts = topk_ids.unique()
         num_active = active_experts.numel()
 
-        # ---- dequantize only the active experts --------------------------------
-        if self.ocp_mx_scheme.startswith("w_mxfp4"):  # type: ignore[union-attr]
-            # w1 shape: [E_total, intermediate*2, hidden//2]
-            # w1_scale shape: [E_total, intermediate*2, hidden//32]
-            w1_dequant = torch.empty(
-                num_active, w1.shape[1], w1.shape[2] * 2,
-                dtype=target_dtype, device=w1.device,
-            )
-            w2_dequant = torch.empty(
-                num_active, w2.shape[1], w2.shape[2] * 2,
-                dtype=target_dtype, device=w2.device,
-            )
-            for i, eid in enumerate(active_experts.tolist()):
-                w1_dequant[i] = dq_mxfp4_pytorch(
-                    w1[eid].unsqueeze(0),
-                    self.w1_scale_val[eid].unsqueeze(0),
-                    target_dtype,
-                ).squeeze(0)
-                w2_dequant[i] = dq_mxfp4_pytorch(
-                    w2[eid].unsqueeze(0),
-                    self.w2_scale_val[eid].unsqueeze(0),
-                    target_dtype,
-                ).squeeze(0)
-            a1q_scale_arg = None
-            a2_scale_arg = None
-        elif self.ocp_mx_scheme.startswith("w_mxfp6"):  # type: ignore[union-attr]
-            w1_dequant = torch.empty(
-                num_active, w1.shape[1], w1.shape[2] * 2,
-                dtype=target_dtype, device=w1.device,
-            )
-            w2_dequant = torch.empty(
-                num_active, w2.shape[1], w2.shape[2] * 2,
-                dtype=target_dtype, device=w2.device,
-            )
-            for i, eid in enumerate(active_experts.tolist()):
-                w1_dequant[i] = dequant_mxfp6(
-                    w1[eid], self.w1_scale_val[eid],
-                    quant_dtype="fp6_e3m2"
-                    if "e3m2" in self.ocp_mx_scheme  # type: ignore[union-attr]
-                    else "fp6_e2m3",
-                    float_dtype=target_dtype,
-                )
-                w2_dequant[i] = dequant_mxfp6(
-                    w2[eid], self.w2_scale_val[eid],
-                    quant_dtype="fp6_e3m2"
-                    if "e3m2" in self.ocp_mx_scheme  # type: ignore[union-attr]
-                    else "fp6_e2m3",
-                    float_dtype=target_dtype,
-                )
-            a1q_scale_arg = None
-            a2_scale_arg = None
-        else:
-            w1_dequant = self._dequantize_weights(
-                w1, self.w1_scale_val, target_dtype
-            )
-            w2_dequant = self._dequantize_weights(
-                w2, self.w2_scale_val, target_dtype
-            )
-            a1q_scale_arg = None
-            a2_scale_arg = None
+        # ---- evict stale cache entries ----------------------------------------
+        active_set = set(active_experts.tolist())
+        stale = [eid for eid in self._dequant_cache if eid not in active_set]
+        for eid in stale:
+            del self._dequant_cache[eid]
 
-        # ---- remap expert IDs  global → local ----------------------------------
+        # ---- dequantize only uncached experts ----------------------------------
+        is_mxfp4 = self.ocp_mx_scheme.startswith("w_mxfp4")  # type: ignore[union-attr]
+        is_mxfp6 = self.ocp_mx_scheme.startswith("w_mxfp6")  # type: ignore[union-attr]
+
+        if is_mxfp4:
+            for eid in active_experts.tolist():
+                if eid not in self._dequant_cache:
+                    self._dequant_cache[eid] = (
+                        dq_mxfp4_pytorch(
+                            w1[eid].unsqueeze(0),
+                            self.w1_scale_val[eid].unsqueeze(0),
+                            target_dtype,
+                        ).squeeze(0),
+                        dq_mxfp4_pytorch(
+                            w2[eid].unsqueeze(0),
+                            self.w2_scale_val[eid].unsqueeze(0),
+                            target_dtype,
+                        ).squeeze(0),
+                    )
+        elif is_mxfp6:
+            qtype = "fp6_e3m2" if "e3m2" in self.ocp_mx_scheme else "fp6_e2m3"  # type: ignore[union-attr]
+            for eid in active_experts.tolist():
+                if eid not in self._dequant_cache:
+                    self._dequant_cache[eid] = (
+                        dequant_mxfp6(w1[eid], self.w1_scale_val[eid],
+                                      quant_dtype=qtype, float_dtype=target_dtype),
+                        dequant_mxfp6(w2[eid], self.w2_scale_val[eid],
+                                      quant_dtype=qtype, float_dtype=target_dtype),
+                    )
+        else:
+            # Non-FP4/FP6 path: fall back to full dequant (rare)
+            w1_full = self._dequantize_weights(w1, self.w1_scale_val, target_dtype)
+            w2_full = self._dequantize_weights(w2, self.w2_scale_val, target_dtype)
+            super().apply(
+                output=output, hidden_states=hidden_states,
+                w1=w1_full, w2=w2_full,
+                topk_weights=topk_weights, topk_ids=topk_ids,
+                activation=activation, global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                a1q_scale=None, a2_scale=None,
+                workspace13=workspace13, workspace2=workspace2,
+                expert_tokens_meta=expert_tokens_meta,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+            return
+
+        # ---- assemble cached weight tensors -----------------------------------
+        w1_dequant = torch.empty(
+            num_active, w1.shape[1], w1.shape[2] * 2,
+            dtype=target_dtype, device=w1.device,
+        )
+        w2_dequant = torch.empty(
+            num_active, w2.shape[1], w2.shape[2] * 2,
+            dtype=target_dtype, device=w2.device,
+        )
+        for i, eid in enumerate(active_experts.tolist()):
+            w1_dequant[i], w2_dequant[i] = self._dequant_cache[eid]
+
+        # ---- remap expert IDs  global → local ---------------------------------
         global_to_local = {eid: i for i, eid in enumerate(active_experts.tolist())}
         local_ids = topk_ids.clone()
         for gid, lid in global_to_local.items():
             local_ids[topk_ids == gid] = lid
 
-        # ---- forward to parent with reduced weight set -------------------------
+        # ---- forward to parent with cached weights ----------------------------
         super().apply(
             output=output,
             hidden_states=hidden_states,
@@ -238,9 +245,9 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             topk_ids=local_ids,
             activation=activation,
             global_num_experts=num_active,
-            expert_map=None,   # no remapping needed with local IDs
-            a1q_scale=a1q_scale_arg,
-            a2_scale=a2_scale_arg,
+            expert_map=None,
+            a1q_scale=None,
+            a2_scale=None,
             workspace13=workspace13,
             workspace2=workspace2,
             expert_tokens_meta=expert_tokens_meta,
