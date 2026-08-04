@@ -161,20 +161,29 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         active_experts = topk_ids.unique()
         num_active = active_experts.numel()
 
-        # ---- vectorized dequant: one batched call for all active experts ------
+        # ---- chunked-vectorized dequant ---------------------------------------
+        # Dequantize active experts in chunks to bound peak temporary memory.
+        # Prefill with many tokens may activate all 256 experts (→ ~17 GB temp);
+        # we cap at 16 experts per chunk (→ ~700 MB temp per chunk).
+        MAX_CHUNK = 16
+
         if self.ocp_mx_scheme.startswith("w_mxfp4"):  # type: ignore[union-attr]
-            # w1: [E_total, N, K//2] uint8 → index → [num_active, N, K//2]
-            # dq_mxfp4_pytorch handles batched leading dims natively
-            w1_dequant = dq_mxfp4_pytorch(
-                w1[active_experts],
-                self.w1_scale_val[active_experts],
-                target_dtype,
-            )  # → [num_active, N, K]  BF16
-            w2_dequant = dq_mxfp4_pytorch(
-                w2[active_experts],
-                self.w2_scale_val[active_experts],
-                target_dtype,
-            )  # → [num_active, K, hidden]  BF16
+            w1_dequant = torch.empty(
+                num_active, w1.shape[1], w1.shape[2] * 2,
+                dtype=target_dtype, device=w1.device,
+            )
+            w2_dequant = torch.empty(
+                num_active, w2.shape[1], w2.shape[2] * 2,
+                dtype=target_dtype, device=w2.device,
+            )
+            for c in range(0, num_active, MAX_CHUNK):
+                chunk = active_experts[c : c + MAX_CHUNK]
+                w1_dequant[c : c + len(chunk)] = dq_mxfp4_pytorch(
+                    w1[chunk], self.w1_scale_val[chunk], target_dtype,
+                )
+                w2_dequant[c : c + len(chunk)] = dq_mxfp4_pytorch(
+                    w2[chunk], self.w2_scale_val[chunk], target_dtype,
+                )
             a1q_scale_arg = None
             a2_scale_arg = None
         elif self.ocp_mx_scheme.startswith("w_mxfp6"):  # type: ignore[union-attr]
