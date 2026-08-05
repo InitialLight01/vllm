@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable, Iterable
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
@@ -1170,6 +1171,26 @@ class RoutedExperts(PluggableLayer):
             Output tensor from routed experts
         """
         assert not self.quant_method.is_monolithic
+
+        if os.environ.get("VLLM_DUMP_TOPK"):
+            try:
+                import json as _json
+                import torch as _torch
+                _tk = topk_ids.detach().cpu()
+                _n_valid = int((topk_ids >= 0).sum().item())
+                _row = {
+                    "rank": _torch.distributed.get_rank() if _torch.distributed.is_initialized() else -1,
+                    "layer": getattr(self, "_active_idx", -1),
+                    "n_valid": _n_valid,
+                    "topk0": [int(v) for v in topk_ids[0].tolist()],
+                }
+                if _n_valid > 100:
+                    # prefill: dump full flattened expert IDs for exact match
+                    _row["full"] = [int(v) for v in _tk.flatten().tolist()]
+                with open(os.environ["VLLM_DUMP_TOPK"], "a") as _f:
+                    _f.write(_json.dumps(_row) + "\n")
+            except Exception:
+                pass
 
         # Modular kernels use pre-computed routing
         return self.quant_method.apply(

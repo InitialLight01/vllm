@@ -77,7 +77,19 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             OCP_MX_Scheme.w_mxfp4_a_mxfp4,
         }:
             # Weight has to be dequantized for mxfp4 emulation.
-            self._quant_dtype = "mxfp4"
+            if os.environ.get("VLLM_EMU_FP8_ACT"):
+                # Experiment: emulate DeepGEMM's FP8 activation QDQ instead
+                # of MXFP4 (which is ~2x coarser: FP4 1-bit mantissa vs FP8
+                # E4M3 3-bit).  Tests the "training-distribution alignment"
+                # hypothesis — if FP8-act matches DeepGEMM results, the
+                # accuracy gap is activation-quantization format, not BF16.
+                logger.warning_once(
+                    "VLLM_EMU_FP8_ACT=1: activation QDQ switched to FP8 "
+                    "(DeepGEMM-compatible) instead of MXFP4."
+                )
+                self._quant_dtype = current_platform.fp8_dtype()
+            else:
+                self._quant_dtype = "mxfp4"
         elif self.ocp_mx_scheme in [
             OCP_MX_Scheme.w_mxfp4_a_mxfp6_e3m2,
             OCP_MX_Scheme.w_mxfp4_a_mxfp6_e2m3,
@@ -157,6 +169,21 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         """
         assert w1.dtype == torch.uint8
         assert w2.dtype == torch.uint8
+
+        if os.environ.get("VLLM_DUMP_TOPK"):
+            try:
+                import json as _json
+                _tk = topk_ids.detach().float().cpu()
+                with open(os.environ["VLLM_DUMP_TOPK"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "layer": getattr(self, "_active_idx", -1),
+                        "n_valid": int((topk_ids >= 0).sum().item()),
+                        "topk0": [int(v) for v in topk_ids[0].tolist()],
+                        "uniq": [int(v) for v in topk_ids.unique().tolist()[:20]],
+                    }) + "\n")
+            except Exception:
+                pass
 
         target_dtype = hidden_states.dtype
 
