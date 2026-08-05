@@ -11,6 +11,8 @@ Weights are dequantized on the fly during each forward, we fall back to calling
 is applied on activations via `moe_kernel_quantize_input`.
 """
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -161,6 +163,8 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         # ---- find which experts are actually active ---------------------------
         active_experts = topk_ids.unique()
         num_active = active_experts.numel()
+        # Chunk size bounds the dequant peak: dq_mxfp4_pytorch allocates
+        # several int32 intermediates ≈ 6× the BF16 output.
         MAX_CHUNK = 16
 
         # Non-FP4/FP6 path: full dequant (rare)

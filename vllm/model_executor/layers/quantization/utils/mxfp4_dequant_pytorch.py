@@ -57,21 +57,27 @@ def _unpack_fp4_to_float(val: torch.Tensor, float_dtype: torch.dtype) -> torch.T
 
     # Compute target exponent: unbiased_fp4 = fp4_exp - 1
     #   target_exp = fp4_exp - 1 + half_bias
-    new_exp = (exp.to(torch.int32) - FLOAT4_EXP_BIAS + half_exp_bias).to(torch.int32)
+    # int16 arithmetic: BF16 exp ≤ 255 << 7 = 0x7F80; FP16 exp ≤ 31 << 10 =
+    # 0x7C00; both fit in int16 without overflow.  Bit patterns of int16 are
+    # identical to uint16, so the final .view(float_dtype) is correct.
+    new_exp = (exp.to(torch.int16) - FLOAT4_EXP_BIAS + half_exp_bias)
 
     # Case 0000 → real zero: zero out exponent
-    new_exp = new_exp * torch.logical_or(exp > 0, mantissa > 0).to(torch.int32)
+    new_exp = new_exp * torch.logical_or(exp > 0, mantissa > 0).to(torch.int16)
 
     # Subnormals (001 → 0.5): clear mantissa (value encoded purely by exponent)
-    new_mantissa = mantissa.to(torch.int32)
-    new_mantissa = torch.logical_and(new_mantissa, exp > 0).to(torch.int32)
-    new_mantissa = new_mantissa << (half_mantissa_bits - 1)
+    # NB: torch.logical_and promotes to int64 — cast back to int16 to keep
+    # 16-bit packing (else .view(bf16) would quadruple the last dim).
+    new_mantissa = (
+        torch.logical_and(mantissa.to(torch.int16), exp > 0).to(torch.int16)
+        << (half_mantissa_bits - 1)
+    )
 
-    sign_bits = sign.to(torch.int32) << 15
+    sign_bits = sign.to(torch.int16) << 15
     exp_bits = new_exp << half_mantissa_bits
 
     bits = sign_bits | exp_bits | new_mantissa
-    return bits.to(torch.uint16).view(float_dtype)
+    return bits.view(float_dtype)
 
 
 def dq_mxfp4_pytorch(
