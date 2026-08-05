@@ -3,6 +3,8 @@
 import functools
 from math import prod
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -211,6 +213,30 @@ def _fp8_quantize_dequantize(
     return A, None
 
 
+def _fp8_ptg_quant_dequant_ue8m0(
+    A: torch.Tensor,
+    group_size: int = 128,
+) -> tuple[torch.Tensor, None]:
+    """Per-token-group FP8 E4M3 QDQ with 2-power (UE8M0-style) scales.
+
+    Mimics DeepGEMM's FP8 activation quantization: block of ``group_size``
+    (DeepGEMM uses 128) shares one scale that is the smallest power of two
+    covering the group's abs-max.  ``q = round_to_e4m3(A / scale)`` then
+    dequantized back — numerically equivalent to DeepGEMM's
+    ``qA * scale`` compute, keeping the routing/logit numerics aligned.
+    """
+    M, K = A.shape
+    A_g = A.reshape(M, K // group_size, group_size)
+    amax = A_g.abs().max(dim=-1, keepdim=True).values
+    # UE8M0: scale = 2^ceil(log2(amax))  (smallest power of 2 >= amax)
+    log2_amax = torch.log2(amax.clamp(min=1e-30))
+    scale_val = torch.ceil(log2_amax).clamp(-126, 127)
+    scale = 2.0 ** scale_val  # [M, K//g, 1] FP32
+    qA = (A_g / scale).to(torch.float8_e4m3fn)
+    dqA = (qA.to(A.dtype) * scale).reshape(M, K)
+    return dqA, None
+
+
 def _mxfp8_e4m3_quantize(
     A: torch.Tensor,
     A_scale: torch.Tensor | None,
@@ -287,6 +313,13 @@ def moe_kernel_quantize_input(
         # activation quantization below.
     if quant_dtype == current_platform.fp8_dtype():
         if quantization_emulation:
+            if os.environ.get("VLLM_EMU_DG_ACT"):
+                # DeepGEMM-compatible: per-token-group FP8 QDQ with 2-power
+                # scales (block 128), instead of per-tensor QDQ.  Reproduces
+                # DeepGEMM's activation quantization numerics on the
+                # EMULATION path so router boundaries stay aligned.
+                _g = (block_shape[1] if block_shape else 128)
+                return _fp8_ptg_quant_dequant_ue8m0(A, group_size=_g)
             return _fp8_quantize_dequantize(A, A_scale)
         else:
             return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
