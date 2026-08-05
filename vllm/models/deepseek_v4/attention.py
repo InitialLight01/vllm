@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -327,6 +328,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if os.environ.get("VLLM_DUMP_HIDDEN"):
+            try:
+                import json as _json
+                with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "attn_fwd_enter",
+                        "cls": type(self).__name__,
+                        "hs_shape": list(hidden_states.shape),
+                    }) + "\n")
+            except Exception:
+                pass
+
         # Pre-allocate attention output with FlashMLA-padded head count.
         # The op writes into `o_padded`; we slice to n_local_heads after.
         num_tokens = hidden_states.shape[0]
@@ -365,6 +379,29 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
         o = o_padded[:, : self.n_local_heads, :]
+        if os.environ.get("VLLM_DUMP_HIDDEN"):
+            try:
+                import json as _json
+                torch.cuda.synchronize()
+                _o_stats = o.detach().float().cpu()
+                _o_pad_stats = o_padded.detach().float().cpu()
+                with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "layer": getattr(self, "_active_idx", -1),
+                        "comp": "attn_o_pre_proj",
+                        "shape": list(o.shape),
+                        "nz": int((_o_stats != 0).sum().item()),
+                        "mean": round(_o_stats.mean().item(), 6),
+                        "std": round(_o_stats.std().item(), 6),
+                        "max_abs": round(_o_stats.abs().max().item(), 6),
+                        "o_padded_nz": int((_o_pad_stats != 0).sum().item()),
+                        "o_padded_mean": round(_o_pad_stats.mean().item(), 6),
+                        "impl": type(self.attention_impl).__name__,
+                        "num_tokens": int(hidden_states.shape[0]),
+                    }) + "\n")
+            except Exception:
+                pass
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         return self._o_proj(o, positions)
