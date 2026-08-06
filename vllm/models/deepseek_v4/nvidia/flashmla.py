@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -282,6 +283,21 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             # tile_scheduler_metadata.
             output.zero_()
             return
+
+        if os.environ.get("VLLM_DUMP_HIDDEN"):
+            try:
+                import json as _json
+                with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "comp": "decode_call_flashmla",
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "impl": flash_mla_with_kvcache.__name__,
+                        "swa_only": bool(swa_only),
+                        "topk_indices": None if topk_indices is None else list(topk_indices.shape),
+                        "tile_metadata": None if tile_metadata is None else "set",
+                    }) + "\n")
+            except Exception:
+                pass
 
         out, _ = flash_mla_with_kvcache(
             q=q,

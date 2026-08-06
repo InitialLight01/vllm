@@ -215,66 +215,196 @@ else:
             import torch
 
             # Build dense KV from cache: [num_kv, 1, head_dim] bf16
+            # Gather NOPE+ROPE from cache into BF16 for each required token.
+            # SWA window tokens come from ``indices``/``topk_length``; the
+            # DSA-indexer global tokens come from ``extra_indices_in_kvcache``
+            # / ``extra_topk_length`` (attended in ADDITION to SWA).  The
+            # original SM80 Triton path ignored ``extra_*``, which dropped the
+            # global context once a sequence outgrew the SWA window (128) —
+            # the model then "forgot" the few-shot examples / question and
+            # fell into self-doubt loops.  We now gather both and prepend the
+            # global tokens (matching combine_topk_swa_indices ordering used
+            # by the prefill path).
             cache_u8 = k_cache.contiguous().view(torch.uint8).reshape(-1)
             bs = k_cache.shape[1]  # block_size
             hb = k_cache.shape[3]  # head_bytes
             tstride = 448 + 64 * 2  # 576
             sdim = 448 // 64 + 1  # 8
 
-            # Gather NOPE+ROPE from cache into BF16 for each required token
             idx = indices.squeeze(1)  # [D, max_swa]
             lens = topk_length  # [D]
 
+            has_extra = (
+                extra_indices_in_kvcache is not None
+                and extra_topk_length is not None
+            )
+            # Compressed-cache layers (compress_ratio 4/128) pass a DIFFERENT
+            # KV cache (compressed blocks) as extra_k_cache whose layout does
+            # not match the SWA cache layout this gather assumes.  Reading it
+            # with SWA strides yields garbage (attn_out ~1e36).  Fall back to
+            # SWA-only for those layers until a compressed-cache gather is
+            # implemented.
+            if has_extra and extra_k_cache is not None:
+                if extra_k_cache.shape != k_cache.shape:
+                    has_extra = False
+            if has_extra:
+                extra_idx = extra_indices_in_kvcache.squeeze(1)  # [D, max_extra]
+                extra_lens = extra_topk_length  # [D]
+                if extra_lens.ndim == 2:
+                    extra_lens = extra_lens.squeeze(1)
+                extra_cache = extra_k_cache if extra_k_cache is not None else k_cache
+                # extra tokens may live in a separate cache tensor
+                extra_u8 = extra_cache.contiguous().view(torch.uint8).reshape(-1)
+            else:
+                extra_idx = None
+                extra_lens = None
+                extra_u8 = None
+
             D = q.shape[0]
-            max_len = lens.max().item()
-            # Accumulate all unique KV slots
-            kv_slots = idx[:, :max_len].unique()
+            swa_max = lens.max().item()
+            extra_max = (
+                extra_lens.max().item() if has_extra else 0
+            )
+            max_len = swa_max + extra_max
+            if os.environ.get("VLLM_DUMP_HIDDEN"):
+                try:
+                    import json as _json
+                    with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                        _f.write(_json.dumps({
+                            "comp": "gather_debug",
+                            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                            "has_extra": bool(has_extra),
+                            "swa_max": int(swa_max),
+                            "extra_max": int(extra_max),
+                            "D": int(D),
+                            "lens0": [int(v) for v in lens[:4].tolist()],
+                            "extra_lens0": [int(v) for v in extra_lens[:4].tolist()] if has_extra else None,
+                            "extra_idx_shape": list(extra_indices_in_kvcache.shape) if has_extra else None,
+                        }) + "\n")
+                except Exception:
+                    pass
 
-            # Build gathered KV: [num_kv, 1, 512]
-            kv_bf16 = torch.zeros(len(kv_slots), 1, 512, dtype=torch.bfloat16, device=q.device)
-            for i, slot in enumerate(kv_slots.tolist()):
-                block_idx = slot // bs
-                pos_in_block = slot % bs
-                base = block_idx * bs * hb
-                data_off = base + pos_in_block * tstride
-                scale_off = base + bs * tstride + pos_in_block * sdim
+            def _gather_slots_vec(slots, cache_u8v):
+                """Vectorized dequant of KV slots from a uint8 cache view.
 
-                # Decode NOPE (FP8 → BF16)
-                nope_raw = cache_u8[data_off : data_off + 448]
-                nope_fp8 = nope_raw.view(torch.float8_e4m3fn)
-                scale_u8 = cache_u8[scale_off : scale_off + sdim]
-                scale_f32 = 2.0 ** (scale_u8.float() - 127.0)
-                nope_deq = torch.empty(448, dtype=torch.bfloat16, device=q.device)
+                Returns (kv [N,1,512] bf16, slot_to_idx dict)."""
+                n = slots.shape[0]
+                block_idx = (slots // bs).long()
+                pos_in_block = (slots % bs).long()
+                base = block_idx * (bs * hb)
+                data_offs = base + pos_in_block * tstride
+                scale_offs = base + bs * tstride + pos_in_block * sdim
+
+                # bulk-read 576 data bytes + 8 scale bytes per slot
+                byte_arange = torch.arange(
+                    576, device=q.device
+                )
+                all_data_offs = data_offs.unsqueeze(1) + byte_arange.unsqueeze(0)
+                data_bytes = cache_u8v[all_data_offs]  # [N, 576] uint8
+
+                nope_fp8 = (
+                    data_bytes[:, :448]
+                    .reshape(-1)
+                    .view(torch.float8_e4m3fn)
+                    .reshape(n, 448)
+                )
+                nope_bf16 = nope_fp8.to(torch.bfloat16)
+
+                scale_arange = torch.arange(8, device=q.device)
+                all_scale_offs = scale_offs.unsqueeze(1) + scale_arange.unsqueeze(0)
+                scale_bytes = cache_u8v[all_scale_offs]  # [N, 8] uint8
+                scale_f32 = 2.0 ** (scale_bytes.float() - 127.0)
+                scale_bf16 = scale_f32.to(torch.bfloat16)
                 for g in range(7):
-                    nope_deq[g*64:(g+1)*64] = nope_fp8[g*64:(g+1)*64].to(torch.bfloat16) * scale_f32[g].to(torch.bfloat16)
+                    nope_bf16[:, g * 64 : (g + 1) * 64] *= scale_bf16[:, g : g + 1]
 
-                # ROPE is bf16 directly
-                rope_bf16 = cache_u8[data_off + 448 : data_off + 448 + 128].view(torch.bfloat16)
+                rope_bf16 = (
+                    data_bytes[:, 448:576]
+                    .reshape(-1)
+                    .view(torch.bfloat16)
+                    .reshape(n, 64)
+                )
 
-                kv_bf16[i, 0, :448] = nope_deq
-                kv_bf16[i, 0, 448:] = rope_bf16
+                kv = torch.zeros(n, 1, 512, dtype=torch.bfloat16, device=q.device)
+                kv[:, 0, :448] = nope_bf16
+                kv[:, 0, 448:] = rope_bf16
+                slot_to_idx = {s.item(): i for i, s in enumerate(slots)}
+                return kv, slot_to_idx
 
-            # Map slot → index in kv_bf16
-            slot_to_idx = {s.item(): i for i, s in enumerate(kv_slots)}
-            kv_indices = torch.zeros(D, 1, max_len, dtype=torch.int32, device=q.device)
+            # Gather global (extra) KV slots, then SWA slots
+            if has_extra:
+                # filter invalid (-1 padding) slots before gather — reading
+                # cache at negative offsets would corrupt attention output
+                extra_slots = extra_idx[:, :extra_max].unique()
+                extra_slots = extra_slots[extra_slots >= 0]
+                kv_extra, extra_to_local = _gather_slots_vec(
+                    extra_slots, extra_u8
+                )
+            else:
+                extra_slots = None
+                kv_extra = None
+                extra_to_local = {}
+
+            kv_slots = idx[:, :swa_max].unique()
+            kv_slots = kv_slots[kv_slots >= 0]  # filter invalid padding
+            kv_bf16, slot_to_idx = _gather_slots_vec(kv_slots, cache_u8)
+
+            # Assemble per-token indices: [extra..., swa...], padded with 0
+            kv_indices = torch.zeros(
+                D, 1, max_len, dtype=torch.int32, device=q.device
+            )
+            combined_lens = torch.zeros(D, dtype=torch.int32, device=q.device)
             for d in range(D):
+                E = extra_lens[d].item() if has_extra else 0
                 L = lens[d].item()
+                combined_lens[d] = E + L
+                for k in range(E):
+                    _s = extra_idx[d, k].item()
+                    if _s >= 0:
+                        kv_indices[d, 0, k] = extra_to_local[_s]
                 for k in range(L):
-                    kv_indices[d, 0, k] = slot_to_idx[idx[d, k].item()]
+                    _s = idx[d, k].item()
+                    if _s >= 0:
+                        kv_indices[d, 0, E + k] = slot_to_idx[_s]
+
+            # Concatenate global + SWA gathered KV
+            if kv_extra is not None:
+                kv_all = torch.cat([kv_extra, kv_bf16], dim=0)
+                # offset SWA slot indices by the number of global slots
+                offset = kv_extra.shape[0]
+                for d in range(D):
+                    E = extra_lens[d].item() if has_extra else 0
+                    L = lens[d].item()
+                    for k in range(L):
+                        _s = idx[d, k].item()
+                        if _s >= 0:
+                            kv_indices[d, 0, E + k] = (
+                                slot_to_idx[_s] + offset
+                            )
+            else:
+                kv_all = kv_bf16
 
             # Reshape out: [D, padded_H, 512]
             out_3d = out.squeeze(1) if is_4d else out
             sparse_attn_prefill(
                 q=q,
-                kv=kv_bf16,
+                kv=kv_all,
                 indices=kv_indices,
                 sm_scale=softmax_scale,
                 attn_sink=attn_sink,
-                topk_length=lens,
+                topk_length=combined_lens,
                 out=out_3d,
             )
             return out, tile_scheduler_metadata
-        except Exception:
+        except Exception as _e:
+            import traceback as _tb
+            if os.environ.get("VLLM_DUMP_HIDDEN"):
+                try:
+                    with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                        _f.write("GATHER_EXCEPTION: " + repr(_e) + "\n")
+                        _f.write(_tb.format_exc())
+                except Exception:
+                    pass
             out.zero_()
             return out, tile_scheduler_metadata
 
