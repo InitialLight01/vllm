@@ -238,15 +238,6 @@ else:
                 extra_indices_in_kvcache is not None
                 and extra_topk_length is not None
             )
-            # Compressed-cache layers (compress_ratio 4/128) pass a DIFFERENT
-            # KV cache (compressed blocks) as extra_k_cache whose layout does
-            # not match the SWA cache layout this gather assumes.  Reading it
-            # with SWA strides yields garbage (attn_out ~1e36).  Fall back to
-            # SWA-only for those layers until a compressed-cache gather is
-            # implemented.
-            if has_extra and extra_k_cache is not None:
-                if extra_k_cache.shape != k_cache.shape:
-                    has_extra = False
             if has_extra:
                 extra_idx = extra_indices_in_kvcache.squeeze(1)  # [D, max_extra]
                 extra_lens = extra_topk_length  # [D]
@@ -284,16 +275,20 @@ else:
                 except Exception:
                     pass
 
-            def _gather_slots_vec(slots, cache_u8v):
+            def _gather_slots_vec(slots, cache_u8v, bs_local):
                 """Vectorized dequant of KV slots from a uint8 cache view.
 
+                ``bs_local`` is the cache's own block size — the SWA cache
+                and the compressed caches (C4A/C128A) use different block
+                sizes (attn_metadata.block_size // compress_ratio), and
+                mixing them misplaces every slot beyond the first block.
                 Returns (kv [N,1,512] bf16, slot_to_idx dict)."""
                 n = slots.shape[0]
-                block_idx = (slots // bs).long()
-                pos_in_block = (slots % bs).long()
-                base = block_idx * (bs * hb)
+                block_idx = (slots // bs_local).long()
+                pos_in_block = (slots % bs_local).long()
+                base = block_idx * (bs_local * hb)
                 data_offs = base + pos_in_block * tstride
-                scale_offs = base + bs * tstride + pos_in_block * sdim
+                scale_offs = base + bs_local * tstride + pos_in_block * sdim
 
                 # bulk-read 576 data bytes + 8 scale bytes per slot
                 byte_arange = torch.arange(
@@ -337,8 +332,10 @@ else:
                 # cache at negative offsets would corrupt attention output
                 extra_slots = extra_idx[:, :extra_max].unique()
                 extra_slots = extra_slots[extra_slots >= 0]
+                # compressed caches use their own block size
+                extra_bs = extra_cache.shape[1]
                 kv_extra, extra_to_local = _gather_slots_vec(
-                    extra_slots, extra_u8
+                    extra_slots, extra_u8, extra_bs
                 )
             else:
                 extra_slots = None
@@ -347,7 +344,7 @@ else:
 
             kv_slots = idx[:, :swa_max].unique()
             kv_slots = kv_slots[kv_slots >= 0]  # filter invalid padding
-            kv_bf16, slot_to_idx = _gather_slots_vec(kv_slots, cache_u8)
+            kv_bf16, slot_to_idx = _gather_slots_vec(kv_slots, cache_u8, bs)
 
             # Assemble per-token indices: [extra..., swa...], padded with 0
             kv_indices = torch.zeros(
