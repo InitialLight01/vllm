@@ -3,6 +3,8 @@
 
 from typing import TYPE_CHECKING, Any
 
+import os
+
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -494,6 +496,27 @@ class Fp8LinearMethod(LinearMethodBase):
                 w_bf16 = (weight_fp8.to(torch.float32) * weight_scale.to(torch.float32)).to(x.dtype)
             else:
                 w_bf16 = weight_fp8.to(x.dtype)
+
+        # ---- quantize activation like the SM120 native FP8 path --------------
+        # SM120's Fp8BlockScaledMMLinearKernel quantizes activations to FP8
+        # per-token-group (128, UE8M0 scale) before the scaled GEMM.  To make
+        # SM80 EMULATION numerically identical, apply the same QDQ on the BF16
+        # fallback path (gated by VLLM_EMU_FP8_LINEAR_ACT).  The weight side is
+        # already exact (FP8 values × 2^scale are exact in BF16), so only the
+        # activation QDQ matters.
+        if (
+            os.environ.get("VLLM_EMU_FP8_LINEAR_ACT")
+            and x.dtype == torch.bfloat16
+            and self.block_quant
+        ):
+            from vllm.model_executor.layers.fused_moe.utils import (
+                _fp8_ptg_quant_dequant_ue8m0,
+            )
+
+            orig_shape = x.shape
+            x2d = x.reshape(-1, orig_shape[-1])
+            x2d = _fp8_ptg_quant_dequant_ue8m0(x2d, 128)[0].to(torch.bfloat16)
+            x = x2d.reshape(orig_shape)
 
         # ---- grouped BMM path (wo_a in DeepSeek-V4 attention) -----------------
         if getattr(layer, "is_bmm", False):

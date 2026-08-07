@@ -219,20 +219,31 @@ def _fp8_ptg_quant_dequant_ue8m0(
 ) -> tuple[torch.Tensor, None]:
     """Per-token-group FP8 E4M3 QDQ with 2-power (UE8M0-style) scales.
 
-    Mimics DeepGEMM's FP8 activation quantization: block of ``group_size``
-    (DeepGEMM uses 128) shares one scale that is the smallest power of two
-    covering the group's abs-max.  ``q = round_to_e4m3(A / scale)`` then
-    dequantized back — numerically equivalent to DeepGEMM's
-    ``qA * scale`` compute, keeping the routing/logit numerics aligned.
+    Bit-mimics DeepGEMM's FP8 activation quantization (CUDA kernel
+    ``per_token_group_fp8_quant`` with ``scale_ue8m0=True``): a block of
+    ``group_size`` (DeepGEMM uses 128) shares one scale that is the smallest
+    power of two covering the group's abs-max **divided by fp8_max**:
+
+        scale = 2^ceil(log2(max(|A|) / fp8_max))
+        q     = clamp(A / scale, -fp8_max, fp8_max) -> e4m3 (RN cast)
+
+    then dequantized back as ``qA * scale`` — numerically equivalent to
+    DeepGEMM's quantized compute, keeping the routing/logit numerics aligned.
+    Note: dividing by fp8_max first is essential; ``2^ceil(log2(amax))``
+    without it quantizes into (0.5, 1] and shares zero bits with DeepGEMM.
     """
+    fp8_dtype = current_platform.fp8_dtype()
+    fp8_max = torch.finfo(fp8_dtype).max  # 448.0 for e4m3
+    fp8_min = -fp8_max
+
     M, K = A.shape
     A_g = A.reshape(M, K // group_size, group_size)
     amax = A_g.abs().max(dim=-1, keepdim=True).values
-    # UE8M0: scale = 2^ceil(log2(amax))  (smallest power of 2 >= amax)
-    log2_amax = torch.log2(amax.clamp(min=1e-30))
-    scale_val = torch.ceil(log2_amax).clamp(-126, 127)
-    scale = 2.0 ** scale_val  # [M, K//g, 1] FP32
-    qA = (A_g / scale).to(torch.float8_e4m3fn)
+    # UE8M0: scale = 2^ceil(log2(amax / fp8_max))  (matches DeepGEMM kernel)
+    scale_raw = torch.maximum(amax / fp8_max, torch.tensor(1e-10, device=A.device))
+    exponent = torch.ceil(torch.log2(scale_raw))
+    scale = torch.exp2(exponent)  # [M, K//g, 1] FP32
+    qA = torch.clamp(A_g / scale, fp8_min, fp8_max).to(fp8_dtype)
     dqA = (qA.to(A.dtype) * scale).reshape(M, K)
     return dqA, None
 
@@ -315,11 +326,13 @@ def moe_kernel_quantize_input(
         if quantization_emulation:
             if os.environ.get("VLLM_EMU_DG_ACT"):
                 # DeepGEMM-compatible: per-token-group FP8 QDQ with 2-power
-                # scales (block 128), instead of per-tensor QDQ.  Reproduces
-                # DeepGEMM's activation quantization numerics on the
-                # EMULATION path so router boundaries stay aligned.
-                _g = (block_shape[1] if block_shape else 128)
-                return _fp8_ptg_quant_dequant_ue8m0(A, group_size=_g)
+                # scales, block 128 — reproduces DeepGEMM's activation
+                # quantization numerics on the EMULATION path so router
+                # boundaries stay aligned.  Group size must be 128
+                # (kFp8Dynamic128Sym), NOT the weight block_shape (MXFP4
+                # weights use 32) — using 32 quantizes per-32-elements and
+                # diverges from DeepGEMM.
+                return _fp8_ptg_quant_dequant_ue8m0(A, group_size=128)
             return _fp8_quantize_dequantize(A, A_scale)
         else:
             return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
