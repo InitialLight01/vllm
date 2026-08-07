@@ -996,6 +996,20 @@ class DeepseekV4DecoderLayer(nn.Module):
                     _f.write(_json.dumps(_stats) + "\n")
             except Exception:
                 pass
+        if os.environ.get("VLLM_DUMP_HIDDEN_FULL"):
+            try:
+                import json as _json
+                torch.cuda.synchronize()
+                _ffn_out = x.detach().float().cpu()
+                with open(os.environ["VLLM_DUMP_HIDDEN_FULL"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "ffn_out_full",
+                        "shape": list(x.shape),
+                        "data": _ffn_out[:4].reshape(-1).tolist(),  # 4 tokens x 4096
+                    }) + "\n")
+            except Exception:
+                pass
         return x, residual, post_mix, res_mix
 
 

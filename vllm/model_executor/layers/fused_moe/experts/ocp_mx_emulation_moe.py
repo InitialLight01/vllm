@@ -170,6 +170,21 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         assert w1.dtype == torch.uint8
         assert w2.dtype == torch.uint8
 
+        if os.environ.get("VLLM_DUMP_FC1"):
+            try:
+                import json as _json
+                with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else -1,
+                        "backend": "emu_shapes",
+                        "w1_shape": list(w1.shape),
+                        "w2_shape": list(w2.shape),
+                        "hs_shape": list(hidden_states.shape),
+                    }) + "\n")
+            except Exception:
+                pass
+
         if os.environ.get("VLLM_DUMP_TOPK"):
             try:
                 import json as _json
@@ -246,6 +261,38 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                 w2_chunk = dq_mxfp4_pytorch(
                     w2[chunk], self.w2_scale_val[chunk], target_dtype,
                 )
+            if os.environ.get("VLLM_DUMP_FC1"):
+                try:
+                    import json as _j
+                    with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                        _f.write(_j.dumps({
+                            "rank": torch.distributed.get_rank()
+                            if torch.distributed.is_initialized() else -1,
+                            "backend": "emu_wchunk",
+                            "chunk": [int(v) for v in chunk.tolist()],
+                            "w1c0_bytes": [int(v) for v in w1[chunk[0]][0][:4].tolist()],
+                            "w1c_last_bytes": [int(v) for v in w1[chunk[-1]][0][:4].tolist()],
+                        }) + "\n")
+                except Exception:
+                    pass
+            if os.environ.get("VLLM_DUMP_FC1"):
+                try:
+                    import json as _json
+                    with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                        _f.write(_json.dumps({
+                            "rank": torch.distributed.get_rank()
+                            if torch.distributed.is_initialized() else -1,
+                            "backend": "emu_wbytes",
+                            "w1_bytes": [int(v) for v in w1[chunk[0]][0][:8].tolist()],
+                            "w2_bytes": [int(v) for v in w2[chunk[0]][0][:8].tolist()],
+                            "w1s_bytes": [int(v) for v in self.w1_scale_val[chunk[0]][0][:8].tolist()],
+                            "w2s_bytes": [int(v) for v in self.w2_scale_val[chunk[0]][0][:8].tolist()],
+                            "w2s_shape": list(self.w2_scale_val.shape),
+                            "w1_dq": w1_chunk[0][0][:16].tolist(),
+                            "w2_dq": w2_chunk[0][0][:16].tolist(),
+                        }) + "\n")
+                except Exception:
+                    pass
 
             # ---- remap this chunk's experts  global → local -------------------
             # Slots not routed to this chunk get id 0 with zero weight, so
@@ -257,9 +304,46 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             local_weights = torch.where(
                 in_chunk, topk_weights, torch.zeros_like(topk_weights)
             )
+            if os.environ.get("VLLM_DUMP_FC1"):
+                try:
+                    import json as _j
+                    with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                        _f.write(_j.dumps({
+                            "rank": torch.distributed.get_rank()
+                            if torch.distributed.is_initialized() else -1,
+                            "backend": "emu_localids",
+                            "topk_ids_shape": list(topk_ids.shape),
+                            "topk_ids0": [int(v) for v in topk_ids[0].tolist()],
+                            "local_ids0": [int(v) for v in local_ids[0].tolist()],
+                            "dtype": str(topk_ids.dtype),
+                        }) + "\n")
+                except Exception:
+                    pass
 
             # ---- forward this chunk into a temp output, then accumulate ------
             temp_out = torch.empty_like(output)
+            if os.environ.get("VLLM_DUMP_SILU") or os.environ.get("VLLM_DUMP_FC1"):
+                # publish chunk→global expert map for the inner dump hook
+                try:
+                    import json as _j
+                    os.environ["VLLM_DUMP_CHUNK_EXPERTS"] = _j.dumps(
+                        [int(v) for v in chunk.tolist()]
+                    )
+                    os.environ["VLLM_DUMP_CHUNK_TOPK0"] = _j.dumps(
+                        [int(v) for v in topk_ids[0].tolist()]
+                    )
+                    if os.environ.get("VLLM_DUMP_FC1"):
+                        with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                            _f.write(_j.dumps({
+                                "rank": torch.distributed.get_rank()
+                                if torch.distributed.is_initialized() else -1,
+                                "backend": "emu_chunk",
+                                "chunk": [int(v) for v in chunk.tolist()],
+                                "active_experts": [int(v) for v in active_experts.tolist()],
+                                "topk0": [int(v) for v in topk_ids[0].tolist()],
+                            }) + "\n")
+                except Exception:
+                    pass
             super().apply(
                 output=temp_out,
                 hidden_states=hidden_states,
@@ -277,6 +361,24 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                 expert_tokens_meta=expert_tokens_meta,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
+            if os.environ.get("VLLM_DUMP_SILU"):
+                try:
+                    import json as _json
+                    _t = temp_out.detach().float().cpu()
+                    _lid = local_ids.detach().cpu()
+                    _tk = topk_ids.detach().cpu()
+                    with open(os.environ["VLLM_DUMP_SILU"], "a") as _f:
+                        _f.write(_json.dumps({
+                            "rank": torch.distributed.get_rank()
+                            if torch.distributed.is_initialized() else -1,
+                            "backend": "emulation",
+                            "chunk_experts": [int(v) for v in chunk.tolist()],
+                            "local_ids0": [int(v) for v in _lid[0].tolist()],
+                            "topk0": [int(v) for v in _tk[0].tolist()],
+                            "fc2_out": _t[:1].reshape(-1)[:64].tolist(),
+                        }) + "\n")
+                except Exception:
+                    pass
             acc.add_(temp_out)
 
         output.copy_(acc)

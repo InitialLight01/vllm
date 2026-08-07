@@ -402,6 +402,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     }) + "\n")
             except Exception:
                 pass
+        if os.environ.get("VLLM_DUMP_HIDDEN_FULL"):
+            try:
+                import json as _json
+                torch.cuda.synchronize()
+                _o_stats = o.detach().float().cpu()
+                with open(os.environ["VLLM_DUMP_HIDDEN_FULL"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "attn_o_pre_proj_full",
+                        "shape": list(o.shape),
+                        "data": _o_stats[:4].reshape(-1).tolist(),  # 4 tokens x heads*head_dim
+                    }) + "\n")
+            except Exception:
+                pass
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         return self._o_proj(o, positions)
