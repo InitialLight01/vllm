@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -4078,6 +4079,10 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        if os.environ.get("VLLM_PROFILE"):
+            import time as _tmod
+            self._profile_t_start = _tmod.perf_counter()
+
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
@@ -4692,6 +4697,13 @@ class GPUModelRunner(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
+            if os.environ.get("VLLM_PROFILE"):
+                import time as _tmod
+                with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                    _f.write(
+                        f"execute_model {(_tmod.perf_counter() - self._profile_t_start) * 1000:.1f}ms "
+                        f"num_tokens={scheduler_output.total_num_scheduled_tokens}\n"
+                    )
             return output
 
         with record_function_or_nullcontext(
@@ -4740,6 +4752,13 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        if os.environ.get("VLLM_PROFILE"):
+            import time as _tmod
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(
+                    f"execute_model {(_tmod.perf_counter() - self._profile_t_start) * 1000:.1f}ms "
+                    f"num_tokens={scheduler_output.total_num_scheduled_tokens}\n"
+                )
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
