@@ -361,6 +361,26 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         )
 
         def _base_w13_fn():
+            if os.environ.get("VLLM_DUMP_FC1"):
+                try:
+                    import json as _json
+                    _eids = expert_ids.detach().cpu()
+                    _st = sorted_token_ids.detach().cpu()
+                    _w1e0 = w1[0].detach().float().cpu()
+                    with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                        _f.write(_json.dumps({
+                            "rank": torch.distributed.get_rank()
+                            if torch.distributed.is_initialized() else -1,
+                            "backend": "emu_fc1args",
+                            "expert_ids8": [int(v) for v in _eids[:8].tolist()],
+                            "expert_ids_shape": list(expert_ids.shape),
+                            "sorted8": [int(v) for v in _st[:8].tolist()],
+                            "num_padded": int(num_tokens_post_padded.item()),
+                            "w1e0_first8": [float(v) for v in _w1e0[0][:8].tolist()],
+                            "w1e0_row1_first8": [float(v) for v in _w1e0[1][:8].tolist()],
+                        }) + "\n")
+                except Exception:
+                    pass
             invoke_fused_moe_triton_kernel(
                 hidden_states,
                 w1,
@@ -546,9 +566,16 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                                 "row0_expert": _e0,
                                 "local_ids0": [int(v) for v in _eids[:6].tolist()],
                                 "sorted_tokens0": [int(v) for v in _stids[:8].tolist()],
-                                "row0_input": hidden_states.detach().float().cpu()[
+                                "w1_shape": list(w1.shape),
+                                "hs_shape_silu": list(hidden_states.shape),
+                                "ic1_shape": list(intermediate_cache1.shape),
+                                "w1_e0_rows0_4": [float(v) for v in w1[0][:4].reshape(-1).tolist()],
+                                "row0_input_full": hidden_states.detach().float().cpu()[
+                                    int(_stids[0]) // top_k_num
+                                ].tolist(),
+                                "row0_input_flat": hidden_states.detach().float().cpu()[
                                     int(_stids[0])
-                                ][:8].tolist(),
+                                ].tolist(),
                                 "gate_row0": _gc[0].tolist(),
                                 "up_row0": _uc[0].tolist(),
                                 "silu_row0": _yc2[0].tolist(),

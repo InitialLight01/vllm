@@ -353,6 +353,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Metadata-independent input GEMMs + RMSNorm stay in the captured
         # graph; the metadata-dependent rest (q up-proj + kv-insert, indexer,
         # compressor, MLA attention) runs in the eager break.
+        if os.environ.get("VLLM_PROFILE"):
+            _tqkv0 = torch.cuda.Event(enable_timing=True)
+            _tqkv1 = torch.cuda.Event(enable_timing=True)
+            _tqkv0.record()
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
             self.attn_gemm_parallel_execute(hidden_states)
         )
@@ -364,10 +368,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.kv_norm.weight.data,
             self.eps,
         )
+        if os.environ.get("VLLM_PROFILE"):
+            _tqkv1.record()
+            torch.cuda.synchronize()
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"attn_qkv {_tqkv0.elapsed_time(_tqkv1):.3f}ms\n")
 
         # attention_impl is wrapped with @eager_break_during_capture: this is
         # where the breakable cudagraph capture breaks (the attention op runs
         # eagerly between captured graph segments).
+        if os.environ.get("VLLM_PROFILE"):
+            _tatt0 = torch.cuda.Event(enable_timing=True)
+            _tatt1 = torch.cuda.Event(enable_timing=True)
+            _tatt0.record()
         self.attention_impl(
             hidden_states,
             qr,
@@ -379,6 +392,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
         o = o_padded[:, : self.n_local_heads, :]
+        if os.environ.get("VLLM_PROFILE"):
+            _tatt1.record()
+            torch.cuda.synchronize()
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"attn_impl {_tatt0.elapsed_time(_tatt1):.3f}ms\n")
         if os.environ.get("VLLM_DUMP_HIDDEN"):
             try:
                 import json as _json
@@ -418,7 +436,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 pass
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
-        return self._o_proj(o, positions)
+        if os.environ.get("VLLM_PROFILE"):
+            _top0 = torch.cuda.Event(enable_timing=True)
+            _top1 = torch.cuda.Event(enable_timing=True)
+            _top0.record()
+        _r = self._o_proj(o, positions)
+        if os.environ.get("VLLM_PROFILE"):
+            _top1.record()
+            torch.cuda.synchronize()
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"attn_oproj {_top0.elapsed_time(_top1):.3f}ms\n")
+        return _r
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
         aux_streams = self.aux_stream_list

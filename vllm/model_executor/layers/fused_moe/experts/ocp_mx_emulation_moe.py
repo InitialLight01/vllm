@@ -27,6 +27,9 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mx
 from vllm.model_executor.layers.quantization.utils.mxfp4_dequant_pytorch import (
     dq_mxfp4_pytorch,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp4_dequant_triton import (
+    dq_mxfp4_triton,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp6_utils import dequant_mxfp6
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
     OCP_MX_Scheme,
@@ -170,6 +173,11 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         assert w1.dtype == torch.uint8
         assert w2.dtype == torch.uint8
 
+        if os.environ.get("VLLM_PROFILE"):
+            _t0 = torch.cuda.Event(enable_timing=True)
+            _t1 = torch.cuda.Event(enable_timing=True)
+            _t0.record()
+
         if os.environ.get("VLLM_DUMP_FC1"):
             try:
                 import json as _json
@@ -181,6 +189,9 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                         "w1_shape": list(w1.shape),
                         "w2_shape": list(w2.shape),
                         "hs_shape": list(hidden_states.shape),
+                        "expert_map": None if expert_map is None else
+                        [int(v) for v in expert_map[:16].tolist()],
+                        "layer_name": getattr(self, "layer_name", "?"),
                     }) + "\n")
             except Exception:
                 pass
@@ -255,23 +266,35 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                     for eid in chunk.tolist()
                 ], dim=0)
             else:
-                w1_chunk = dq_mxfp4_pytorch(
-                    w1[chunk], self.w1_scale_val[chunk], target_dtype,
+                if os.environ.get("VLLM_PROFILE"):
+                    _td0 = torch.cuda.Event(enable_timing=True)
+                    _td1 = torch.cuda.Event(enable_timing=True)
+                    _td0.record()
+                w1_chunk = dq_mxfp4_triton(
+                    w1[chunk], self.w1_scale_val[chunk],
                 )
-                w2_chunk = dq_mxfp4_pytorch(
-                    w2[chunk], self.w2_scale_val[chunk], target_dtype,
+                w2_chunk = dq_mxfp4_triton(
+                    w2[chunk], self.w2_scale_val[chunk],
                 )
+                if os.environ.get("VLLM_PROFILE"):
+                    _td1.record()
+                    torch.cuda.synchronize()
+                    with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                        _f.write(
+                            f"  dequant {_td0.elapsed_time(_td1):.3f}ms "
+                            f"chunk={len(chunk)}\n"
+                        )
             if os.environ.get("VLLM_DUMP_FC1"):
                 try:
                     import json as _j
+                    _dq = [float(v) for v in w1_chunk[0][0][:16].tolist()]
                     with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
                         _f.write(_j.dumps({
                             "rank": torch.distributed.get_rank()
                             if torch.distributed.is_initialized() else -1,
                             "backend": "emu_wchunk",
                             "chunk": [int(v) for v in chunk.tolist()],
-                            "w1c0_bytes": [int(v) for v in w1[chunk[0]][0][:4].tolist()],
-                            "w1c_last_bytes": [int(v) for v in w1[chunk[-1]][0][:4].tolist()],
+                            "w1c0_dq16": _dq,
                         }) + "\n")
                 except Exception:
                     pass
@@ -382,3 +405,15 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             acc.add_(temp_out)
 
         output.copy_(acc)
+
+        if os.environ.get("VLLM_PROFILE"):
+            try:
+                _t1.record()
+                torch.cuda.synchronize()
+                with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                    _f.write(
+                        f"emu_apply {_t0.elapsed_time(_t1):.3f}ms "
+                        f"M={hidden_states.shape[0]} experts={num_active}\n"
+                    )
+            except Exception:
+                pass

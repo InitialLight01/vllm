@@ -932,7 +932,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         # attn_norm is fused into mhc_pre_tilelang / mhc_fused_post_pre above.
+        if os.environ.get("VLLM_PROFILE"):
+            _pa = torch.cuda.Event(enable_timing=True)
+            _pa.record()
         x = self.attn(positions, x, None)
+        if os.environ.get("VLLM_PROFILE"):
+            _qa = torch.cuda.Event(enable_timing=True)
+            _qa.record()
+            torch.cuda.synchronize()
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"attn {_pa.elapsed_time(_qa):.3f}ms M={x.shape[0]}\n")
         if os.environ.get("VLLM_DUMP_HIDDEN"):
             try:
                 import json as _json
