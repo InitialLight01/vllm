@@ -394,6 +394,7 @@ def sparse_attn_prefill(
         H, head_dim, N, sm_scale,
         HAS_ATTN_SINK=attn_sink is not None,
         BLOCK_H=BLOCK_H, BLOCK_D=BLOCK_D, BLOCK_K=BLOCK_K,
+        num_warps=8, num_stages=2,
     )
 
 
