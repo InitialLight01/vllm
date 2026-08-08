@@ -310,8 +310,9 @@ else:
                 scale_bytes = cache_u8v[all_scale_offs]  # [N, 8] uint8
                 scale_f32 = 2.0 ** (scale_bytes.float() - 127.0)
                 scale_bf16 = scale_f32.to(torch.bfloat16)
-                for g in range(7):
-                    nope_bf16[:, g * 64 : (g + 1) * 64] *= scale_bf16[:, g : g + 1]
+                # vectorized scale application (no Python loop): each of the
+                # 7 NOPE 64-elt groups gets scale_bf16[:, g]
+                nope_bf16 *= scale_bf16[:, :7].repeat_interleave(64, dim=1)
 
                 rope_bf16 = (
                     data_bytes[:, 448:576]
@@ -323,8 +324,10 @@ else:
                 kv = torch.zeros(n, 1, 512, dtype=torch.bfloat16, device=q.device)
                 kv[:, 0, :448] = nope_bf16
                 kv[:, 0, 448:] = rope_bf16
-                slot_to_idx = {s.item(): i for i, s in enumerate(slots)}
-                return kv, slot_to_idx
+                # sorted slots allow GPU searchsorted instead of a Python dict
+                slot_order = torch.argsort(slots)
+                sorted_slots = slots[slot_order]
+                return kv, sorted_slots, slot_order
 
             # Gather global (extra) KV slots, then SWA slots
             if has_extra:
@@ -334,50 +337,59 @@ else:
                 extra_slots = extra_slots[extra_slots >= 0]
                 # compressed caches use their own block size
                 extra_bs = extra_cache.shape[1]
-                kv_extra, extra_to_local = _gather_slots_vec(
+                kv_extra, extra_sorted, _ = _gather_slots_vec(
                     extra_slots, extra_u8, extra_bs
                 )
             else:
                 extra_slots = None
                 kv_extra = None
-                extra_to_local = {}
+                extra_sorted = None
 
             kv_slots = idx[:, :swa_max].unique()
             kv_slots = kv_slots[kv_slots >= 0]  # filter invalid padding
-            kv_bf16, slot_to_idx = _gather_slots_vec(kv_slots, cache_u8, bs)
+            kv_bf16, swa_sorted, _ = _gather_slots_vec(kv_slots, cache_u8, bs)
 
-            # Assemble per-token indices: [extra..., swa...], padded with 0
+            # ---- GPU-vectorized index assembly (no Python loops / .item()) ----
+            def _local_map(raw_idx, sorted_slots):
+                # raw_idx [D, K] slots (may contain -1 padding); sorted_slots
+                # [N] unique valid slots. Returns [D, K] local indices with
+                # invalid/padding entries mapped to 0.
+                if sorted_slots is None or sorted_slots.numel() == 0:
+                    return torch.zeros_like(raw_idx)
+                match = (raw_idx.unsqueeze(-1) == sorted_slots.unsqueeze(0).unsqueeze(0))
+                local = match.int().argmax(dim=-1)  # [D, K]; no-match -> 0
+                valid = (raw_idx >= 0) & match.any(dim=-1)
+                return torch.where(valid, local, 0)
+
+            max_len = swa_max + extra_max
             kv_indices = torch.zeros(
                 D, 1, max_len, dtype=torch.int32, device=q.device
             )
+            if has_extra and extra_sorted is not None and extra_sorted.numel() > 0:
+                # extra block [0, E): local indices into kv_extra
+                extra_local = _local_map(extra_idx[:, :extra_max], extra_sorted)
+                kv_indices[:, 0, :extra_max] = extra_local
+
+            if kv_extra is not None:
+                # SWA block [extra_max, max_len): local indices into kv_bf16,
+                # offset by the number of global slots
+                offset = kv_extra.shape[0]
+                swa_local = _local_map(idx[:, :swa_max], swa_sorted) + offset
+            else:
+                offset = 0
+                swa_local = _local_map(idx[:, :swa_max], swa_sorted)
+            kv_indices[:, 0, extra_max:max_len] = swa_local
+
+            # combined lengths: GPU addition (padding entries stay 0)
             combined_lens = torch.zeros(D, dtype=torch.int32, device=q.device)
-            for d in range(D):
-                E = extra_lens[d].item() if has_extra else 0
-                L = lens[d].item()
-                combined_lens[d] = E + L
-                for k in range(E):
-                    _s = extra_idx[d, k].item()
-                    if _s >= 0:
-                        kv_indices[d, 0, k] = extra_to_local[_s]
-                for k in range(L):
-                    _s = idx[d, k].item()
-                    if _s >= 0:
-                        kv_indices[d, 0, E + k] = slot_to_idx[_s]
+            if has_extra:
+                combined_lens += (extra_lens.squeeze(1) if extra_lens.ndim == 2
+                                  else extra_lens)
+            combined_lens += lens
 
             # Concatenate global + SWA gathered KV
             if kv_extra is not None:
                 kv_all = torch.cat([kv_extra, kv_bf16], dim=0)
-                # offset SWA slot indices by the number of global slots
-                offset = kv_extra.shape[0]
-                for d in range(D):
-                    E = extra_lens[d].item() if has_extra else 0
-                    L = lens[d].item()
-                    for k in range(L):
-                        _s = idx[d, k].item()
-                        if _s >= 0:
-                            kv_indices[d, 0, E + k] = (
-                                slot_to_idx[_s] + offset
-                            )
             else:
                 kv_all = kv_bf16
 

@@ -213,6 +213,9 @@ def _fp8_quantize_dequantize(
     return A, None
 
 
+_FP8_QDQ_EPS: torch.Tensor | None = None
+
+
 def _fp8_ptg_quant_dequant_ue8m0(
     A: torch.Tensor,
     group_size: int = 128,
@@ -236,11 +239,17 @@ def _fp8_ptg_quant_dequant_ue8m0(
     fp8_max = torch.finfo(fp8_dtype).max  # 448.0 for e4m3
     fp8_min = -fp8_max
 
+    # Pre-allocated constant (CUDA-graph capture cannot create CPU->CUDA
+    # copies from torch.tensor(...); a module-level constant is fine).
+    global _FP8_QDQ_EPS
+    if _FP8_QDQ_EPS is None or _FP8_QDQ_EPS.device != A.device:
+        _FP8_QDQ_EPS = torch.tensor(1e-10, device=A.device)
+
     M, K = A.shape
     A_g = A.reshape(M, K // group_size, group_size)
     amax = A_g.abs().max(dim=-1, keepdim=True).values
     # UE8M0: scale = 2^ceil(log2(amax / fp8_max))  (matches DeepGEMM kernel)
-    scale_raw = torch.maximum(amax / fp8_max, torch.tensor(1e-10, device=A.device))
+    scale_raw = torch.maximum(amax / fp8_max, _FP8_QDQ_EPS)
     exponent = torch.ceil(torch.log2(scale_raw))
     scale = torch.exp2(exponent)  # [M, K//g, 1] FP32
     qA = torch.clamp(A_g / scale, fp8_min, fp8_max).to(fp8_dtype)

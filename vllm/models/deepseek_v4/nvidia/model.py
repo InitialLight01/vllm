@@ -1542,9 +1542,18 @@ class DeepseekV4ForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if os.environ.get("VLLM_PROFILE"):
+            _tf0 = torch.cuda.Event(enable_timing=True)
+            _tf1 = torch.cuda.Event(enable_timing=True)
+            _tf0.record()
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+        if os.environ.get("VLLM_PROFILE"):
+            _tf1.record()
+            torch.cuda.synchronize()
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"model_fwd {_tf0.elapsed_time(_tf1):.3f}ms M={input_ids.shape[0]}\n")
         return hidden_states
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
