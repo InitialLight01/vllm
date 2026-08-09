@@ -361,31 +361,103 @@ else:
                 valid = (raw_idx >= 0) & match.any(dim=-1)
                 return torch.where(valid, local, 0)
 
-            max_len = swa_max + extra_max
-            kv_indices = torch.zeros(
-                D, 1, max_len, dtype=torch.int32, device=q.device
-            )
-            if has_extra and extra_sorted is not None and extra_sorted.numel() > 0:
-                # extra block [0, E): local indices into kv_extra
-                extra_local = _local_map(extra_idx[:, :extra_max], extra_sorted)
-                kv_indices[:, 0, :extra_max] = extra_local
-
-            if kv_extra is not None:
-                # SWA block [extra_max, max_len): local indices into kv_bf16,
-                # offset by the number of global slots
-                offset = kv_extra.shape[0]
-                swa_local = _local_map(idx[:, :swa_max], swa_sorted) + offset
-            else:
-                offset = 0
-                swa_local = _local_map(idx[:, :swa_max], swa_sorted)
-            kv_indices[:, 0, extra_max:max_len] = swa_local
-
-            # combined lengths: GPU addition (padding entries stay 0)
+            # Combined lengths (per-row), needed by the kernel indptr.
             combined_lens = torch.zeros(D, dtype=torch.int32, device=q.device)
             if has_extra:
                 combined_lens += (extra_lens.squeeze(1) if extra_lens.ndim == 2
                                   else extra_lens)
             combined_lens += lens
+
+            # ---- compact per-row index assembly ----
+            # Row t layout: [extra local (extra_lens_t) | swa local (lens_t)]
+            # with NO padding inside the active region, mirroring
+            # combine_topk_swa_indices(). The old fixed-width layout
+            # [extra | pad | swa] combined with the per-row length mask
+            # [0, combined_lens_t) inserted (extra_max - extra_lens_t) zero
+            # slots (→ kv_all[0]) between the blocks whenever the batch had
+            # heterogeneous extra lens (any D >= 2) and dropped the SWA tail
+            # past the block end — decode attention then lost the most recent
+            # context and fell into prompt-regeneration repetition loops.
+            if has_extra and extra_sorted is not None and extra_sorted.numel() > 0:
+                # extra block: local indices into kv_extra, left-aligned
+                extra_local = _local_map(extra_idx[:, :extra_max], extra_sorted)
+            else:
+                extra_local = None
+            if kv_extra is not None:
+                # SWA block: local indices into kv_bf16, offset by the
+                # number of global slots
+                offset = kv_extra.shape[0]
+                swa_local = _local_map(idx[:, :swa_max], swa_sorted) + offset
+            else:
+                swa_local = _local_map(idx[:, :swa_max], swa_sorted)
+
+            max_combined = int(combined_lens.max().item()) if D > 0 else 0
+            kv_indices = torch.zeros(
+                D, 1, max_combined, dtype=torch.int32, device=q.device
+            )
+            flat = kv_indices.view(-1)
+            row_base = torch.arange(D, device=q.device).to(torch.int64)
+            row_base = row_base * max_combined
+            if extra_local is not None:
+                n_extra = extra_lens.to(torch.int64)  # [D]
+                mask_e = (
+                    torch.arange(extra_max, device=q.device).unsqueeze(0)
+                    < n_extra.unsqueeze(1)
+                )
+                dst_e = row_base.unsqueeze(1) + torch.arange(
+                    extra_max, device=q.device
+                ).unsqueeze(0)
+                # _local_map returns int64 (argmax); index_put_ requires
+                # exact dtype match with the int32 destination
+                flat[dst_e[mask_e]] = extra_local[mask_e].to(torch.int32)
+            n_swa = lens.to(torch.int64)  # [D]
+            mask_s = (
+                torch.arange(swa_max, device=q.device).unsqueeze(0)
+                < n_swa.unsqueeze(1)
+            )
+            # swa block starts at extra_lens_t within each row (not extra_max)
+            swa_col_base = (
+                (extra_lens.to(torch.int64) if has_extra else torch.zeros_like(n_swa))
+            ).unsqueeze(1)
+            dst_s = row_base.unsqueeze(1) + swa_col_base + torch.arange(
+                swa_max, device=q.device
+            ).unsqueeze(0)
+            flat[dst_s[mask_s]] = swa_local[mask_s].to(torch.int32)
+
+            if os.environ.get("VLLM_DUMP_HIDDEN"):
+                try:
+                    import json as _json
+                    # self-check: within each row's active region
+                    # [0, combined_lens_t), local indices must be distinct
+                    # (extra block [0,E) and swa block [E,E+S) are disjoint
+                    # ranges). Duplicates would mean zero padding slipped
+                    # into the attention list (the pre-fix bug).
+                    row_mask = torch.arange(
+                        max_combined, device=q.device
+                    ).unsqueeze(0) < combined_lens.unsqueeze(1)
+                    active_sorted, _ = torch.sort(
+                        torch.where(
+                            row_mask,
+                            kv_indices.squeeze(1).to(torch.int64),
+                            -1,
+                        ),
+                        dim=1,
+                    )
+                    dup = (active_sorted[:, 1:] == active_sorted[:, :-1]) & (
+                        active_sorted[:, 1:] >= 0
+                    )
+                    with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                        _f.write(_json.dumps({
+                            "comp": "gather_layout_check",
+                            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                            "D": int(D),
+                            "max_combined": max_combined,
+                            "dup_in_active": int(dup.sum().item()),
+                            "active_total": int(row_mask.sum().item()),
+                            "lens": [int(v) for v in combined_lens[:8].tolist()],
+                        }) + "\n")
+                except Exception:
+                    pass
 
             # Concatenate global + SWA gathered KV
             if kv_extra is not None:
