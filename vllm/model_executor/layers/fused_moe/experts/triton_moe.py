@@ -52,6 +52,9 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
+# debug counter for VLLM_DUMP_SILU (per-process)
+_SILU_DUMP_N = [0]
+
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     """Triton-based fused MoE expert implementation."""
@@ -520,9 +523,16 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 # silu_mul_fp8_quant_packed (alpha=1, beta=0).
                 _glu = _g / (1.0 + torch.exp(-_g))
                 _y = (_u * _glu).to(torch.bfloat16).to(torch.float32)
-                if os.environ.get("VLLM_DUMP_SILU"):
+                if os.environ.get("VLLM_DUMP_SILU") and os.path.exists(
+                    os.environ.get(
+                        "VLLM_DUMP_SILU_TRIGGER", "/root/autodl-tmp/tmp/.silu_trigger"
+                    )
+                ):
                     try:
                         import json as _json
+                        _SILU_DUMP_N[0] += 1
+                        _n = _SILU_DUMP_N[0]
+                        _full = True  # trigger-gated runs are small; dump everything
                         _x1c = intermediate_cache1.detach().float().cpu()
                         _yc = _y.detach().float().cpu()
                         _eids = expert_ids.detach().cpu()
@@ -535,12 +545,13 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                         ]
                         with open(os.environ["VLLM_DUMP_SILU"], "a") as _f:
                             _f.write(_json.dumps({
+                                "n": _n,
                                 "rank": torch.distributed.get_rank()
                                 if torch.distributed.is_initialized() else -1,
                                 "expert_ids": _glob,
                                 "fc1_out": _x1c[:8, :6].reshape(-1).tolist(),
                                 "silu_out": _yc[:8, :6].reshape(-1).tolist(),
-                                "fc1_row0_full": _x1c[0].tolist(),
+                                "fc1_row0_full": _x1c[0].tolist() if _full else None,
                             }) + "\n")
                     except Exception:
                         pass

@@ -37,6 +37,7 @@ def _prefill_kernel(
     kv_ptr,
     kv_indices_ptr,
     kv_indptr_ptr,
+    kv_lens_ptr,
     attn_sink_ptr,
     out_ptr,
     q_stride_t,
@@ -52,6 +53,7 @@ def _prefill_kernel(
     num_kv,
     scale,
     HAS_ATTN_SINK: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -80,9 +82,18 @@ def _prefill_kernel(
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
-    kv_start = tl.load(kv_indptr_ptr + query_idx)
-    kv_end = tl.load(kv_indptr_ptr + query_idx + 1)
-    kv_len = kv_end - kv_start
+    # CUDA-graph safe row-major layout: row t occupies
+    # [t * ROW_STRIDE, (t+1) * ROW_STRIDE) in kv_indices; valid prefix
+    # length is kv_len (per-row), tail columns hold 0-slot garbage that
+    # must NOT be attended. ROW_STRIDE==0 means the legacy ragged layout
+    # (indptr-based, kept for non-graph callers).
+    if ROW_STRIDE > 0:
+        kv_start = query_idx * ROW_STRIDE
+        kv_len = tl.load(kv_lens_ptr + query_idx)
+    else:
+        kv_start = tl.load(kv_indptr_ptr + query_idx)
+        kv_end = tl.load(kv_indptr_ptr + query_idx + 1)
+        kv_len = kv_end - kv_start
     k_offsets = tl.arange(0, BLOCK_K)
 
     for k_start in tl.range(0, kv_len, BLOCK_K):
@@ -377,7 +388,15 @@ def sparse_attn_prefill(
     N = kv.shape[0]
     assert kv.shape[1] == 1 and kv.shape[2] == head_dim
 
-    indptr, ragged_idx = _dense_to_ragged(indices, topk_length)
+    # CUDA-graph safe: skip the boolean-mask ragged compression
+    # (_dense_to_ragged is illegal during capture — dynamic output shape).
+    # Use the static row-major layout directly: row t occupies
+    # [t*K, (t+1)*K) of the flattened index tensor, valid prefix is
+    # topk_length[t], tail columns hold 0-slot garbage that the kernel
+    # masks out via kv_len.
+    K = indices.shape[-1]
+    ragged_idx = indices.squeeze(1).reshape(-1).contiguous()
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=indices.device)
 
     BLOCK_H = min(16, triton.next_power_of_2(H))
     BLOCK_D = triton.next_power_of_2(head_dim)
@@ -385,7 +404,7 @@ def sparse_attn_prefill(
 
     grid = (T, triton.cdiv(H, BLOCK_H))
     _prefill_kernel[grid](
-        q, kv.squeeze(1), ragged_idx, indptr,
+        q, kv.squeeze(1), ragged_idx, indptr, topk_length,
         attn_sink if attn_sink is not None else q,  # dummy ptr if no sink
         out,
         q.stride(0), q.stride(1), q.stride(2),
@@ -393,6 +412,7 @@ def sparse_attn_prefill(
         out.stride(0), out.stride(1), out.stride(2),
         H, head_dim, N, sm_scale,
         HAS_ATTN_SINK=attn_sink is not None,
+        ROW_STRIDE=K,
         BLOCK_H=BLOCK_H, BLOCK_D=BLOCK_D, BLOCK_K=BLOCK_K,
         num_warps=8, num_stages=2,
     )

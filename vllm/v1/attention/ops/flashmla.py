@@ -252,12 +252,16 @@ else:
                 extra_u8 = None
 
             D = q.shape[0]
-            swa_max = lens.max().item()
+            # CUDA-graph compatible: use the STATIC allocation widths of the
+            # index tensors instead of runtime .item() syncs (which are
+            # illegal during graph capture). Per-row lengths still mask the
+            # valid prefix of each row, so the fixed max width is safe.
+            swa_max = idx.shape[-1]
             extra_max = (
-                extra_lens.max().item() if has_extra else 0
+                extra_idx.shape[-1] if has_extra else 0
             )
             max_len = swa_max + extra_max
-            if os.environ.get("VLLM_DUMP_HIDDEN"):
+            if os.environ.get("VLLM_DUMP_HIDDEN") and not torch.cuda.is_current_stream_capturing():
                 try:
                     import json as _json
                     with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
@@ -327,14 +331,27 @@ else:
                 # sorted slots allow GPU searchsorted instead of a Python dict
                 slot_order = torch.argsort(slots)
                 sorted_slots = slots[slot_order]
+                # reorder KV rows to match the sorted order so that local
+                # indices from _local_map (which match against sorted_slots)
+                # index into consistent rows. torch.unique() used to return
+                # ascending slots (making slots==sorted order); the flattened
+                # slot list breaks that invariant.
+                kv = kv[slot_order]
                 return kv, sorted_slots, slot_order
 
-            # Gather global (extra) KV slots, then SWA slots
+            # Gather global (extra) KV slots, then SWA slots.
+            # CUDA-graph note: torch.unique() is illegal during capture
+            # (dynamic allocation), so we gather the full flattened slot
+            # list instead. Duplicated slots produce duplicated KV rows;
+            # _local_map still resolves correctly because every match lands
+            # on a valid local index whose KV content is identical
+            # (_gather_slots_vec reorders rows into sorted order).
             if has_extra:
-                # filter invalid (-1 padding) slots before gather — reading
-                # cache at negative offsets would corrupt attention output
-                extra_slots = extra_idx[:, :extra_max].unique()
-                extra_slots = extra_slots[extra_slots >= 0]
+                extra_slots = extra_idx[:, :extra_max].reshape(-1)
+                extra_slots = torch.where(
+                    extra_slots >= 0, extra_slots,
+                    torch.zeros_like(extra_slots),
+                )  # clamp -1 padding to slot 0 (masked out downstream)
                 # compressed caches use their own block size
                 extra_bs = extra_cache.shape[1]
                 kv_extra, extra_sorted, _ = _gather_slots_vec(
@@ -345,8 +362,10 @@ else:
                 kv_extra = None
                 extra_sorted = None
 
-            kv_slots = idx[:, :swa_max].unique()
-            kv_slots = kv_slots[kv_slots >= 0]  # filter invalid padding
+            kv_slots = idx[:, :swa_max].reshape(-1)
+            kv_slots = torch.where(
+                kv_slots >= 0, kv_slots, torch.zeros_like(kv_slots)
+            )  # clamp -1 padding to slot 0 (masked out downstream)
             kv_bf16, swa_sorted, _ = _gather_slots_vec(kv_slots, cache_u8, bs)
 
             # ---- GPU-vectorized index assembly (no Python loops / .item()) ----
@@ -391,30 +410,28 @@ else:
             else:
                 swa_local = _local_map(idx[:, :swa_max], swa_sorted)
 
-            max_combined = int(combined_lens.max().item()) if D > 0 else 0
+            # static max width = swa_max + extra_max (CUDA-graph safe, no .item())
+            max_combined = max_len if D > 0 else 0
             kv_indices = torch.zeros(
                 D, 1, max_combined, dtype=torch.int32, device=q.device
             )
             flat = kv_indices.view(-1)
             row_base = torch.arange(D, device=q.device).to(torch.int64)
             row_base = row_base * max_combined
+            # CUDA-graph note: boolean-mask index_put_ is illegal during
+            # capture (dynamic mask cardinality). Write the FULL static
+            # integer-index range instead: rows are disjoint and
+            # in-row columns are unique, and invalid columns already hold
+            # 0 from _local_map (masked out by combined_lens downstream),
+            # so unconditional writes are safe.
             if extra_local is not None:
-                n_extra = extra_lens.to(torch.int64)  # [D]
-                mask_e = (
-                    torch.arange(extra_max, device=q.device).unsqueeze(0)
-                    < n_extra.unsqueeze(1)
-                )
                 dst_e = row_base.unsqueeze(1) + torch.arange(
                     extra_max, device=q.device
                 ).unsqueeze(0)
                 # _local_map returns int64 (argmax); index_put_ requires
                 # exact dtype match with the int32 destination
-                flat[dst_e[mask_e]] = extra_local[mask_e].to(torch.int32)
+                flat[dst_e] = extra_local.to(torch.int32)
             n_swa = lens.to(torch.int64)  # [D]
-            mask_s = (
-                torch.arange(swa_max, device=q.device).unsqueeze(0)
-                < n_swa.unsqueeze(1)
-            )
             # swa block starts at extra_lens_t within each row (not extra_max)
             swa_col_base = (
                 (extra_lens.to(torch.int64) if has_extra else torch.zeros_like(n_swa))
@@ -422,9 +439,9 @@ else:
             dst_s = row_base.unsqueeze(1) + swa_col_base + torch.arange(
                 swa_max, device=q.device
             ).unsqueeze(0)
-            flat[dst_s[mask_s]] = swa_local[mask_s].to(torch.int32)
+            flat[dst_s] = swa_local.to(torch.int32)
 
-            if os.environ.get("VLLM_DUMP_HIDDEN"):
+            if os.environ.get("VLLM_DUMP_HIDDEN") and not torch.cuda.is_current_stream_capturing():
                 try:
                     import json as _json
                     # self-check: within each row's active region
@@ -455,6 +472,13 @@ else:
                             "dup_in_active": int(dup.sum().item()),
                             "active_total": int(row_mask.sum().item()),
                             "lens": [int(v) for v in combined_lens[:8].tolist()],
+                            "row0_head8": [int(v) for v in kv_indices[0, 0, :8].tolist()],
+                            "row0_tail8": [int(v) for v in kv_indices[0, 0, -8:].tolist()],
+                            "raw_swa0": [int(v) for v in idx[0, :8].tolist()],
+                            "sorted_swa_head": [int(v) for v in swa_sorted[:8].tolist()],
+                            "sorted_extra_head": [int(v) for v in extra_sorted[:8].tolist()] if extra_sorted is not None else None,
+                            "kv_extra_rows": int(kv_extra.shape[0]) if kv_extra is not None else 0,
+                            "kv_bf16_rows": int(kv_bf16.shape[0]) if kv_bf16 is not None else 0,
                         }) + "\n")
                 except Exception:
                     pass
@@ -479,7 +503,7 @@ else:
             return out, tile_scheduler_metadata
         except Exception as _e:
             import traceback as _tb
-            if os.environ.get("VLLM_DUMP_HIDDEN"):
+            if os.environ.get("VLLM_DUMP_HIDDEN") and not torch.cuda.is_current_stream_capturing():
                 try:
                     with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
                         _f.write("GATHER_EXCEPTION: " + repr(_e) + "\n")

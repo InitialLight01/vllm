@@ -16,6 +16,9 @@ import os
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+
+# debug counter for VLLM_DUMP_SILU (per-process)
+_EMU_DUMP_N = [0]
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -213,12 +216,22 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
 
         target_dtype = hidden_states.dtype
 
-        # ---- find which experts are actually active ---------------------------
-        active_experts = topk_ids.unique()
-        num_active = active_experts.numel()
+        # ---- capture-safe static slot structure -------------------------------
+        # CUDA-graph note: torch.unique() and .tolist() are illegal during
+        # graph capture, and Python loop trip counts must not depend on GPU
+        # values. We therefore skip the unique() dedup entirely: chunk over
+        # the STATIC slot list topk_ids (M × top_k entries, padding included).
+        # DeepSeek routing picks distinct experts per token, so a given
+        # expert appears in at most one slot; duplicated padding (-1) is
+        # clamped in-bounds and masked by zero weights downstream.
         # Chunk size bounds the dequant peak: dq_mxfp4_pytorch allocates
         # several int32 intermediates ≈ 6× the BF16 output.
         MAX_CHUNK = 16
+        slots = topk_ids.reshape(-1)  # [M*top_k] static shape
+        num_slots = slots.numel()  # static Python int (from shape, not GPU value)
+        n_chunks = (num_slots + MAX_CHUNK - 1) // MAX_CHUNK
+        # keep the old name for dump hooks / logging below
+        num_active = num_slots
 
         # Non-FP4/FP6 path: full dequant (rare)
         if not (
@@ -250,20 +263,24 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         # nothing, so summing chunk outputs is exact.
         acc = torch.zeros_like(output)
 
-        for c in range(0, num_active, MAX_CHUNK):
-            chunk = active_experts[c : c + MAX_CHUNK]
+        for c in range(n_chunks):
+            c0 = c * MAX_CHUNK
+            chunk_slots = slots[c0 : c0 + MAX_CHUNK]  # static-shape slice
+            # clamp -1 padding so expert indexing stays in-bounds; the
+            # corresponding weights are zero, so content is irrelevant
+            chunk_clamped = torch.clamp(chunk_slots, min=0)
 
             # ---- dequantize only this chunk's experts -------------------------
             if is_mxfp6:
                 w1_chunk = torch.stack([
                     dequant_mxfp6(w1[eid], self.w1_scale_val[eid],
                                   quant_dtype=qtype, float_dtype=target_dtype)
-                    for eid in chunk.tolist()
+                    for eid in chunk_clamped.tolist()
                 ], dim=0)
                 w2_chunk = torch.stack([
                     dequant_mxfp6(w2[eid], self.w2_scale_val[eid],
                                   quant_dtype=qtype, float_dtype=target_dtype)
-                    for eid in chunk.tolist()
+                    for eid in chunk_clamped.tolist()
                 ], dim=0)
             else:
                 if os.environ.get("VLLM_PROFILE"):
@@ -271,10 +288,10 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                     _td1 = torch.cuda.Event(enable_timing=True)
                     _td0.record()
                 w1_chunk = dq_mxfp4_triton(
-                    w1[chunk], self.w1_scale_val[chunk],
+                    w1[chunk_clamped], self.w1_scale_val[chunk_clamped],
                 )
                 w2_chunk = dq_mxfp4_triton(
-                    w2[chunk], self.w2_scale_val[chunk],
+                    w2[chunk_clamped], self.w2_scale_val[chunk_clamped],
                 )
                 if os.environ.get("VLLM_PROFILE"):
                     _td1.record()
@@ -282,7 +299,7 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                     with open(os.environ["VLLM_PROFILE"], "a") as _f:
                         _f.write(
                             f"  dequant {_td0.elapsed_time(_td1):.3f}ms "
-                            f"chunk={len(chunk)}\n"
+                            f"chunk={len(chunk_clamped)}\n"
                         )
             if os.environ.get("VLLM_DUMP_FC1"):
                 try:
@@ -293,7 +310,7 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                             "rank": torch.distributed.get_rank()
                             if torch.distributed.is_initialized() else -1,
                             "backend": "emu_wchunk",
-                            "chunk": [int(v) for v in chunk.tolist()],
+                            "chunk": [int(v) for v in chunk_slots.tolist()],
                             "w1c0_dq16": _dq,
                         }) + "\n")
                 except Exception:
@@ -306,10 +323,10 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                             "rank": torch.distributed.get_rank()
                             if torch.distributed.is_initialized() else -1,
                             "backend": "emu_wbytes",
-                            "w1_bytes": [int(v) for v in w1[chunk[0]][0][:8].tolist()],
-                            "w2_bytes": [int(v) for v in w2[chunk[0]][0][:8].tolist()],
-                            "w1s_bytes": [int(v) for v in self.w1_scale_val[chunk[0]][0][:8].tolist()],
-                            "w2s_bytes": [int(v) for v in self.w2_scale_val[chunk[0]][0][:8].tolist()],
+                            "w1_bytes": [int(v) for v in w1[chunk_slots[0]][0][:8].tolist()],
+                            "w2_bytes": [int(v) for v in w2[chunk_slots[0]][0][:8].tolist()],
+                            "w1s_bytes": [int(v) for v in self.w1_scale_val[chunk_slots[0]][0][:8].tolist()],
+                            "w2s_bytes": [int(v) for v in self.w2_scale_val[chunk_slots[0]][0][:8].tolist()],
                             "w2s_shape": list(self.w2_scale_val.shape),
                             "w1_dq": w1_chunk[0][0][:16].tolist(),
                             "w2_dq": w2_chunk[0][0][:16].tolist(),
@@ -318,12 +335,29 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                     pass
 
             # ---- remap this chunk's experts  global → local -------------------
-            # Slots not routed to this chunk get id 0 with zero weight, so
-            # they are computed (redundantly) but contribute nothing.
-            local_ids = torch.zeros_like(topk_ids)
-            for i, eid in enumerate(chunk.tolist()):
-                local_ids[topk_ids == eid] = i
-            in_chunk = torch.isin(topk_ids, chunk)
+            # Each (token, topk) slot belongs to the chunk containing its SLOT
+            # POSITION in the row-major flattening (slots = topk_ids.reshape(-1)).
+            # Assigning by expert-id membership instead (topk_ids == chunk_slots)
+            # would match a slot against EVERY chunk whose 16-slot window happens
+            # to contain the same expert id — expert ids repeat across windows,
+            # so the slot's router weight would be applied once per matching
+            # chunk and its contribution double-counted (long prefill → output
+            # degenerates into repetition loops). The old unique-expert chunking
+            # never hit this because each expert appeared in exactly one chunk.
+            slot_pos = torch.arange(num_slots, device=slots.device, dtype=torch.int64)
+            in_chunk = ((slot_pos >= c0) & (slot_pos < c0 + MAX_CHUNK)).view(
+                topk_ids.shape
+            )
+            # local id of an in-chunk slot = its position within chunk_slots;
+            # out-of-chunk slots get 0 (harmless: zero weight below). Clamp to
+            # [0, MAX_CHUNK) — ids >= len(chunk) would make moe_align_block_size
+            # index out of bounds (per-expert counters / w1_chunk rows).
+            local_ids = (
+                (slot_pos - c0)
+                .clamp(min=0, max=MAX_CHUNK - 1)
+                .view(topk_ids.shape)
+                .to(torch.int32)
+            )
             local_weights = torch.where(
                 in_chunk, topk_weights, torch.zeros_like(topk_weights)
             )
@@ -350,7 +384,7 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                 try:
                     import json as _j
                     os.environ["VLLM_DUMP_CHUNK_EXPERTS"] = _j.dumps(
-                        [int(v) for v in chunk.tolist()]
+                        [int(v) for v in chunk_slots.tolist()]
                     )
                     os.environ["VLLM_DUMP_CHUNK_TOPK0"] = _j.dumps(
                         [int(v) for v in topk_ids[0].tolist()]
@@ -361,7 +395,7 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                                 "rank": torch.distributed.get_rank()
                                 if torch.distributed.is_initialized() else -1,
                                 "backend": "emu_chunk",
-                                "chunk": [int(v) for v in chunk.tolist()],
+                                "chunk": [int(v) for v in chunk_slots.tolist()],
                                 "active_experts": [int(v) for v in active_experts.tolist()],
                                 "topk0": [int(v) for v in topk_ids[0].tolist()],
                             }) + "\n")
@@ -375,7 +409,7 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                 topk_weights=local_weights,
                 topk_ids=local_ids,
                 activation=activation,
-                global_num_experts=len(chunk),
+                global_num_experts=len(chunk_clamped),
                 expert_map=None,
                 a1q_scale=None,
                 a2_scale=None,
@@ -384,18 +418,24 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                 expert_tokens_meta=expert_tokens_meta,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
-            if os.environ.get("VLLM_DUMP_SILU"):
+            if os.environ.get("VLLM_DUMP_SILU") and os.path.exists(
+                os.environ.get(
+                    "VLLM_DUMP_SILU_TRIGGER", "/root/autodl-tmp/tmp/.silu_trigger"
+                )
+            ):
                 try:
                     import json as _json
+                    _EMU_DUMP_N[0] += 1
                     _t = temp_out.detach().float().cpu()
                     _lid = local_ids.detach().cpu()
                     _tk = topk_ids.detach().cpu()
                     with open(os.environ["VLLM_DUMP_SILU"], "a") as _f:
                         _f.write(_json.dumps({
+                            "n": _EMU_DUMP_N[0],
                             "rank": torch.distributed.get_rank()
                             if torch.distributed.is_initialized() else -1,
                             "backend": "emulation",
-                            "chunk_experts": [int(v) for v in chunk.tolist()],
+                            "chunk_experts": [int(v) for v in chunk_slots.tolist()],
                             "local_ids0": [int(v) for v in _lid[0].tolist()],
                             "topk0": [int(v) for v in _tk[0].tolist()],
                             "fc2_out": _t[:1].reshape(-1)[:64].tolist(),
