@@ -266,6 +266,75 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         # nothing, so summing chunk outputs is exact.
         acc = torch.zeros_like(output)
 
+        # ---- decode / tiny-batch fast path -----------------------------------
+        # When the whole routing fits one chunk (e.g. single-stream decode,
+        # M=1 → 6 slots), dequantize only the ROUTED experts via one
+        # positional chunk. The fixed expert-id partition would dequantize
+        # all 256 experts per step (16 chunks), which is correct but wastes
+        # ~40× the dequant traffic for single-stream decode. Both branches
+        # are static-shape (the branch is on a Python int from the tensor
+        # shape), so each is individually CUDA-graph capture-safe.
+        num_slots = topk_ids.numel()  # static Python int (from shape)
+        if num_slots <= MAX_CHUNK:
+            chunk_ids = topk_ids.reshape(-1)  # <= MAX_CHUNK routed slots
+            chunk_clamped = torch.clamp(chunk_ids, min=0)  # -1 pad → expert 0
+            if is_mxfp6:
+                w1_chunk = torch.stack([
+                    dequant_mxfp6(w1[eid], self.w1_scale_val[eid],
+                                  quant_dtype=qtype, float_dtype=target_dtype)
+                    for eid in chunk_clamped.tolist()
+                ], dim=0)
+                w2_chunk = torch.stack([
+                    dequant_mxfp6(w2[eid], self.w2_scale_val[eid],
+                                  quant_dtype=qtype, float_dtype=target_dtype)
+                    for eid in chunk_clamped.tolist()
+                ], dim=0)
+            else:
+                w1_chunk = dq_mxfp4_triton(
+                    w1[chunk_clamped], self.w1_scale_val[chunk_clamped],
+                )
+                w2_chunk = dq_mxfp4_triton(
+                    w2[chunk_clamped], self.w2_scale_val[chunk_clamped],
+                )
+            # positional local ids: slot j → row j of the chunk
+            local_ids = (
+                torch.arange(num_slots, device=topk_ids.device, dtype=torch.int64)
+                .view(topk_ids.shape)
+                .to(torch.int32)
+            )
+            temp_out = torch.empty_like(output)
+            super().apply(
+                output=temp_out,
+                hidden_states=hidden_states,
+                w1=w1_chunk,
+                w2=w2_chunk,
+                topk_weights=topk_weights,
+                topk_ids=local_ids,
+                activation=activation,
+                global_num_experts=num_slots,
+                expert_map=None,
+                a1q_scale=None,
+                a2_scale=None,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=expert_tokens_meta,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+            acc.add_(temp_out)
+            output.copy_(acc)
+            if os.environ.get("VLLM_PROFILE"):
+                try:
+                    _t1.record()
+                    torch.cuda.synchronize()
+                    with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                        _f.write(
+                            f"emu_apply_fastpath {_t0.elapsed_time(_t1):.3f}ms "
+                            f"M={hidden_states.shape[0]} slots={num_slots}\n"
+                        )
+                except Exception:
+                    pass
+            return
+
         for c in range(n_chunks):
             c0 = c * MAX_CHUNK
             c1 = min(c0 + MAX_CHUNK, num_experts)
