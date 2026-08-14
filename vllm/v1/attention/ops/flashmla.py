@@ -207,30 +207,14 @@ else:
                               dtype=q.dtype, device=q.device)
         try:
             from vllm.v1.attention.ops.triton_mla_sparse_dsv4 import (
-                sparse_attn_prefill,
+                sparse_attn_decode,
             )
-            # GATHER: dequantize KV from fp8 cache to BF16, then use
-            # the prefill kernel (which takes BF16) for decode attention.
-            # This avoids FP8 decode-kernel dequant routing altogether.
-            import torch
-
-            # Build dense KV from cache: [num_kv, 1, head_dim] bf16
-            # Gather NOPE+ROPE from cache into BF16 for each required token.
-            # SWA window tokens come from ``indices``/``topk_length``; the
-            # DSA-indexer global tokens come from ``extra_indices_in_kvcache``
-            # / ``extra_topk_length`` (attended in ADDITION to SWA).  The
-            # original SM80 Triton path ignored ``extra_*``, which dropped the
-            # global context once a sequence outgrew the SWA window (128) —
-            # the model then "forgot" the few-shot examples / question and
-            # fell into self-doubt loops.  We now gather both and prepend the
-            # global tokens (matching combine_topk_swa_indices ordering used
-            # by the prefill path).
-            cache_u8 = k_cache.contiguous().view(torch.uint8).reshape(-1)
-            bs = k_cache.shape[1]  # block_size
-            hb = k_cache.shape[3]  # head_bytes
-            tstride = 448 + 64 * 2  # 576
-            sdim = 448 // 64 + 1  # 8
-
+            # Direct FP8-cache decode: the Triton kernel reads the
+            # fp8_ds_mla cache in-kernel (FP8 NOPE dequant + per-64-group
+            # scales). The previous gather path materialized BF16 KV per
+            # layer per step (~2ms of byte-indexing + dequant copies for a
+            # ~1K-token context) before running the BF16 prefill kernel;
+            # the direct kernel runs the same attention in ~0.03-0.26ms.
             idx = indices.squeeze(1)  # [D, max_swa]
             lens = topk_length  # [D]
 
@@ -240,264 +224,27 @@ else:
             )
             if has_extra:
                 extra_idx = extra_indices_in_kvcache.squeeze(1)  # [D, max_extra]
-                extra_lens = extra_topk_length  # [D]
+                extra_lens = extra_topk_length
                 if extra_lens.ndim == 2:
                     extra_lens = extra_lens.squeeze(1)
-                extra_cache = extra_k_cache if extra_k_cache is not None else k_cache
                 # extra tokens may live in a separate cache tensor
-                extra_u8 = extra_cache.contiguous().view(torch.uint8).reshape(-1)
+                extra_kc = extra_k_cache if extra_k_cache is not None else k_cache
             else:
                 extra_idx = None
                 extra_lens = None
-                extra_u8 = None
+                extra_kc = None
 
-            D = q.shape[0]
-            # CUDA-graph compatible: use the STATIC allocation widths of the
-            # index tensors instead of runtime .item() syncs (which are
-            # illegal during graph capture). Per-row lengths still mask the
-            # valid prefix of each row, so the fixed max width is safe.
-            swa_max = idx.shape[-1]
-            extra_max = (
-                extra_idx.shape[-1] if has_extra else 0
-            )
-            max_len = swa_max + extra_max
-            if os.environ.get("VLLM_DUMP_HIDDEN") and not torch.cuda.is_current_stream_capturing():
-                try:
-                    import json as _json
-                    with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
-                        _f.write(_json.dumps({
-                            "comp": "gather_debug",
-                            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                            "has_extra": bool(has_extra),
-                            "swa_max": int(swa_max),
-                            "extra_max": int(extra_max),
-                            "D": int(D),
-                            "lens0": [int(v) for v in lens[:4].tolist()],
-                            "extra_lens0": [int(v) for v in extra_lens[:4].tolist()] if has_extra else None,
-                            "extra_idx_shape": list(extra_indices_in_kvcache.shape) if has_extra else None,
-                        }) + "\n")
-                except Exception:
-                    pass
-
-            def _gather_slots_vec(slots, cache_u8v, bs_local):
-                """Vectorized dequant of KV slots from a uint8 cache view.
-
-                ``bs_local`` is the cache's own block size — the SWA cache
-                and the compressed caches (C4A/C128A) use different block
-                sizes (attn_metadata.block_size // compress_ratio), and
-                mixing them misplaces every slot beyond the first block.
-                Returns (kv [N,1,512] bf16, slot_to_idx dict)."""
-                n = slots.shape[0]
-                block_idx = (slots // bs_local).long()
-                pos_in_block = (slots % bs_local).long()
-                base = block_idx * (bs_local * hb)
-                data_offs = base + pos_in_block * tstride
-                scale_offs = base + bs_local * tstride + pos_in_block * sdim
-
-                # bulk-read 576 data bytes + 8 scale bytes per slot
-                byte_arange = torch.arange(
-                    576, device=q.device
-                )
-                all_data_offs = data_offs.unsqueeze(1) + byte_arange.unsqueeze(0)
-                data_bytes = cache_u8v[all_data_offs]  # [N, 576] uint8
-
-                nope_fp8 = (
-                    data_bytes[:, :448]
-                    .reshape(-1)
-                    .view(torch.float8_e4m3fn)
-                    .reshape(n, 448)
-                )
-                nope_bf16 = nope_fp8.to(torch.bfloat16)
-
-                scale_arange = torch.arange(8, device=q.device)
-                all_scale_offs = scale_offs.unsqueeze(1) + scale_arange.unsqueeze(0)
-                scale_bytes = cache_u8v[all_scale_offs]  # [N, 8] uint8
-                scale_f32 = 2.0 ** (scale_bytes.float() - 127.0)
-                scale_bf16 = scale_f32.to(torch.bfloat16)
-                # vectorized scale application (no Python loop): each of the
-                # 7 NOPE 64-elt groups gets scale_bf16[:, g]
-                nope_bf16 *= scale_bf16[:, :7].repeat_interleave(64, dim=1)
-
-                rope_bf16 = (
-                    data_bytes[:, 448:576]
-                    .reshape(-1)
-                    .view(torch.bfloat16)
-                    .reshape(n, 64)
-                )
-
-                kv = torch.zeros(n, 1, 512, dtype=torch.bfloat16, device=q.device)
-                kv[:, 0, :448] = nope_bf16
-                kv[:, 0, 448:] = rope_bf16
-                # sorted slots allow GPU searchsorted instead of a Python dict
-                slot_order = torch.argsort(slots)
-                sorted_slots = slots[slot_order]
-                # reorder KV rows to match the sorted order so that local
-                # indices from _local_map (which match against sorted_slots)
-                # index into consistent rows. torch.unique() used to return
-                # ascending slots (making slots==sorted order); the flattened
-                # slot list breaks that invariant.
-                kv = kv[slot_order]
-                return kv, sorted_slots, slot_order
-
-            # Gather global (extra) KV slots, then SWA slots.
-            # CUDA-graph note: torch.unique() is illegal during capture
-            # (dynamic allocation), so we gather the full flattened slot
-            # list instead. Duplicated slots produce duplicated KV rows;
-            # _local_map still resolves correctly because every match lands
-            # on a valid local index whose KV content is identical
-            # (_gather_slots_vec reorders rows into sorted order).
-            if has_extra:
-                extra_slots = extra_idx[:, :extra_max].reshape(-1)
-                extra_slots = torch.where(
-                    extra_slots >= 0, extra_slots,
-                    torch.zeros_like(extra_slots),
-                )  # clamp -1 padding to slot 0 (masked out downstream)
-                # compressed caches use their own block size
-                extra_bs = extra_cache.shape[1]
-                kv_extra, extra_sorted, _ = _gather_slots_vec(
-                    extra_slots, extra_u8, extra_bs
-                )
-            else:
-                extra_slots = None
-                kv_extra = None
-                extra_sorted = None
-
-            kv_slots = idx[:, :swa_max].reshape(-1)
-            kv_slots = torch.where(
-                kv_slots >= 0, kv_slots, torch.zeros_like(kv_slots)
-            )  # clamp -1 padding to slot 0 (masked out downstream)
-            kv_bf16, swa_sorted, _ = _gather_slots_vec(kv_slots, cache_u8, bs)
-
-            # ---- GPU-vectorized index assembly (no Python loops / .item()) ----
-            def _local_map(raw_idx, sorted_slots):
-                # raw_idx [D, K] slots (may contain -1 padding); sorted_slots
-                # [N] unique valid slots. Returns [D, K] local indices with
-                # invalid/padding entries mapped to 0.
-                if sorted_slots is None or sorted_slots.numel() == 0:
-                    return torch.zeros_like(raw_idx)
-                match = (raw_idx.unsqueeze(-1) == sorted_slots.unsqueeze(0).unsqueeze(0))
-                local = match.int().argmax(dim=-1)  # [D, K]; no-match -> 0
-                valid = (raw_idx >= 0) & match.any(dim=-1)
-                return torch.where(valid, local, 0)
-
-            # Combined lengths (per-row), needed by the kernel indptr.
-            combined_lens = torch.zeros(D, dtype=torch.int32, device=q.device)
-            if has_extra:
-                combined_lens += (extra_lens.squeeze(1) if extra_lens.ndim == 2
-                                  else extra_lens)
-            combined_lens += lens
-
-            # ---- compact per-row index assembly ----
-            # Row t layout: [extra local (extra_lens_t) | swa local (lens_t)]
-            # with NO padding inside the active region, mirroring
-            # combine_topk_swa_indices(). The old fixed-width layout
-            # [extra | pad | swa] combined with the per-row length mask
-            # [0, combined_lens_t) inserted (extra_max - extra_lens_t) zero
-            # slots (→ kv_all[0]) between the blocks whenever the batch had
-            # heterogeneous extra lens (any D >= 2) and dropped the SWA tail
-            # past the block end — decode attention then lost the most recent
-            # context and fell into prompt-regeneration repetition loops.
-            if has_extra and extra_sorted is not None and extra_sorted.numel() > 0:
-                # extra block: local indices into kv_extra, left-aligned
-                extra_local = _local_map(extra_idx[:, :extra_max], extra_sorted)
-            else:
-                extra_local = None
-            if kv_extra is not None:
-                # SWA block: local indices into kv_bf16, offset by the
-                # number of global slots
-                offset = kv_extra.shape[0]
-                swa_local = _local_map(idx[:, :swa_max], swa_sorted) + offset
-            else:
-                swa_local = _local_map(idx[:, :swa_max], swa_sorted)
-
-            # static max width = swa_max + extra_max (CUDA-graph safe, no .item())
-            max_combined = max_len if D > 0 else 0
-            kv_indices = torch.zeros(
-                D, 1, max_combined, dtype=torch.int32, device=q.device
-            )
-            flat = kv_indices.view(-1)
-            row_base = torch.arange(D, device=q.device).to(torch.int64)
-            row_base = row_base * max_combined
-            # CUDA-graph note: boolean-mask index_put_ is illegal during
-            # capture (dynamic mask cardinality). Write the FULL static
-            # integer-index range instead: rows are disjoint and
-            # in-row columns are unique, and invalid columns already hold
-            # 0 from _local_map (masked out by combined_lens downstream),
-            # so unconditional writes are safe.
-            if extra_local is not None:
-                dst_e = row_base.unsqueeze(1) + torch.arange(
-                    extra_max, device=q.device
-                ).unsqueeze(0)
-                # _local_map returns int64 (argmax); index_put_ requires
-                # exact dtype match with the int32 destination
-                flat[dst_e] = extra_local.to(torch.int32)
-            n_swa = lens.to(torch.int64)  # [D]
-            # swa block starts at extra_lens_t within each row (not extra_max)
-            swa_col_base = (
-                (extra_lens.to(torch.int64) if has_extra else torch.zeros_like(n_swa))
-            ).unsqueeze(1)
-            dst_s = row_base.unsqueeze(1) + swa_col_base + torch.arange(
-                swa_max, device=q.device
-            ).unsqueeze(0)
-            flat[dst_s] = swa_local.to(torch.int32)
-
-            if os.environ.get("VLLM_DUMP_HIDDEN") and not torch.cuda.is_current_stream_capturing():
-                try:
-                    import json as _json
-                    # self-check: within each row's active region
-                    # [0, combined_lens_t), local indices must be distinct
-                    # (extra block [0,E) and swa block [E,E+S) are disjoint
-                    # ranges). Duplicates would mean zero padding slipped
-                    # into the attention list (the pre-fix bug).
-                    row_mask = torch.arange(
-                        max_combined, device=q.device
-                    ).unsqueeze(0) < combined_lens.unsqueeze(1)
-                    active_sorted, _ = torch.sort(
-                        torch.where(
-                            row_mask,
-                            kv_indices.squeeze(1).to(torch.int64),
-                            -1,
-                        ),
-                        dim=1,
-                    )
-                    dup = (active_sorted[:, 1:] == active_sorted[:, :-1]) & (
-                        active_sorted[:, 1:] >= 0
-                    )
-                    with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
-                        _f.write(_json.dumps({
-                            "comp": "gather_layout_check",
-                            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                            "D": int(D),
-                            "max_combined": max_combined,
-                            "dup_in_active": int(dup.sum().item()),
-                            "active_total": int(row_mask.sum().item()),
-                            "lens": [int(v) for v in combined_lens[:8].tolist()],
-                            "row0_head8": [int(v) for v in kv_indices[0, 0, :8].tolist()],
-                            "row0_tail8": [int(v) for v in kv_indices[0, 0, -8:].tolist()],
-                            "raw_swa0": [int(v) for v in idx[0, :8].tolist()],
-                            "sorted_swa_head": [int(v) for v in swa_sorted[:8].tolist()],
-                            "sorted_extra_head": [int(v) for v in extra_sorted[:8].tolist()] if extra_sorted is not None else None,
-                            "kv_extra_rows": int(kv_extra.shape[0]) if kv_extra is not None else 0,
-                            "kv_bf16_rows": int(kv_bf16.shape[0]) if kv_bf16 is not None else 0,
-                        }) + "\n")
-                except Exception:
-                    pass
-
-            # Concatenate global + SWA gathered KV
-            if kv_extra is not None:
-                kv_all = torch.cat([kv_extra, kv_bf16], dim=0)
-            else:
-                kv_all = kv_bf16
-
-            # Reshape out: [D, padded_H, 512]
             out_3d = out.squeeze(1) if is_4d else out
-            sparse_attn_prefill(
+            sparse_attn_decode(
                 q=q,
-                kv=kv_all,
-                indices=kv_indices,
-                sm_scale=softmax_scale,
+                k_cache=k_cache,
+                indices=idx.unsqueeze(1),
+                topk_length=lens,
+                softmax_scale=softmax_scale,
                 attn_sink=attn_sink,
-                topk_length=combined_lens,
+                extra_k_cache=extra_kc,
+                extra_indices=extra_idx.unsqueeze(1) if has_extra else None,
+                extra_topk_length=extra_lens,
                 out=out_3d,
             )
             return out, tile_scheduler_metadata
@@ -506,7 +253,7 @@ else:
             if os.environ.get("VLLM_DUMP_HIDDEN") and not torch.cuda.is_current_stream_capturing():
                 try:
                     with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
-                        _f.write("GATHER_EXCEPTION: " + repr(_e) + "\n")
+                        _f.write("DECODE_EXCEPTION: " + repr(_e) + "\n")
                         _f.write(_tb.format_exc())
                 except Exception:
                     pass

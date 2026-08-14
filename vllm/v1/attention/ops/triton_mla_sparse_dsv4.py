@@ -159,6 +159,8 @@ def _decode_kernel(
     q_stride1,
     out_stride0,
     out_stride1,
+    kv_lens_ptr,
+    extra_kv_lens_ptr,
     main_cache_stride0,
     extra_cache_stride0,
     main_num_rows,
@@ -179,6 +181,8 @@ def _decode_kernel(
     ROPE_DIM_C: tl.constexpr,  # 64
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
+    EXTRA_ROW_STRIDE: tl.constexpr,
 ):
     """Single-launch decode attention over two ragged KV lists.
 
@@ -223,9 +227,17 @@ def _decode_kernel(
     # (inlined — Triton JIT does not support nested def)
 
     # ---- main (SWA) attention ---------------------------------------------
-    main_start = tl.load(main_indptr_ptr + query_idx)
-    main_end = tl.load(main_indptr_ptr + query_idx + 1)
-    main_len = main_end - main_start
+    # ROW_STRIDE > 0: row-major static layout (CUDA-graph safe) — row t
+    # occupies [t*ROW_STRIDE, (t+1)*ROW_STRIDE) of the index tensor, valid
+    # prefix length is kv_lens[t]. ROW_STRIDE == 0: legacy ragged layout
+    # (indptr-based, kept for non-graph callers).
+    if ROW_STRIDE > 0:
+        main_start = query_idx * ROW_STRIDE
+        main_len = tl.load(kv_lens_ptr + query_idx)
+    else:
+        main_start = tl.load(main_indptr_ptr + query_idx)
+        main_end = tl.load(main_indptr_ptr + query_idx + 1)
+        main_len = main_end - main_start
     for k_start in tl.range(0, main_len, BLOCK_K):
         k_pos = k_start + k_offsets
         in_range = k_pos < main_len
@@ -277,9 +289,13 @@ def _decode_kernel(
 
     # ---- extra (compressed) attention ------------------------------------
     if HAS_EXTRA:
-        extra_start = tl.load(extra_indptr_ptr + query_idx)
-        extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
-        extra_len = extra_end - extra_start
+        if EXTRA_ROW_STRIDE > 0:
+            extra_start = query_idx * EXTRA_ROW_STRIDE
+            extra_len = tl.load(extra_kv_lens_ptr + query_idx)
+        else:
+            extra_start = tl.load(extra_indptr_ptr + query_idx)
+            extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
+            extra_len = extra_end - extra_start
         for k_start in tl.range(0, extra_len, BLOCK_K):
             k_pos = k_start + k_offsets
             in_range = k_pos < extra_len
@@ -295,7 +311,16 @@ def _decode_kernel(
             x_uint8 = tl.load(token_data[:, None] + nope_offsets[None, :],
                               mask=valid[:, None] & nope_mask[None, :], other=0)
             x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            scale_ptr = token_data + NOPE_DIM_C + ROPE_DIM_C * 2
+            # extra cache uses the SAME fp8_ds_mla block layout as the main
+            # cache (scales live in a per-block region AFTER the data
+            # region) — the old inline-scale formula read garbage scales
+            # whenever the extra (DSA global) path activated, corrupting
+            # decode attention once a sequence outgrew the SWA window.
+            scale_ptr = (
+                block_ptr
+                + extra_block_size * TOKEN_STRIDE
+                + pos_in_block * SCALE_DIM
+            )
             encoded = tl.load(scale_ptr[:, None] + nope_offsets[None, :] // 64,
                               mask=valid[:, None] & nope_mask[None, :], other=127)
             scales = tl.exp2(encoded.to(tl.float32) - 127.0)
@@ -444,14 +469,28 @@ def sparse_attn_decode(
     token_stride = 512 if is_bf16_cache else NOPE_DIM + ROPE_DIM * 2  # 576
     scale_dim = 0 if is_bf16_cache else NOPE_DIM // 64 + 1  # 8
 
-    # build ragged index lists
-    main_indptr, main_ragged = _dense_to_ragged(indices, topk_length)
+    # Build index lists. CUDA-graph note: skip the boolean-mask ragged
+    # compression (_dense_to_ragged is illegal during capture — dynamic
+    # output shape). Use the static row-major layout directly: row t
+    # occupies [t*K, (t+1)*K) of the flattened index tensor, valid prefix
+    # is topk_length[t]; tail columns hold -1 padding that the kernel
+    # masks out via kv_len.
+    K = indices.shape[-1]
+    main_indptr = torch.zeros(D + 1, dtype=torch.int32, device=indices.device)
+    main_ragged = indices.squeeze(1).reshape(-1).contiguous()
+    main_lens = topk_length
     has_extra = extra_k_cache is not None and extra_indices is not None
     extra_indptr = extra_ragged = None
+    extra_lens = None
     extra_rows = extra_bs = 0
+    EXTRA_ROW_STRIDE = 0
     if has_extra:
         assert extra_topk_length is not None
-        extra_indptr, extra_ragged = _dense_to_ragged(extra_indices, extra_topk_length)
+        EK = extra_indices.shape[-1]
+        extra_indptr = torch.zeros(D + 1, dtype=torch.int32, device=indices.device)
+        extra_ragged = extra_indices.squeeze(1).reshape(-1).contiguous()
+        extra_lens = extra_topk_length
+        EXTRA_ROW_STRIDE = EK
         extra_rows = extra_k_cache.shape[0] * extra_k_cache.shape[1]
         extra_bs = extra_k_cache.shape[1]
 
@@ -496,6 +535,8 @@ def sparse_attn_decode(
         out,
         q.stride(0), q.stride(1),
         out.stride(0), out.stride(1),
+        main_lens,
+        extra_lens if has_extra else main_lens,
         main_stride0, extra_stride0,
         main_rows, extra_rows, main_bs, extra_bs,
         softmax_scale, num_heads,
@@ -510,4 +551,6 @@ def sparse_attn_decode(
         NOPE_BLOCK_C=NOPE_BLOCK,
         ROPE_DIM_C=ROPE_DIM,
         BLOCK_H=BLOCK_H, BLOCK_K=BLOCK_K,
+        ROW_STRIDE=K,
+        EXTRA_ROW_STRIDE=EXTRA_ROW_STRIDE,
     )
