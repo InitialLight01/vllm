@@ -78,10 +78,33 @@ def _o_proj_bf16_sm80(
     rope_inv = torch.stack([x_inv, y_inv], dim=-1).reshape(num_tokens, num_heads, rope_dim)
 
     o_full = torch.cat([nope_part, rope_inv], dim=-1)
-    o_flat = o_full.reshape(num_tokens, n_groups, heads_per_group * head_dim)
-    o_flat = o_flat.to(torch.bfloat16)
-    z = wo_a(o_flat).to(torch.bfloat16)
-    return wo_b(z.flatten(1))
+    # Group count for the reshape must match wo_a's in_features, not
+    # n_local_groups (some layers have n_local_groups=1 with 32 heads; the
+    # o_proj matrix still processes 8-head blocks of 4096). The quantized
+    # layer's stored weight may be packed (e.g. humming [out, packed_in]),
+    # so read the logical in_features from the layer metadata.
+    _wa_in = getattr(wo_a, "input_size_per_partition", None)
+    if _wa_in is None:
+        _wa_in = getattr(wo_a, "input_size", None)
+    if _wa_in is None:
+        _wa_in = heads_per_group * head_dim
+    n_blocks = max(1, (num_heads * head_dim) // _wa_in)
+    o_flat = o_full.reshape(num_tokens, n_blocks, _wa_in).to(torch.bfloat16)
+    # Some quantized kernels (humming) expect strictly 2D inputs; a 3D
+    # tensor would be flattened along the trailing dims into [T, 16384]
+    # and fail their shape check. Feed the per-block 2D view explicitly.
+    z = wo_a(o_flat.view(-1, _wa_in)).to(torch.bfloat16)
+    # wo_b is also per-block (in_features_per_partition == wo_a out per
+    # block); feed the 2D [T*n_blocks, K] form and merge the blocks back
+    # to [T, hidden] for the MHC consumer.
+    zb = wo_b(z).to(torch.bfloat16)
+    _wb_in_part = getattr(wo_b, "input_size_per_partition", None)
+    if _wb_in_part is not None and _wb_in_part == z.shape[1]:
+        # Per-block wo_b ([K -> K] shared across blocks): reduce the
+        # n_blocks outputs into the [T, K] hidden state.
+        return zb.view(num_tokens, n_blocks, -1).sum(dim=1)
+    # Merged wo_b (single [n_blocks*out_a -> hidden] matrix, EMULATION).
+    return zb.view(num_tokens, -1)
 
 
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
@@ -94,7 +117,56 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization.fp8 import (
+            Fp8LinearMethod,
+        )
+
+        # The BF16 emulation path only applies to FP8-quantized o_proj
+        # weights (dequantize -> matmul). W4A16 / compressed-tensors
+        # checkpoints have their own kernels (humming/marlin) and must NOT
+        # take this path even under VLLM_FORCE_SM80 (their quant method
+        # dispatches internally; feeding the grouped o_flat shape here
+        # breaks their expected in_features).
+        if isinstance(getattr(self.wo_a, "quant_method", None), Fp8LinearMethod):
+            pass  # FP8 emulation path below
+        else:
+            import os
+            if os.environ.get("VLLM_DBG_OPROJ"):
+                _wa = self.wo_a
+                _attrs = {
+                    k: tuple(v.shape) if hasattr(v, "shape") else v
+                    for k, v in vars(_wa).items()
+                    if isinstance(v, torch.Tensor) and "scale" not in k
+                }
+                print(
+                    f"[oproj-dbg] o={tuple(o.shape)} n_groups={self.n_local_groups} "
+                    f"hpg={self.n_local_heads // self.n_local_groups} "
+                    f"wo_a_tensors={ {k: v for k, v in list(_attrs.items())[:4]} } "
+                    f"in_part={getattr(_wa, 'input_size_per_partition', None)} "
+                    f"out_parts={getattr(_wa, 'output_partition_sizes', None)} "
+                    f"in_size={getattr(_wa, 'input_size', None)}",
+                    flush=True,
+                )
         if current_platform.is_sm80_context():
+            # Works for both FP8-emulation and compressed-tensors quantized
+            # o_proj weights: each path's wo_a/wo_b forward handles its own
+            # quantization; the per-group 3D input layout
+            # [T, n_groups, heads_per_group * head_dim] matches both.
+            return _o_proj_bf16_sm80(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a,
+                self.wo_b,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                o_lora_rank=self.o_lora_rank,
+            )
+        if not isinstance(getattr(self.wo_a, "quant_method", None), Fp8LinearMethod):
+            # compressed-tensors o_proj outside SM80 context: deep_gemm is
+            # FP8-specific; fall back to the generic path.
             return _o_proj_bf16_sm80(
                 o,
                 positions,
