@@ -78,33 +78,42 @@ def _o_proj_bf16_sm80(
     rope_inv = torch.stack([x_inv, y_inv], dim=-1).reshape(num_tokens, num_heads, rope_dim)
 
     o_full = torch.cat([nope_part, rope_inv], dim=-1)
-    # Group count for the reshape must match wo_a's in_features, not
-    # n_local_groups (some layers have n_local_groups=1 with 32 heads; the
-    # o_proj matrix still processes 8-head blocks of 4096). The quantized
-    # layer's stored weight may be packed (e.g. humming [out, packed_in]),
-    # so read the logical in_features from the layer metadata.
-    _wa_in = getattr(wo_a, "input_size_per_partition", None)
-    if _wa_in is None:
-        _wa_in = getattr(wo_a, "input_size", None)
-    if _wa_in is None:
-        _wa_in = heads_per_group * head_dim
-    n_blocks = max(1, (num_heads * head_dim) // _wa_in)
-    o_flat = o_full.reshape(num_tokens, n_blocks, _wa_in).to(torch.bfloat16)
-    # Some quantized kernels (humming) expect strictly 2D inputs; a 3D
-    # tensor would be flattened along the trailing dims into [T, 16384]
-    # and fail their shape check. Feed the per-block 2D view explicitly.
-    z = wo_a(o_flat.view(-1, _wa_in)).to(torch.bfloat16)
-    # wo_b is also per-block (in_features_per_partition == wo_a out per
-    # block); feed the 2D [T*n_blocks, K] form and merge the blocks back
-    # to [T, hidden] for the MHC consumer.
-    zb = wo_b(z).to(torch.bfloat16)
-    _wb_in_part = getattr(wo_b, "input_size_per_partition", None)
-    if _wb_in_part is not None and _wb_in_part == z.shape[1]:
-        # Per-block wo_b ([K -> K] shared across blocks): reduce the
-        # n_blocks outputs into the [T, K] hidden state.
-        return zb.view(num_tokens, n_blocks, -1).sum(dim=1)
-    # Merged wo_b (single [n_blocks*out_a -> hidden] matrix, EMULATION).
-    return zb.view(num_tokens, -1)
+
+    from vllm.model_executor.layers.quantization.fp8 import (
+        Fp8LinearMethod,
+    )
+
+    if isinstance(getattr(wo_a, "quant_method", None), Fp8LinearMethod):
+        # FP8 EMULATION (official checkpoint): grouped BMM semantics —
+        # wo_a is a bmm layer (is_bmm=True) whose forward does
+        # einsum("bgd,grd->bgr") and expects the grouped 3D input.
+        # This is the pre-c204a4de9 path, validated at 82% on 600q.
+        o_flat = o_full.reshape(num_tokens, n_groups, heads_per_group * head_dim)
+        o_flat = o_flat.to(torch.bfloat16)
+        z = wo_a(o_flat).to(torch.bfloat16)
+        return wo_b(z.flatten(1))
+
+    # compressed-tensors (W4A16 humming): no bmm support in the scheme.
+    # wo_a (TP=2) is [4096, 4096] = n_local_groups row-blocks of
+    # [2048, 4096], one per attention group. The W4A16 checkpoint keeps
+    # the official per-group layout (the 4 row-blocks are DIFFERENT
+    # matrices, cos<0.001 — NOT a shared matrix), so each group must
+    # multiply with its own row-block. o here is the local view
+    # [T, n_local_heads, head_dim]; group gl consumes heads
+    # [gl*8:(gl+1)*8] (4096-dim input) and emits wo_a rows
+    # [2048*gl:2048*(gl+1)].
+    n_local_groups = n_groups
+    hpg_local = num_heads // n_local_groups  # 8 heads per local group
+    _out_per_group = wo_a.output_size_per_partition // n_local_groups
+    outs = []
+    for gl in range(n_local_groups):
+        hs = gl * hpg_local
+        x_g = o_full[:, hs:hs + hpg_local, :].reshape(num_tokens, -1)
+        x_g = x_g.to(torch.bfloat16)
+        y_g = wo_a(x_g).to(torch.bfloat16)  # [T, out_per_partition]
+        outs.append(y_g[:, gl * _out_per_group:(gl + 1) * _out_per_group])
+    z = torch.cat(outs, dim=-1)  # [T, n_local_groups * 2048]
+    return wo_b(z).to(torch.bfloat16)
 
 
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
