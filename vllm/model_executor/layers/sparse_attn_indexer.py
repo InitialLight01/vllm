@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -559,16 +561,34 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         else:
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                clean_logits=False,
-            )
+            # [SM120] VLLM_SM120_TRITON_INDEXER=1 replaces the DeepGEMM
+            # fp8_fp4_paged_mqa_logits path with the capture-safe Triton
+            # kernel (ported from codex/ds4-sm120-min-enable). Default off:
+            # the DeepGEMM path is unchanged.
+            if os.getenv("VLLM_SM120_TRITON_INDEXER", "0") == "1":
+                from vllm.model_executor.layers.dsv4_sm120_ops import (
+                    fp8_paged_mqa_logits_triton,
+                )
+
+                logits = fp8_paged_mqa_logits_triton(
+                    padded_q_quant_decode_tokens,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    max_model_len,
+                )
+            else:
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    clean_logits=False,
+                )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
