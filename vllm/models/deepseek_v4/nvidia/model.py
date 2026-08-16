@@ -950,6 +950,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 _stats = {
                     "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
                     "layer": getattr(self, "_active_idx", -1),
+                    "fp": [round(float(v), 4) for v in self.hc_attn_base[:3].cpu().tolist()],
                     "comp": "attn_out",
                     "shape": list(x.shape),
                     "nz": int((_attn_out != 0).sum().item()),
@@ -965,6 +966,16 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
+        import os as _os
+        if _os.environ.get("VLLM_DBG_OPROJ"):
+            print(
+                f"[mhc-dbg] x={tuple(x.shape)} residual={tuple(residual.shape)} "
+                f"post_mix={tuple(post_mix.shape)} res_mix={tuple(res_mix.shape)} "
+                f"hc_ffn_fn={tuple(self.hc_ffn_fn.shape)} "
+                f"hc_ffn_scale={tuple(self.hc_ffn_scale.shape)} "
+                f"hc_ffn_base={tuple(self.hc_ffn_base.shape)}",
+                flush=True,
+            )
         residual, post_mix, res_mix, x = _fused(
             x,
             residual,
@@ -993,6 +1004,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 _stats = {
                     "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
                     "layer": getattr(self, "_active_idx", -1),
+                    "fp": [round(float(v), 4) for v in self.hc_attn_base[:3].cpu().tolist()],
                     "comp": "ffn_out",
                     "shape": list(x.shape),
                     "nz": int((_ffn_out != 0).sum().item()),
