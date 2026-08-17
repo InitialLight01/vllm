@@ -5,35 +5,47 @@
 import torch
 
 from vllm.distributed import get_tensor_model_parallel_rank
-from vllm.model_executor.custom_op import direct_register_custom_op
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _upcast_e8m0_to_fp32,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import fp8_einsum
 
 
-def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
-    exp_bits = scale.view(torch.uint8).to(torch.int32)
-    fp32_bits = exp_bits << 23
-    return fp32_bits.view(torch.float32)
-
-
-@triton.jit
+# num_tokens and the token-count-dependent strides (a_stride_group == T*hidden,
+# and the two a_scale strides via align(T,4)) are passed as RUNTIME args (not
+# tl.constexpr) and marked do_not_specialize, so the kernel compiles to a SINGLE
+# cubin for every prefill chunk size. They are used only for masking and scalar
+# pointer offsets (never loop trip-counts/shapes), so this is numerically
+# identical and perf-neutral. As constexprs they baked the chunk token count into
+# the JIT key, so an unaligned chunked-prefill tail (e.g. 1131 tokens) JIT-loaded
+# a fresh cubin mid-inference; when that cuModuleLoad coincides with CUDA-graph
+# capture it raises cudaErrorNotPermitted and kills the worker (PR #41834).
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "a_stride_group",
+        "a_scale_stride_group",
+        "a_scale_stride_hidden",
+    ]
+)
 def _deepseek_v4_sm12x_fp8_einsum_kernel(
     a_ptr,
     a_scale_ptr,
     b_ptr,
     b_scale_ptr,
     out_ptr,
-    num_tokens: tl.constexpr,
+    num_tokens,
     num_groups: tl.constexpr,
     out_rank: tl.constexpr,
     hidden_size: tl.constexpr,
     a_stride_token: tl.constexpr,
-    a_stride_group: tl.constexpr,
+    a_stride_group,
     a_stride_hidden: tl.constexpr,
     a_scale_stride_token: tl.constexpr,
-    a_scale_stride_group: tl.constexpr,
-    a_scale_stride_hidden: tl.constexpr,
+    a_scale_stride_group,
+    a_scale_stride_hidden,
     b_stride_group: tl.constexpr,
     b_stride_out: tl.constexpr,
     b_stride_hidden: tl.constexpr,
@@ -275,23 +287,3 @@ def deepseek_v4_fp8_einsum(
             return
 
     fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
-
-
-def deepseek_v4_fp8_einsum_fake(
-    a: torch.Tensor,
-    a_scale: torch.Tensor,
-    b: torch.Tensor,
-    b_scale: torch.Tensor,
-    out: torch.Tensor,
-    equation: str,
-    recipe: list[int],
-) -> None:
-    return None
-
-
-direct_register_custom_op(
-    op_name="deepseek_v4_fp8_einsum",
-    op_func=deepseek_v4_fp8_einsum,
-    mutates_args=["out"],
-    fake_impl=deepseek_v4_fp8_einsum_fake,
-)

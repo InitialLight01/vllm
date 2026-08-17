@@ -10,7 +10,18 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 _SM120_MQA_LOGITS_MAX_SCORE_BYTES = 64 * 1024 * 1024
+_SM120_MQA_TRITON_TOPK_MAX_LOGITS_BYTES = 512 * 1024 * 1024
+_SM120_MQA_TRITON_CHUNKED_TOPK_CHUNK_SIZE = 32768
 _SM120_PAGED_MQA_TOPK_CHUNK_SIZE = 8192
+
+
+def _top_k_per_row_prefill_op():
+    try:
+        from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+        return torch.ops._C.top_k_per_row_prefill
+    except (AttributeError, ImportError, RuntimeError):
+        return None
 
 
 def _fp8_mqa_logits_head_chunk_size(
@@ -209,6 +220,176 @@ def _fp8_mqa_logits_topk_torch(
     return out
 
 
+def _fp8_mqa_logits_topk_triton(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    out: torch.Tensor,
+) -> bool:
+    q_values, q_scale = q
+    k_values, _ = kv
+    if not (q_scale is None and q_values.dim() == 3 and k_values.dim() == 2):
+        return False
+
+    logits_bytes = q_values.shape[0] * k_values.shape[0] * torch.float32.itemsize
+    if logits_bytes > _SM120_MQA_TRITON_TOPK_MAX_LOGITS_BYTES:
+        return False
+
+    from vllm.models.deepseek_v4.nvidia.ops.sm12x_mqa import (
+        fp8_mqa_logits_triton,
+    )
+
+    logits = fp8_mqa_logits_triton(q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+    topk_tokens = out.shape[1]
+    select_k = min(topk_tokens, logits.shape[1])
+    out.fill_(-1)
+    if select_k == 0:
+        return True
+
+    selected = out[:, :select_k]
+    topk_op = _top_k_per_row_prefill_op()
+    if topk_op is not None:
+        # top_k_per_row_prefill writes its output as a contiguous [M, select_k]
+        # buffer (it is given the logits strides, not the output strides). When
+        # select_k < out.shape[1] -- i.e. the compressed-KV count is below the
+        # topk width, which happens for short prompts and the early queries of
+        # long prompts -- out[:, :select_k] is non-contiguous (row stride =
+        # out.shape[1]), so writing it as contiguous silently corrupts later
+        # rows and drops their top-k (all -1). Hand the op a fresh contiguous
+        # buffer and copy back. The buffer is left uninitialized (new_empty)
+        # rather than copied (.contiguous()) because the op overwrites every
+        # element, so copying the placeholder -1s in would be wasted work.
+        work = (
+            selected if selected.is_contiguous() else selected.new_empty(selected.shape)
+        )
+        topk_op(
+            logits,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            work,
+            logits.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+            select_k,
+        )
+        work.add_(cu_seqlen_ks[:, None])
+        valid = (work >= cu_seqlen_ks[:, None]) & (work < cu_seqlen_ke[:, None])
+        work.masked_fill_(~valid, -1)
+        if work is not selected:
+            selected.copy_(work)
+    else:
+        values, indices = torch.topk(logits, select_k, dim=1)
+        selected.copy_(indices.to(torch.int32))
+        selected.masked_fill_(~torch.isfinite(values), -1)
+    return True
+
+
+def _fp8_mqa_logits_topk_triton_chunked(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    out: torch.Tensor,
+) -> bool:
+    q_values, q_scale = q
+    k_values, k_scales = kv
+    if not (q_scale is None and q_values.dim() == 3 and k_values.dim() == 2):
+        return False
+
+    from vllm.models.deepseek_v4.nvidia.ops.sm12x_mqa import (
+        fp8_mqa_logits_triton,
+    )
+
+    seq_len = q_values.shape[0]
+    seq_len_kv = k_values.shape[0]
+    topk_tokens = out.shape[1]
+    out.fill_(-1)
+    if seq_len == 0 or seq_len_kv == 0 or topk_tokens == 0:
+        return True
+
+    chunk_size = max(1, _SM120_MQA_TRITON_CHUNKED_TOPK_CHUNK_SIZE)
+    best_values = torch.full(
+        (seq_len, topk_tokens),
+        float("-inf"),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+    max_chunk_topk = min(topk_tokens, chunk_size)
+    chunk_values_buf = torch.empty(
+        (seq_len, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+    chunk_indices_buf = torch.empty(
+        (seq_len, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int64,
+    )
+    chunk_indices_i32 = torch.empty(
+        (seq_len, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int32,
+    )
+    candidate_values = torch.empty(
+        (seq_len, topk_tokens + max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+    candidate_indices = torch.empty(
+        (seq_len, topk_tokens + max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int32,
+    )
+    next_best_values = torch.empty_like(best_values)
+    selected = torch.empty(
+        (seq_len, topk_tokens),
+        device=q_values.device,
+        dtype=torch.int64,
+    )
+
+    for k_start in range(0, seq_len_kv, chunk_size):
+        k_end = min(k_start + chunk_size, seq_len_kv)
+        local_width = k_end - k_start
+        local_ks = torch.clamp(cu_seqlen_ks - k_start, min=0, max=local_width)
+        local_ke = torch.clamp(cu_seqlen_ke - k_start, min=0, max=local_width)
+        chunk_logits = fp8_mqa_logits_triton(
+            q_values,
+            (k_values[k_start:k_end], k_scales[k_start:k_end]),
+            weights,
+            local_ks,
+            local_ke,
+        )
+        chunk_topk = min(topk_tokens, local_width)
+        chunk_values = chunk_values_buf[:, :chunk_topk]
+        chunk_indices = chunk_indices_buf[:, :chunk_topk]
+        torch.topk(chunk_logits, chunk_topk, dim=1, out=(chunk_values, chunk_indices))
+        chunk_indices_out = chunk_indices_i32[:, :chunk_topk]
+        chunk_indices_out.copy_(chunk_indices)
+        chunk_indices_out.add_(k_start)
+
+        candidate_cols = topk_tokens + chunk_topk
+        candidate_values_view = candidate_values[:, :candidate_cols]
+        candidate_indices_view = candidate_indices[:, :candidate_cols]
+        candidate_values_view[:, :topk_tokens].copy_(best_values)
+        candidate_values_view[:, topk_tokens:candidate_cols].copy_(chunk_values)
+        candidate_indices_view[:, :topk_tokens].copy_(out)
+        candidate_indices_view[:, topk_tokens:candidate_cols].copy_(chunk_indices_out)
+        torch.topk(
+            candidate_values_view,
+            topk_tokens,
+            dim=1,
+            out=(next_best_values, selected),
+        )
+        torch.gather(candidate_indices_view, 1, selected, out=out)
+        best_values, next_best_values = next_best_values, best_values
+        out.masked_fill_(~torch.isfinite(best_values), -1)
+
+    return True
+
+
 def fp8_fp4_mqa_topk_indices(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -224,6 +405,24 @@ def fp8_fp4_mqa_topk_indices(
         and q[1] is None
     ):
         return False
+    if _fp8_mqa_logits_topk_triton(
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        topk_indices,
+    ):
+        return True
+    if _fp8_mqa_logits_topk_triton_chunked(
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        topk_indices,
+    ):
+        return True
     _fp8_mqa_logits_topk_torch(
         q,
         kv,

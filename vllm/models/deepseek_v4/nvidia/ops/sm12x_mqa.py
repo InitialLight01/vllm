@@ -7,6 +7,30 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+def _bucketed_logits_buffer(
+    num_rows: int, row_width: int, device: torch.device
+) -> torch.Tensor:
+    """fp32 (num_rows, row_width) output, allocated in power-of-two buckets.
+
+    During a chunked prefill the logits width (the compressed KV length) grows
+    monotonically with every chunk, so a fresh exact-size ``torch.empty`` per
+    call means no request can ever be served from a cached block: the caching
+    allocator maps a new segment each chunk and ``memory_reserved`` ratchets
+    toward the SUM of the distinct sizes. On unified-memory devices (GB10)
+    that reserve is system RAM -- ~2.6-3 GiB per 32K needle prompt
+    (jasl/vllm#31). Rounding the flat allocation up to a power of two makes
+    consecutive chunks share a bucket, bounding the transient footprint at
+    ~2x the largest live buffer instead of the running sum. The trailing view
+    keeps the tensor contiguous, so kernel stride assumptions are unchanged.
+    """
+    numel = num_rows * row_width
+    if numel == 0:
+        return torch.empty((num_rows, row_width), device=device, dtype=torch.float32)
+    alloc = 1 << (numel - 1).bit_length()
+    flat = torch.empty((alloc,), device=device, dtype=torch.float32)
+    return flat[:numel].view(num_rows, row_width)
+
+
 def _view_packed_fp8_paged_mqa_kv_cache(
     kv_cache: torch.Tensor,
     head_dim: int,
@@ -20,9 +44,7 @@ def _view_packed_fp8_paged_mqa_kv_cache(
     elif kv_cache.dim() == 4:
         num_blocks, block_size, num_kv_heads, head_dim_with_scale = kv_cache.shape
     else:
-        raise ValueError(
-            f"Expected 3D or 4D kv_cache, got {kv_cache.dim()} dimensions"
-        )
+        raise ValueError(f"Expected 3D or 4D kv_cache, got {kv_cache.dim()} dimensions")
     if num_kv_heads != 1:
         raise ValueError(f"Expected one KV head, got {num_kv_heads}")
 
@@ -61,8 +83,8 @@ def _fp8_mqa_logits_kernel(
     cu_seqlen_ks_ptr,
     cu_seqlen_ke_ptr,
     logits_ptr,
-    num_q: tl.constexpr,
-    seq_len_kv: tl.constexpr,
+    num_q,
+    seq_len_kv,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     stride_qm: tl.constexpr,
@@ -72,7 +94,7 @@ def _fp8_mqa_logits_kernel(
     stride_kd: tl.constexpr,
     stride_wm: tl.constexpr,
     stride_wh: tl.constexpr,
-    stride_lm: tl.constexpr,
+    stride_lm,
     stride_ln: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -139,15 +161,12 @@ def fp8_mqa_logits_triton(
     k_fp8, scale = kv
     num_q, num_heads, head_dim = q.shape
     seq_len_kv = k_fp8.shape[0]
-    logits = torch.empty(
-        (num_q, seq_len_kv),
-        device=q.device,
-        dtype=torch.float32,
-    )
+    logits = _bucketed_logits_buffer(num_q, seq_len_kv, q.device)
     if num_q == 0 or seq_len_kv == 0:
         return logits
 
-    grid = (triton.cdiv(num_q, 64), triton.cdiv(seq_len_kv, 128))
+    block_m = _fp8_mqa_logits_block_m(num_q, seq_len_kv)
+    grid = (triton.cdiv(num_q, block_m), triton.cdiv(seq_len_kv, 128))
     _fp8_mqa_logits_kernel[grid](
         q,
         k_fp8,
@@ -169,12 +188,18 @@ def fp8_mqa_logits_triton(
         weights.stride(1),
         logits.stride(0),
         logits.stride(1),
-        BLOCK_M=64,
+        BLOCK_M=block_m,
         BLOCK_N=128,
         BLOCK_D=64,
         num_warps=4,
     )
     return logits
+
+
+def _fp8_mqa_logits_block_m(num_q: int, seq_len_kv: int) -> int:
+    if seq_len_kv <= 16 * 1024:
+        return 16
+    return 64
 
 
 @triton.jit
@@ -187,8 +212,8 @@ def _fp8_paged_mqa_logits_kernel(
     block_tables_ptr,
     logits_ptr,
     token_start,
-    num_rows: tl.constexpr,
-    logits_width: tl.constexpr,
+    num_rows,
+    logits_width,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -208,7 +233,7 @@ def _fp8_paged_mqa_logits_kernel(
     stride_cln: tl.constexpr,
     stride_btb: tl.constexpr,
     stride_btk: tl.constexpr,
-    stride_lm: tl.constexpr,
+    stride_lm,
     stride_ln: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -244,7 +269,9 @@ def _fp8_paged_mqa_logits_kernel(
 
     logits = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     scale = tl.load(
-        scale_ptr + block_idx.to(tl.int64) * stride_sb + block_offset[None, :] * stride_ss,
+        scale_ptr
+        + block_idx.to(tl.int64) * stride_sb
+        + block_offset[None, :] * stride_ss,
         mask=context_mask,
         other=0.0,
     )
@@ -297,8 +324,8 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     block_tables_ptr,
     logits_ptr,
     token_start,
-    num_rows: tl.constexpr,
-    logits_width: tl.constexpr,
+    num_rows,
+    logits_width,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -318,7 +345,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     stride_cln: tl.constexpr,
     stride_btb: tl.constexpr,
     stride_btk: tl.constexpr,
-    stride_lm: tl.constexpr,
+    stride_lm,
     stride_ln: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -443,11 +470,7 @@ def fp8_paged_mqa_logits_rowwise_triton(
     assert token_start >= 0
     assert token_count >= 0
     assert token_start + token_count <= max_model_len
-    logits = torch.empty(
-        (num_rows, token_count),
-        device=q.device,
-        dtype=torch.float32,
-    )
+    logits = _bucketed_logits_buffer(num_rows, token_count, q.device)
     if num_rows == 0 or token_count == 0:
         return logits
 
@@ -533,11 +556,7 @@ def fp8_paged_mqa_logits_triton(
     assert token_start >= 0
     assert token_count >= 0
     assert token_start + token_count <= max_model_len
-    logits = torch.empty(
-        (num_rows, token_count),
-        device=q.device,
-        dtype=torch.float32,
-    )
+    logits = _bucketed_logits_buffer(num_rows, token_count, q.device)
     if num_rows == 0 or token_count == 0:
         return logits
 
@@ -604,17 +623,17 @@ def _tf32_hc_prenorm_gemm_kernel(
     fn_ptr,
     out_ptr,
     sqrsum_ptr,
-    M: tl.constexpr,
+    M,
     K: tl.constexpr,
     N: tl.constexpr,
     stride_xm: tl.constexpr,
     stride_xk: tl.constexpr,
     stride_fnn: tl.constexpr,
     stride_fnk: tl.constexpr,
-    stride_outs: tl.constexpr,
+    stride_outs,
     stride_outm: tl.constexpr,
     stride_outn: tl.constexpr,
-    stride_sqs: tl.constexpr,
+    stride_sqs,
     stride_sqm: tl.constexpr,
     NUM_SPLIT: tl.constexpr,
     BLOCK_M: tl.constexpr,
