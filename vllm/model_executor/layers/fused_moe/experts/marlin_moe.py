@@ -579,7 +579,15 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         self.w2_g_idx_sort_indices = w2_g_idx_sort_indices
         self.is_k_full = is_k_full
         self.input_dtype = get_marlin_input_dtype()
-        self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
+        # Numerics-compat hook: LVLLM_NO_SWIGLU_CLAMP=1 disables the gemm1
+        # silu clamp (replicating the lvllm no-clamp configuration for
+        # cross-stack comparisons). Default keeps the official clamp.
+        import os as _os
+        self.gemm1_clamp_limit = (
+            None
+            if _os.environ.get("LVLLM_NO_SWIGLU_CLAMP") == "1"
+            else quant_config.gemm1_clamp_limit
+        )
         # Gated-activation params (used by SWIGLUOAI_UNINTERLEAVE on packed w13).
         # silu == swigluoai with alpha=1, beta=0; configs that don't set these
         # (plain silu) fall back to the silu identity.
