@@ -23,6 +23,7 @@ from typing import Any
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .fused_indexer_q import _fp32x2_to_fp4x2
@@ -60,12 +61,17 @@ def compress_norm_rope_store_triton(
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4
+        # Outlier clip: the SM80 EMULATION pipeline keeps the tighter ±5; the
+        # SM12x validated path uses ±10.
+        clip_bound = 5.0 if current_platform.is_sm80_context() else 10.0
     elif use_fp4_cache:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
         num_warps = 1
+        clip_bound = 10.0
     else:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
+        clip_bound = 10.0
 
     use_e4nv = torch.cuda.get_device_capability()[0] >= 9
     fp8_max = 448.0 if use_e4nv else 1.0
@@ -103,6 +109,7 @@ def compress_norm_rope_store_triton(
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        CLIP_BOUND=clip_bound,
         num_warps=num_warps,
         **pdl_kwargs,
     )
@@ -146,6 +153,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     TOKEN_STRIDE: tl.constexpr,  # 576 for DeepseekV4
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
+    CLIP_BOUND: tl.constexpr,  # outlier clip: 5.0 (SM80 EMULATION) / 10.0 (SM12x)
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -252,7 +260,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     # Clip each element to a fixed global bound (the typical RMSNorm output
     # range is [-5, 5]; attention spikes can reach ±100+ but contribute
     # negligible signal).
-    quant_2d = tl.clamp(quant_2d, -5.0, 5.0)
+    quant_2d = tl.clamp(quant_2d, -CLIP_BOUND, CLIP_BOUND)
     # Recompute absmax from clipped data
     block_absmax = tl.max(tl.abs(quant_2d), axis=1)
     block_absmax = tl.maximum(block_absmax, 1e-4)
@@ -346,6 +354,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    CLIP_BOUND: tl.constexpr,  # unused here; uniform launcher signature
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -523,6 +532,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     TOKEN_STRIDE: tl.constexpr,  # HEAD_SIZE // 2 = 64 packed bytes/token
     SCALE_DIM: tl.constexpr,  # HEAD_SIZE // QUANT_BLOCK = 4 ue8m0 bytes/token
     KV_BLOCK_STRIDE: tl.constexpr,
+    CLIP_BOUND: tl.constexpr,  # unused here; uniform launcher signature
 ):
     """Fused compress → RMSNorm → RoPE → MXFP4 quant → store.
 
