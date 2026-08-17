@@ -38,6 +38,23 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
+# Some RTX PRO 6000 variants report a device name that differs from the one
+# the tuned W8A8 config JSONs are keyed by. Map them onto the canonical name.
+_SM12X_TUNED_CONFIG_DEVICE_ALIASES = {
+    "NVIDIA_RTX_PRO_6000_Blackwell_Max-Q_Workstation_Edition": (
+        "NVIDIA_RTX_PRO_6000_Blackwell_Workstation_Edition",
+    ),
+    "NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition": (
+        "NVIDIA_RTX_PRO_6000_Blackwell_Workstation_Edition",
+    ),
+}
+
+
+def _tuned_config_device_names() -> tuple[str, ...]:
+    device_name = current_platform.get_device_name().replace(" ", "_")
+    return (device_name, *_SM12X_TUNED_CONFIG_DEVICE_ALIASES.get(device_name, ()))
+
+
 def is_fp8(x: torch.dtype | torch.Tensor) -> bool:
     if isinstance(x, torch.Tensor):
         x = x.dtype
@@ -766,6 +783,64 @@ def per_token_group_quant_fp8_packed_for_deepgemm(
 
 
 @triton.jit
+def _e4m3_uint8_to_f32(u):
+    """Decode an ``e4m3fn`` byte (1-4-3, exp bias 7) to f32 without ever
+    materializing Triton's ``fp8e4nv`` type, which Ampere (SM80/SM86) cannot
+    represent. ``u`` is the raw uint8 bit pattern. NaN (S.1111.111) is not
+    produced by quantized weights and is decoded as a finite value."""
+    ui = u.to(tl.int32)
+    sign = (ui >> 7) & 1
+    exp = (ui >> 3) & 0xF
+    man = ui & 0x7
+    mant = man.to(tl.float32) * 0.125
+    # normal: 2^(exp-7) * (1+mant); subnormal (exp==0): 2^-6 * mant
+    val = tl.where(
+        exp != 0,
+        tl.exp2((exp - 7).to(tl.float32)) * (1.0 + mant),
+        0.015625 * mant,
+    )
+    return tl.where(sign != 0, -val, val)
+
+
+@triton.jit
+def _f32_to_e4m3_uint8(x):
+    """Encode f32 -> ``e4m3fn`` (1-4-3, exp bias 7, max 448, no inf) raw uint8
+    bits, for Ampere (SM80/SM86) where Triton lacks the ``fp8e4nv`` type. Inverse
+    of ``_e4m3_uint8_to_f32``. Round-to-nearest; saturates |x| > 448 and NaN/Inf
+    to +/-448. RNE-vs-round-half differences are sub-ulp and below fp8 noise."""
+    x = x.to(tl.float32)
+    sign = tl.where(x < 0, 1, 0).to(tl.int32)
+    a = tl.abs(x)
+    a = tl.where(a != a, 0.0, a)  # NaN -> 0 magnitude
+    a = tl.minimum(a, 448.0)
+    is_zero = a == 0.0
+    a_safe = tl.where(is_zero, 1.0, a)
+    # unbiased exponent, folded to the [-6, 8] e4m3 range (-6 covers subnormals)
+    e = tl.floor(tl.log2(a_safe))
+    e = tl.maximum(tl.minimum(e, 8.0), -6.0)
+    m = a / tl.exp2(e)  # normal: [1, 2); subnormal (a < 2^-6): [0, 1)
+    is_norm = m >= 1.0
+    # normal: expfield = e + 7 in [1, 15], mant = round((m - 1) * 8), carry -> +1 exp
+    mant_n = tl.floor((m - 1.0) * 8.0 + 0.5)
+    expf_n = e + 7.0
+    carry_n = mant_n >= 8.0
+    mant_n = tl.where(carry_n, 0.0, mant_n)
+    expf_n = tl.where(carry_n, expf_n + 1.0, expf_n)
+    # subnormal: expfield = 0, mant = round(m * 8); mant==8 promotes to min normal
+    mant_s = tl.floor(m * 8.0 + 0.5)
+    promote_s = mant_s >= 8.0
+    expf_s = tl.where(promote_s, 1.0, 0.0)
+    mant_s = tl.where(promote_s, 0.0, mant_s)
+    expf = tl.where(is_norm, expf_n, expf_s)
+    mant = tl.where(is_norm, mant_n, mant_s)
+    expf = tl.where(is_zero, 0.0, expf)
+    mant = tl.where(is_zero, 0.0, mant)
+    expf = tl.minimum(expf, 15.0)
+    byte = (sign << 7) | (expf.to(tl.int32) << 3) | mant.to(tl.int32)
+    return byte.to(tl.uint8)
+
+
+@triton.jit
 def _w8a8_triton_block_scaled_mm(
     # Pointers to inputs and output
     A,
@@ -796,6 +871,7 @@ def _w8a8_triton_block_scaled_mm(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    DECODE_E4M3: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
@@ -824,8 +900,22 @@ def _w8a8_triton_block_scaled_mm(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        a_mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
+        b_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
+        if DECODE_E4M3:
+            # Ampere (SM80/SM86) has no FP8 tensor core and Triton cannot even
+            # represent fp8e4nv here, so the operands arrive bitcast to uint8 and
+            # are decoded e4m3 -> bf16 in-kernel (e4m3 widens exactly into bf16;
+            # block scales are applied after the dot, so this is lossless).
+            a = _e4m3_uint8_to_f32(tl.load(a_ptrs, mask=a_mask, other=0)).to(
+                tl.bfloat16
+            )
+            b = _e4m3_uint8_to_f32(tl.load(b_ptrs, mask=b_mask, other=0)).to(
+                tl.bfloat16
+            )
+        else:
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
@@ -863,14 +953,19 @@ def get_w8a8_block_fp8_configs(
     """
 
     # First look up if an optimized configuration is available in the configs
-    # directory
-    device_name = current_platform.get_device_name().replace(" ", "_")
-    json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n},{block_k}].json"  # noqa: E501
+    # directory (also trying the device-name aliases, e.g. RTX PRO 6000
+    # Max-Q/Server variants mapping onto the Workstation tuned configs).
+    config_file_path = None
+    for device_name in _tuned_config_device_names():
+        json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n},{block_k}].json"  # noqa: E501
+        candidate = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+        )
+        if os.path.exists(candidate):
+            config_file_path = candidate
+            break
 
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
-    )
-    if os.path.exists(config_file_path):
+    if config_file_path is not None:
         with open(config_file_path) as f:
             logger.info(
                 "Using configuration from %s for W8A8 Block FP8 kernel.",
@@ -883,8 +978,7 @@ def get_w8a8_block_fp8_configs(
     # configuration
     logger.warning(
         "Using default W8A8 Block FP8 kernel config. Performance might "
-        "be sub-optimal! Config file not found at %s",
-        config_file_path,
+        "be sub-optimal! Config file not found",
     )
     return None
 
@@ -984,6 +1078,20 @@ def w8a8_triton_block_scaled_mm(
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
+    # Ampere (SM80/SM86) has no FP8 tensor cores and Triton cannot represent
+    # fp8e4nv on this arch at all, so bitcast the e4m3 operands to uint8 and
+    # decode them to bf16 inside the kernel. FP8-capable archs (SM89/SM90/
+    # SM100/SM12x) keep the native FP8 tl.dot.
+    decode_e4m3 = (
+        current_platform.is_cuda()
+        and not current_platform.supports_fp8()
+        and A.dtype == torch.float8_e4m3fn
+        and B.dtype == torch.float8_e4m3fn
+    )
+    if decode_e4m3:
+        A = A.view(torch.uint8)
+        B = B.view(torch.uint8)
+
     _w8a8_triton_block_scaled_mm[grid](
         A,
         B,
@@ -1005,6 +1113,7 @@ def w8a8_triton_block_scaled_mm(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
+        DECODE_E4M3=decode_e4m3,
         **config,
     )
 
