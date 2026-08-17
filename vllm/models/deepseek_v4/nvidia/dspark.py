@@ -13,6 +13,7 @@ the draft block is only ``dspark_block_size`` (5) tokens wide, far below the
 minimum batch the sparse-MLA kernels accept.
 """
 
+import os
 from collections.abc import Iterable
 
 import regex as re
@@ -46,7 +47,15 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.models.deepseek_v4.common.ops.fused_qk_rmsnorm import (
+    fused_q_kv_rmsnorm,
+)
 
+from .dspark_triton import (
+    dspark_context_kv_store,
+    dspark_qkv_postprocess,
+    dspark_triton_attention,
+)
 from .model import (
     DeepseekV4DecoderLayer,
     make_deepseek_v4_expert_params_mapping,
@@ -137,6 +146,11 @@ class DSparkDecoderLayer(DeepseekV4DecoderLayer):
             ),
             persistent=False,
         )
+        # Triton fused kernels on by default; eager fallbacks for debugging
+        # (VLLM_DSPARK_EAGER_ATTN / _QKV / _STORE).
+        self._triton_attn = os.environ.get("VLLM_DSPARK_EAGER_ATTN") is None
+        self._triton_qkv = os.environ.get("VLLM_DSPARK_EAGER_QKV") is None
+        self._triton_store = os.environ.get("VLLM_DSPARK_EAGER_STORE") is None
 
     @property
     def window_size(self) -> int:
@@ -159,8 +173,21 @@ class DSparkDecoderLayer(DeepseekV4DecoderLayer):
         if main_x.numel() == 0 or query_start_loc is None:
             return
         qr_kv = _linear_output(self.attn.fused_wqa_wkv(main_x))
-        kv = qr_kv[..., self.attn.q_lora_rank :]
-        kv = self.attn.kv_norm(kv)
+        kv_raw = qr_kv[..., self.attn.q_lora_rank :]
+        if self._triton_store:
+            dspark_context_kv_store(
+                kv_raw,
+                self._main_kv_cache[:batch_size],
+                context_positions,
+                query_start_loc,
+                batch_size,
+                num_rejected_tokens,
+                self.attn.kv_norm.weight.data,
+                self.attn.rotary_emb.cos_sin_cache,
+                self.attn.eps,
+            )
+            return
+        kv = self.attn.kv_norm(kv_raw)
         kv = _apply_rope_gptj_last(
             kv, context_positions, self.attn.rotary_emb.cos_sin_cache
         )
@@ -186,6 +213,26 @@ class DSparkDecoderLayer(DeepseekV4DecoderLayer):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         qr_kv = _linear_output(self.attn.fused_wqa_wkv(x))
         qr, kv = qr_kv.split([self.attn.q_lora_rank, self.attn.head_dim], dim=-1)
+        if self._triton_qkv:
+            # Fused RMSNorm (q/kv) + fused no-weight q-RMSNorm + RoPE tail.
+            qr, kv = fused_q_kv_rmsnorm(
+                qr,
+                kv,
+                self.attn.q_norm.weight.data,
+                self.attn.kv_norm.weight.data,
+                self.attn.eps,
+            )
+            q = _linear_output(self.attn.wq_b(qr)).view(
+                -1, self.attn.n_local_heads, self.attn.head_dim
+            )
+            q, kv = dspark_qkv_postprocess(
+                q.contiguous(),
+                kv.contiguous(),
+                positions,
+                self.attn.rotary_emb.cos_sin_cache,
+                self.attn.eps,
+            )
+            return q, kv
         qr = self.attn.q_norm(qr)
         kv = self.attn.kv_norm(kv)
         q = _linear_output(self.attn.wq_b(qr)).view(
@@ -221,6 +268,22 @@ class DSparkDecoderLayer(DeepseekV4DecoderLayer):
         draft_kv = draft_kv.view(batch_size, block_size, self.attn.head_dim)
 
         cache_kv = self._main_kv_cache[:batch_size].to(draft_kv.dtype)
+        if self._triton_attn:
+            # KV-shared tensor-core attention over [circular main KV + draft
+            # KV] with the per-head sink folded into the online softmax.
+            o = dspark_triton_attention(
+                q,
+                cache_kv,
+                draft_kv,
+                main_positions.long(),
+                self.attn.attn_sink[: self.attn.n_local_heads],
+                float(self.attn.scale),
+            ).reshape(
+                batch_size * block_size,
+                self.attn.n_local_heads,
+                self.attn.head_dim,
+            )
+            return self.attn._o_proj(o, positions)
         kv = torch.cat([cache_kv, draft_kv], dim=1)
 
         window = self.window_size
