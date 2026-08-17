@@ -799,15 +799,24 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     if device_capability is not None and device_capability.major == 12:
         if envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE:
             from vllm.utils.flashinfer import (
-                has_flashinfer_trtllm_sparse_mla_dsv4,
+                flashinfer_sm120_sparse_mla_unavailable_reason,
             )
 
-            if has_flashinfer_trtllm_sparse_mla_dsv4():
+            reason = flashinfer_sm120_sparse_mla_unavailable_reason()
+            if reason is None:
                 from vllm.models.deepseek_v4.nvidia.flashinfer_sm120_decode import (
                     DeepseekV4FlashInferSM120Attention,
                 )
 
                 return DeepseekV4FlashInferSM120Attention
+            # The packed path is default-on for SM12x; a silent FlashMLA
+            # fallback hides broken installs until recall degrades. Fail
+            # loudly with the reason; opt into the fallback explicitly with
+            # VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE=0.
+            raise RuntimeError(
+                "DeepSeek-V4 SM120 packed sparse-MLA decode is enabled "
+                f"(VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE=1) but: {reason}"
+            )
         return DeepseekV4FlashInferSM120Attention
     return DeepseekV4FlashMLAAttention
 

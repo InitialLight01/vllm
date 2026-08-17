@@ -274,6 +274,37 @@ def has_flashinfer_trtllm_sparse_mla_dsv4() -> bool:
     return True
 
 
+def flashinfer_sm120_sparse_mla_unavailable_reason() -> str | None:
+    """Return why the SM120 packed sparse-MLA decode path cannot run, or None.
+
+    Two halves, both load-bearing (ported from codex 7078d6e823):
+    - the symbol half (has_flashinfer_trtllm_sparse_mla_dsv4) — probes the
+      exact imports the consumer makes;
+    - the version half — flashinfer-python 0.6.13 exposes nearby sparse-MLA
+      APIs WITHOUT the SM120 module, and a flashinfer-cubin whose version
+      differs from flashinfer-python can still fail open on symbols alone.
+    """
+    import importlib.metadata as _md
+
+    try:
+        py_ver = _md.version("flashinfer-python")
+    except _md.PackageNotFoundError:
+        return "flashinfer-python not installed"
+    try:
+        cu_ver = _md.version("flashinfer-cubin")
+    except _md.PackageNotFoundError:
+        return "flashinfer-cubin not installed"
+    from packaging.version import Version
+
+    if Version(py_ver) < Version("0.6.14"):
+        return f"flashinfer-python {py_ver} < 0.6.14"
+    if Version(cu_ver) < Version("0.6.14"):
+        return f"flashinfer-cubin {cu_ver} < 0.6.14"
+    if not has_flashinfer_trtllm_sparse_mla_dsv4():
+        return "trtllm_batch_decode_sparse_mla_dsv4 symbol not importable"
+    return None
+
+
 @functools.cache
 def has_flashinfer_cutedsl() -> bool:
     """Return ``True`` if FlashInfer cutedsl module is available."""

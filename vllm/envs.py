@@ -185,7 +185,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP: bool = True
     VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES: list[int] | None = None
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
-    VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE: bool = False
+    VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE: bool = True
     VLLM_TRITON_MLA_SPARSE: bool | None = None
     VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
     VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int = 256
@@ -1504,7 +1504,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL", "1"))
     ),
     "VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE", "0"))
+        int(os.getenv("VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE", "1"))
     ),
     # Experimental sparse MLA fallback controls.
     # ``VLLM_TRITON_MLA_SPARSE`` unset means auto-select where FlashMLA sparse
