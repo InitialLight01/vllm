@@ -6,6 +6,10 @@ import torch.nn as nn
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
+from vllm.models.deepseek_v4.nvidia.ops.fp8_einsum import (
+    _use_deepseek_v4_sm12x_triton_fp8_einsum,
+    deepseek_v4_fp8_einsum,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
 
@@ -60,11 +64,33 @@ def deep_gemm_fp8_o_proj(
         device=o.device,
         dtype=torch.bfloat16,
     )
-    fp8_einsum(
-        "bhr,hdr->bhd",
-        (o_fp8, o_scale),
-        (wo_a.weight, wo_a.weight_scale_inv),
-        z,
-        recipe=einsum_recipe,
-    )
+    # MarlinFP8.process_weights_after_loading renames block-FP8 scales to
+    # weight_scale_inv. Non-Marlin kernels keep the on-disk weight_scale name.
+    wo_a_scale = getattr(wo_a, "weight_scale_inv", None)
+    if wo_a_scale is None:
+        wo_a_scale = wo_a.weight_scale
+    if _use_deepseek_v4_sm12x_triton_fp8_einsum(
+        "bhr,hdr->bhd", list(einsum_recipe), wo_a_scale
+    ):
+        # Triton einsum: SM 8.x (DECODE_E4M3 on Ampere / UPCAST on Ada) and
+        # SM12x with the legacy (1,128,128) FP32 block-scale layout.
+        deepseek_v4_fp8_einsum(
+            o_fp8,
+            o_scale,
+            wo_a.weight,
+            wo_a_scale,
+            z,
+            "bhr,hdr->bhd",
+            list(einsum_recipe),
+        )
+    else:
+        # DeepGEMM C++ fp8_einsum (SM90/SM100, SM12x TMA recipe) — the
+        # original direct-call semantics with the 2D weight.
+        fp8_einsum(
+            "bhr,hdr->bhd",
+            (o_fp8, o_scale),
+            (wo_a.weight, wo_a_scale),
+            z,
+            recipe=einsum_recipe,
+        )
     return wo_b(z.flatten(1))

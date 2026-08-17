@@ -115,11 +115,61 @@ def check_decode_forced_path() -> None:
     print("  [OK] DECODE_E4M3 forced path\n")
 
 
+
+def check_o_proj_einsum_paths() -> None:
+    """切片 2: einsum 原生回归 + 强制 decode + wrapper 3D-b DeepGEMM 回退."""
+    from vllm.models.deepseek_v4.nvidia.ops.fp8_einsum import (
+        _deepseek_v4_sm12x_fp8_einsum_kernel,
+        deepseek_v4_sm12x_fp8_einsum,
+    )
+
+    torch.manual_seed(0)
+    T, G, H, R = 16, 2, 128, 128
+    dev = "cuda"
+    a_f = (torch.randn(T, G, H, device=dev) * 0.25).clamp(-3, 3)
+    b_f = (torch.randn(G, R, H, device=dev) * 0.25).clamp(-3, 3)
+    a, b = a_f.to(torch.float8_e4m3fn), b_f.to(torch.float8_e4m3fn)
+    a_scale = torch.rand(T, G, H // 128, device=dev) * 0.5 + 0.5
+    b_scale = torch.rand(G, R // 128, H // 128, device=dev) * 0.5 + 0.5
+
+    a_deq = a.to(torch.float32) * a_scale[:, :, 0].unsqueeze(-1)
+    b_deq = b.to(torch.float32) * b_scale[:, 0, 0].view(G, 1, 1)
+    ref = torch.einsum("tgh,grh->tgr", a_deq, b_deq)
+
+    # 1) native launcher (SM120: native fp8 dot)
+    out = torch.empty(T, G, R, device=dev, dtype=torch.float32)
+    deepseek_v4_sm12x_fp8_einsum(a, a_scale, b, b_scale, out)
+    rel = ((out - ref).abs() / (ref.abs() + 1e-3)).max().item()
+    print(f"einsum native  max_rel={rel:.4f}")
+    assert rel < 0.06
+
+    # 2) forced DECODE_E4M3 (uint8 bitcast, direct kernel)
+    out2 = torch.empty(T, G, R, device=dev, dtype=torch.float32)
+    au, bu = a.view(torch.uint8).contiguous(), b.view(torch.uint8).contiguous()
+    grid = (triton.cdiv(T, 16), triton.cdiv(R, 128), G)
+    _deepseek_v4_sm12x_fp8_einsum_kernel[grid](
+        au, a_scale, bu, b_scale, out2, T, G, R, H,
+        au.stride(0), au.stride(1), au.stride(2),
+        a_scale.stride(0), a_scale.stride(1), a_scale.stride(2),
+        bu.stride(0), bu.stride(1), bu.stride(2),
+        b_scale.stride(0), b_scale.stride(1), b_scale.stride(2),
+        out2.stride(0), out2.stride(1), out2.stride(2),
+        BLOCK_TOKENS=16, BLOCK_OUT=128, BLOCK_HIDDEN=128,
+        UPCAST_FP8=False, DECODE_E4M3=True, B_BF16=False,
+        num_warps=4, num_stages=3,
+    )
+    torch.cuda.synchronize()
+    rel2 = ((out2 - ref).abs() / (ref.abs() + 1e-3)).max().item()
+    print(f"einsum decode  max_rel={rel2:.4f}")
+    assert rel2 < 0.06
+
+
 def main() -> None:
     check_e4m3_codec()
     check_native_path()
     check_decode_forced_path()
-    print("ALL SLICE-1 OP CHECKS PASSED")
+    check_o_proj_einsum_paths()
+    print("ALL SLICE-1+2 OP CHECKS PASSED")
 
 
 if __name__ == "__main__":
