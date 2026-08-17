@@ -3,6 +3,8 @@
 
 from typing import TYPE_CHECKING, Any
 
+import os
+
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -396,6 +398,11 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # On SM80 we bypass FP8 kernels entirely (no FP8 tensor cores); keep
+        # weights in their original checkpoint layout so _apply_bf16_sm80()
+        # can dequantize them correctly.
+        if current_platform.is_sm80_context():
+            return
         if self.use_marlin:
             if not self.block_quant:
                 # Canonicalize to (K, N) for the kernel.
@@ -443,12 +450,101 @@ class Fp8LinearMethod(LinearMethodBase):
 
         self.fp8_linear.process_weights_after_loading(layer)
 
+    def _apply_bf16_sm80(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """BF16 fallback for SM80 (Ampere/A800): dequantize FP8 weights and use
+        plain torch matmul. SM80 has no FP8 tensor cores, so the standard FP8
+        linear kernels (Cutlass/DeepGEMM/FlashInfer) cannot run.
+
+        Handles both block-wise (UE8M0) and per-tensor FP8 weight formats,
+        as well as the grouped BMM path used by ``wo_a`` in DeepSeek-V4
+        attention (``is_bmm=True``).
+        """
+        # ---- dequantize weight -------------------------------------------------
+        weight_fp8 = layer.weight  # float8_e4m3fn  [M, K]  (K,N for Marlin after
+        #                                process_weights_after_loading swaps dims)
+        scale_inv = getattr(layer, "weight_scale_inv", None)
+
+        if scale_inv is not None:
+            # Block-wise FP8 with UE8M0 scales (common in DeepSeek-V4 / DSv3).
+            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                _upcast_e8m0_to_fp32,
+            )
+
+            M, K = weight_fp8.shape
+            if scale_inv.dtype in (torch.float8_e8m0fnu, torch.uint8):
+                scale = _upcast_e8m0_to_fp32(scale_inv)
+            else:
+                scale = scale_inv.to(torch.float32)
+            # Broadcast from [M/blk_M, K/blk_K] → [M, K]
+            blk_M = self.weight_block_size[0] if self.weight_block_size else 128
+            blk_K = self.weight_block_size[1] if self.weight_block_size else 128
+            scale = scale.repeat_interleave(blk_M, dim=0).repeat_interleave(blk_K, dim=1)
+            scale = scale[:M, :K]
+            # w_bf16 = w_fp8 * scale  (w_fp8 is stored as w_bf16 / scale,
+            #  scale is the actual block multiplier, not its inverse despite
+            #  the "weight_scale_inv" parameter name).
+            w_bf16 = (weight_fp8.to(torch.float32) * scale).to(x.dtype)
+        else:
+            # Per-tensor FP8 (no block scales).
+            weight_scale = getattr(layer, "weight_scale", None)
+            if weight_scale is not None and weight_scale.numel() == 1:
+                w_bf16 = (weight_fp8.to(torch.float32) * weight_scale.to(torch.float32)).to(x.dtype)
+            else:
+                w_bf16 = weight_fp8.to(x.dtype)
+
+        # ---- quantize activation like the SM120 native FP8 path --------------
+        # SM120's Fp8BlockScaledMMLinearKernel quantizes activations to FP8
+        # per-token-group (128, UE8M0 scale) before the scaled GEMM.  To make
+        # SM80 EMULATION numerically identical, apply the same QDQ on the BF16
+        # fallback path (gated by VLLM_EMU_FP8_LINEAR_ACT).  The weight side is
+        # already exact (FP8 values × 2^scale are exact in BF16), so only the
+        # activation QDQ matters.
+        if (
+            os.environ.get("VLLM_EMU_FP8_LINEAR_ACT")
+            and x.dtype == torch.bfloat16
+            and self.block_quant
+        ):
+            from vllm.model_executor.layers.fused_moe.utils import (
+                _fp8_ptg_quant_dequant_ue8m0,
+            )
+
+            orig_shape = x.shape
+            x2d = x.reshape(-1, orig_shape[-1])
+            x2d = _fp8_ptg_quant_dequant_ue8m0(x2d, 128)[0].to(torch.bfloat16)
+            x = x2d.reshape(orig_shape)
+
+        # ---- grouped BMM path (wo_a in DeepSeek-V4 attention) -----------------
+        if getattr(layer, "is_bmm", False):
+            g = layer.bmm_batch_size  # n_local_groups
+            r = w_bf16.shape[0] // g
+            d = w_bf16.shape[1]
+            w_3d = w_bf16.view(g, r, d)
+            # x: [T, g, d],  w_3d: [g, r, d].
+            # Equivalent to the FP8 DeepGEMM einsum "bhr,hdr->bhd" where
+            # h=g (groups), r=d (contracted dim), d=r (output dim).
+            # torch.einsum avoids the batch-size mismatch issue of torch.bmm
+            # and the broadcasting complexity of torch.matmul.
+            return torch.einsum("bgd,grd->bgr", x, w_3d)
+
+        # ---- plain linear -----------------------------------------------------
+        return torch.nn.functional.linear(x, w_bf16, bias)
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # SM80 (Ampere/A800): no FP8 tensor cores — dequantize to BF16 and use
+        # torch matmul instead of any FP8 kernel backend.
+        if current_platform.is_sm80_context():
+            return self._apply_bf16_sm80(layer, x, bias)
+
         # if batch invariant mode is enabled, prefer direct FP8 path
         # we will use BF16 dequant when direct FP8 is not supported.
         if envs.VLLM_BATCH_INVARIANT:

@@ -68,7 +68,7 @@ def deep_gemm_fp8_o_proj(
     # weight_scale_inv. Non-Marlin kernels keep the on-disk weight_scale name.
     wo_a_scale = getattr(wo_a, "weight_scale_inv", None)
     if wo_a_scale is None:
-        wo_a_scale = wo_a.weight_scale
+        wo_a_scale = getattr(wo_a, "weight_scale", None)
     if _use_deepseek_v4_sm12x_triton_fp8_einsum(
         "bhr,hdr->bhd", list(einsum_recipe), wo_a_scale
     ):

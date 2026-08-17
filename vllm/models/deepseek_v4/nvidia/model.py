@@ -19,11 +19,21 @@ from vllm.distributed import (
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
-from vllm.model_executor.kernels.mhc.tilelang import (
-    hc_head_fused_kernel_tilelang,
-    mhc_fused_post_pre_tilelang,
-    mhc_post_tilelang,
-    mhc_pre_tilelang,
+try:
+    from vllm.model_executor.kernels.mhc.tilelang import (
+        hc_head_fused_kernel_tilelang,
+        mhc_fused_post_pre_tilelang,
+        mhc_post_tilelang,
+        mhc_pre_tilelang,
+    )
+    _has_tilelang_kernels = True
+except (ImportError, RuntimeError):
+    _has_tilelang_kernels = False
+from vllm.model_executor.kernels.mhc.torch import (
+    hc_head_fused_torch,
+    mhc_fused_post_pre_torch,
+    mhc_post_torch,
+    mhc_pre_torch,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -796,6 +806,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     ):
         return DeepseekV4FlashMLAAttention
 
+    # SM80 (Ampere/A800): use FlashMLAAttention layer with BF16 O-proj
+    # fallback and MHU torch functions. The SM120 check below would normally
+    # route to FlashInfer, but under FORCE_SM80 we must simulate SM80 paths.
+    if current_platform.is_sm80_context():
+        return DeepseekV4FlashMLAAttention
     if device_capability is not None and device_capability.major == 12:
         if envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE:
             from vllm.utils.flashinfer import (
@@ -904,12 +919,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from vllm.platforms import current_platform
+        _sm80 = current_platform.is_sm80_context() or not _has_tilelang_kernels
+        _pre = mhc_pre_torch if _sm80 else mhc_pre_tilelang
+        _fused = mhc_fused_post_pre_torch if _sm80 else mhc_fused_post_pre_tilelang
+        _post = mhc_post_torch if _sm80 else mhc_post_tilelang
+
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
-            # Run standalone mhc_pre on first layer
             residual = x
-            post_mix, res_mix, x = mhc_pre_tilelang(
+            post_mix, res_mix, x = _pre(
                 x,
                 self.hc_attn_fn,
                 self.hc_attn_scale,
@@ -923,7 +943,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=attn_norm_eps,
             )
         else:
-            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+            residual, post_mix, res_mix, x = _fused(
                 x,
                 residual,
                 post_mix,
@@ -943,7 +963,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         # attn_norm is fused into mhc_pre_tilelang / mhc_fused_post_pre above.
+        if os.environ.get("VLLM_PROFILE"):
+            _pa = torch.cuda.Event(enable_timing=True)
+            _pa.record()
         x = self.attn(positions, x, None)
+        if os.environ.get("VLLM_PROFILE"):
+            _qa = torch.cuda.Event(enable_timing=True)
+            _qa.record()
+            torch.cuda.synchronize()
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"attn {_pa.elapsed_time(_qa):.3f}ms M={x.shape[0]}\n")
         if os.environ.get("VLLM_DUMP_HIDDEN"):
             try:
                 import json as _json
@@ -968,7 +997,17 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+        import os as _os
+        if _os.environ.get("VLLM_DBG_OPROJ"):
+            print(
+                f"[mhc-dbg] x={tuple(x.shape)} residual={tuple(residual.shape)} "
+                f"post_mix={tuple(post_mix.shape)} res_mix={tuple(res_mix.shape)} "
+                f"hc_ffn_fn={tuple(self.hc_ffn_fn.shape)} "
+                f"hc_ffn_scale={tuple(self.hc_ffn_scale.shape)} "
+                f"hc_ffn_base={tuple(self.hc_ffn_base.shape)}",
+                flush=True,
+            )
+        residual, post_mix, res_mix, x = _fused(
             x,
             residual,
             post_mix,
@@ -1009,12 +1048,37 @@ class DeepseekV4DecoderLayer(nn.Module):
                     _f.write(_json.dumps(_stats) + "\n")
             except Exception:
                 pass
+        if os.environ.get("VLLM_DUMP_HIDDEN_FULL"):
+            try:
+                import json as _json
+                torch.cuda.synchronize()
+                _ffn_out = x.detach().float().cpu()
+                with open(os.environ["VLLM_DUMP_HIDDEN_FULL"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "ffn_out_full",
+                        "shape": list(x.shape),
+                        "data": _ffn_out[:4].reshape(-1).tolist(),  # 4 tokens x 4096
+                    }) + "\n")
+            except Exception:
+                pass
         return x, residual, post_mix, res_mix
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
+        # SM80 (Ampere/A800): override sparse MLA backend to pure-Triton
+        # path.  FlashMLA (SM90+) and FlashInfer (SM120) backends are not
+        # available on SM80.
+        if current_platform.is_sm80_context():
+            from vllm.v1.attention.backends.registry import (
+                AttentionBackendEnum,
+            )
+            vllm_config.attention_config.backend = (
+                AttentionBackendEnum.TRITON_MLA_SPARSE
+            )
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -1139,6 +1203,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        from vllm.platforms import current_platform
+        _sm80_m = current_platform.is_sm80_context() or not _has_tilelang_kernels
+        _post_m = mhc_post_torch if _sm80_m else mhc_post_tilelang
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1159,6 +1226,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            layer._active_idx = idx  # for component-level dump hooks
+            if os.environ.get("VLLM_DUMP_HIDDEN"):
+                try:
+                    import json as _json
+                    h = hidden_states.detach().float().cpu()  # .cpu() syncs kernels
+                    _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+                    _stats = {
+                        "rank": _rank, "layer": idx,
+                        "shape": list(hidden_states.shape),
+                        "mean": round(h.mean().item(), 6),
+                        "std": round(h.std().item(), 6),
+                        "l2": round((h.norm().item() / (h.numel() ** 0.5)), 6),
+                        "max_abs": round(h.abs().max().item(), 6),
+                    }
+                    with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                        _f.write(_json.dumps(_stats) + "\n")
+                except Exception:
+                    pass
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1169,7 +1254,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
+                aux_recon = _post_m(
                     hidden_states, residual, post_mix, res_mix
                 )
                 aux_hidden_states.append(aux_recon.mean(dim=1))
@@ -1179,7 +1264,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
             else:
-                hidden_states = mhc_post_tilelang(
+                hidden_states = _post_m(
                     hidden_states, residual, post_mix, res_mix
                 )
 
@@ -1190,7 +1275,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = hc_head_fused_kernel_tilelang(
+        _hc_head = hc_head_fused_torch if (current_platform.is_sm80_context() or not _has_tilelang_kernels) else hc_head_fused_kernel_tilelang
+        hidden_states = _hc_head(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,
@@ -1499,9 +1585,18 @@ class DeepseekV4ForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if os.environ.get("VLLM_PROFILE"):
+            _tf0 = torch.cuda.Event(enable_timing=True)
+            _tf1 = torch.cuda.Event(enable_timing=True)
+            _tf0.record()
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+        if os.environ.get("VLLM_PROFILE"):
+            _tf1.record()
+            torch.cuda.synchronize()
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"model_fwd {_tf0.elapsed_time(_tf1):.3f}ms M={input_ids.shape[0]}\n")
         return hidden_states
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:

@@ -72,9 +72,10 @@ def kernel_warmup(worker: "Worker"):
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
-    # Deep GEMM warmup
+    # Deep GEMM warmup (skip on SM80: no FP8 tensor cores → BF16 fallback)
     do_deep_gemm_warmup = (
-        envs.VLLM_USE_DEEP_GEMM
+        not current_platform.is_sm80_context()
+        and envs.VLLM_USE_DEEP_GEMM
         and is_deep_gemm_supported()
         and envs.VLLM_DEEP_GEMM_WARMUP != "skip"
     )

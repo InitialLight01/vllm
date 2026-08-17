@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -537,6 +539,25 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         assert self.w1_scale is not None
         assert self.w2_scale is not None
 
+        if os.environ.get("VLLM_DUMP_FC1"):
+            try:
+                import json as _json
+                _q = hidden_states.detach().float().cpu()
+                _s = a1q_scale.detach().float().cpu()
+                with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else -1,
+                        "backend": "deepgemm",
+                        "pre_qdq": _q[:1].reshape(-1)[:64].tolist(),
+                        "scale": _s[:8].tolist(),
+                        "row0_full": _q[0].tolist(),
+                        "scale_full": _s[0].tolist(),
+                        "mm1_row0_full": None,  # placeholder (real dump below)
+                    }) + "\n")
+            except Exception:
+                pass
+
         a1q = hidden_states
         _, N, _ = w1.size()
         # K comes from activations (full hidden dim), not from w1 which is
@@ -583,7 +604,21 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 recipe_a=(1, self._ACT_BLOCK_K),
                 recipe_b=(1, self._WEIGHT_BLOCK_K),
             )
-
+            if os.environ.get("VLLM_DUMP_FC1"):
+                try:
+                    import json as _json
+                    _m1 = mm1_out.detach().float().cpu()
+                    _eids = expert_ids.detach().cpu()
+                    with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                        _f.write(_json.dumps({
+                            "rank": torch.distributed.get_rank()
+                            if torch.distributed.is_initialized() else -1,
+                            "backend": "deepgemm",
+                            "expert0": int(_eids[0]),
+                            "mm1_row0_full": _m1[0].tolist(),
+                        }) + "\n")
+                except Exception:
+                    pass
             # SwiGLU activation + FP8 requant
             activation_out_dim = self.adjust_N_for_activation(N, activation)
             quant_out = _resize_cache(
@@ -603,6 +638,36 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 recipe_a=(1, self._ACT_BLOCK_K),
                 recipe_b=(1, self._WEIGHT_BLOCK_K),
             )
+            if os.environ.get("VLLM_DUMP_FC1") and os.environ.get("VLLM_DUMP_FC1_MM2"):
+                try:
+                    import json as _json
+                    _m2 = mm2_out.detach().float().cpu()
+                    _eids = expert_ids.detach().cpu()
+                    with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                        _f.write(_json.dumps({
+                            "rank": torch.distributed.get_rank()
+                            if torch.distributed.is_initialized() else -1,
+                            "backend": "deepgemm_mm2",
+                            "expert0": int(_eids[0]),
+                            "mm2_row0_full": _m2[0].tolist(),
+                        }) + "\n")
+                except Exception:
+                    pass
+            if os.environ.get("VLLM_DUMP_FC1") and os.environ.get("VLLM_DUMP_FC1_MM2"):
+                try:
+                    import json as _json
+                    _a2q = a2q.detach().float().cpu()
+                    _s2 = a2q_scale.detach().float().cpu()
+                    with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                        _f.write(_json.dumps({
+                            "rank": torch.distributed.get_rank()
+                            if torch.distributed.is_initialized() else -1,
+                            "backend": "deepgemm_a2q",
+                            "a2q_first16": _a2q[:1].reshape(-1)[:16].tolist(),
+                            "a2q_scale_first8": _s2[:8].tolist(),
+                        }) + "\n")
+                except Exception:
+                    pass
 
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)

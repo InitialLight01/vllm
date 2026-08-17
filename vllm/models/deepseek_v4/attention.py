@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -327,6 +328,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if os.environ.get("VLLM_DUMP_HIDDEN"):
+            try:
+                import json as _json
+                with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "attn_fwd_enter",
+                        "cls": type(self).__name__,
+                        "hs_shape": list(hidden_states.shape),
+                    }) + "\n")
+            except Exception:
+                pass
+
         # Pre-allocate attention output with FlashMLA-padded head count.
         # The op writes into `o_padded`; we slice to n_local_heads after.
         num_tokens = hidden_states.shape[0]
@@ -339,6 +353,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Metadata-independent input GEMMs + RMSNorm stay in the captured
         # graph; the metadata-dependent rest (q up-proj + kv-insert, indexer,
         # compressor, MLA attention) runs in the eager break.
+        if os.environ.get("VLLM_PROFILE"):
+            _tqkv0 = torch.cuda.Event(enable_timing=True)
+            _tqkv1 = torch.cuda.Event(enable_timing=True)
+            _tqkv0.record()
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
             self.attn_gemm_parallel_execute(hidden_states)
         )
@@ -350,10 +368,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.kv_norm.weight.data,
             self.eps,
         )
+        if os.environ.get("VLLM_PROFILE"):
+            _tqkv1.record()
+            torch.cuda.synchronize()
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"attn_qkv {_tqkv0.elapsed_time(_tqkv1):.3f}ms\n")
 
         # attention_impl is wrapped with @eager_break_during_capture: this is
         # where the breakable cudagraph capture breaks (the attention op runs
         # eagerly between captured graph segments).
+        if os.environ.get("VLLM_PROFILE"):
+            _tatt0 = torch.cuda.Event(enable_timing=True)
+            _tatt1 = torch.cuda.Event(enable_timing=True)
+            _tatt0.record()
         self.attention_impl(
             hidden_states,
             qr,
@@ -365,9 +392,61 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
         o = o_padded[:, : self.n_local_heads, :]
+        if os.environ.get("VLLM_PROFILE"):
+            _tatt1.record()
+            torch.cuda.synchronize()
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"attn_impl {_tatt0.elapsed_time(_tatt1):.3f}ms\n")
+        if os.environ.get("VLLM_DUMP_HIDDEN"):
+            try:
+                import json as _json
+                torch.cuda.synchronize()
+                _o_stats = o.detach().float().cpu()
+                _o_pad_stats = o_padded.detach().float().cpu()
+                with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "layer": getattr(self, "_active_idx", -1),
+                        "comp": "attn_o_pre_proj",
+                        "shape": list(o.shape),
+                        "nz": int((_o_stats != 0).sum().item()),
+                        "mean": round(_o_stats.mean().item(), 6),
+                        "std": round(_o_stats.std().item(), 6),
+                        "max_abs": round(_o_stats.abs().max().item(), 6),
+                        "o_padded_nz": int((_o_pad_stats != 0).sum().item()),
+                        "o_padded_mean": round(_o_pad_stats.mean().item(), 6),
+                        "impl": type(self.attention_impl).__name__,
+                        "num_tokens": int(hidden_states.shape[0]),
+                    }) + "\n")
+            except Exception:
+                pass
+        if os.environ.get("VLLM_DUMP_HIDDEN_FULL"):
+            try:
+                import json as _json
+                torch.cuda.synchronize()
+                _o_stats = o.detach().float().cpu()
+                with open(os.environ["VLLM_DUMP_HIDDEN_FULL"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "attn_o_pre_proj_full",
+                        "shape": list(o.shape),
+                        "data": _o_stats[:4].reshape(-1).tolist(),  # 4 tokens x heads*head_dim
+                    }) + "\n")
+            except Exception:
+                pass
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
-        return self._o_proj(o, positions)
+        if os.environ.get("VLLM_PROFILE"):
+            _top0 = torch.cuda.Event(enable_timing=True)
+            _top1 = torch.cuda.Event(enable_timing=True)
+            _top0.record()
+        _r = self._o_proj(o, positions)
+        if os.environ.get("VLLM_PROFILE"):
+            _top1.record()
+            torch.cuda.synchronize()
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"attn_oproj {_top0.elapsed_time(_top1):.3f}ms\n")
+        return _r
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
         aux_streams = self.aux_stream_list

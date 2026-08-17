@@ -4,6 +4,8 @@ from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -839,6 +841,24 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
             )
+
+            if os.environ.get("VLLM_DUMP_FFN_FULL"):
+                try:
+                    import json as _json
+                    torch.cuda.synchronize()
+                    _fout = hidden_states.detach().float().cpu()
+                    _sout = shared_output.detach().float().cpu()
+                    with open(os.environ["VLLM_DUMP_FFN_FULL"], "a") as _f:
+                        _f.write(_json.dumps({
+                            "rank": torch.distributed.get_rank()
+                            if torch.distributed.is_initialized() else -1,
+                            "layer": self.layer_id,
+                            "shape": list(hidden_states.shape),
+                            "routed": _fout[:2].reshape(-1).tolist(),
+                            "shared": _sout[:2].reshape(-1).tolist(),
+                        }) + "\n")
+                except Exception:
+                    pass
 
             return self._maybe_combine(
                 shared_output,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -20,6 +21,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
 )
+from vllm.platforms import current_platform
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
@@ -28,6 +30,90 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+
+def _o_proj_bf16_sm80(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a: torch.nn.Module,
+    wo_b: torch.nn.Module,
+    *,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    o_lora_rank: int,
+) -> torch.Tensor:
+    """O-projection BF16 fallback for SM80 (no DeepGEMM/fp8_einsum).
+
+    Replaces fused_inv_rope_fp8_quant + fp8_einsum with pure torch ops.
+    Follows the same inverse-RoPE logic as the FP8 path but skips quantization.
+    """
+    num_tokens, num_heads, head_dim = o.shape
+    assert head_dim == nope_dim + rope_dim, f"{head_dim} != {nope_dim}+{rope_dim}"
+    assert rope_dim % 2 == 0
+    assert cos_sin_cache.shape[-1] == rope_dim
+
+    # Inverse RoPE: follow the same pattern as fused_inv_rope_fp8_quant.
+    # cos_sin_cache layout: [max_pos, rope_dim], first half cos, second half sin.
+    # For GPT-J (interleaved pairs): pair (2i, 2i+1) shares one (cos, sin).
+    half_rope = rope_dim // 2
+    cos = cos_sin_cache[positions][:, :half_rope]   # [T, half_rope]
+    sin = cos_sin_cache[positions][:, half_rope:]   # [T, half_rope]
+
+    nope_part = o[..., :nope_dim]                      # [T, H, nope]
+    rope_part = o[..., nope_dim:]                       # [T, H, rope]
+    # Reshape rope to pair format: [T, H, half_rope, 2]
+    rope_pairs = rope_part.reshape(num_tokens, num_heads, half_rope, 2)
+    # cos/sin: [T, 1, half_rope] — broadcast over heads, NOT [T, 1, R, 1]
+    # which would collide with x's token dim when broadcast (→ [T, T, H, R] OOM).
+    cos = cos.view(num_tokens, 1, half_rope)
+    sin = sin.view(num_tokens, 1, half_rope)
+    # Inverse RoPE (GPT-J interleaved): inv(x_2i, x_2i+1) =
+    #   (x_2i*cos + x_2i+1*sin,  -x_2i*sin + x_2i+1*cos)
+    x, y = rope_pairs[..., 0], rope_pairs[..., 1]
+    x_inv = x * cos + y * sin
+    y_inv = -x * sin + y * cos
+    rope_inv = torch.stack([x_inv, y_inv], dim=-1).reshape(num_tokens, num_heads, rope_dim)
+
+    o_full = torch.cat([nope_part, rope_inv], dim=-1)
+
+    from vllm.model_executor.layers.quantization.fp8 import (
+        Fp8LinearMethod,
+    )
+
+    if isinstance(getattr(wo_a, "quant_method", None), Fp8LinearMethod):
+        # FP8 EMULATION (official checkpoint): grouped BMM semantics —
+        # wo_a is a bmm layer (is_bmm=True) whose forward does
+        # einsum("bgd,grd->bgr") and expects the grouped 3D input.
+        # This is the pre-c204a4de9 path, validated at 82% on 600q.
+        o_flat = o_full.reshape(num_tokens, n_groups, heads_per_group * head_dim)
+        o_flat = o_flat.to(torch.bfloat16)
+        z = wo_a(o_flat).to(torch.bfloat16)
+        return wo_b(z.flatten(1))
+
+    # compressed-tensors (W4A16 humming): no bmm support in the scheme.
+    # wo_a (TP=2) is [4096, 4096] = n_local_groups row-blocks of
+    # [2048, 4096], one per attention group. The W4A16 checkpoint keeps
+    # the official per-group layout (the 4 row-blocks are DIFFERENT
+    # matrices, cos<0.001 — NOT a shared matrix), so each group must
+    # multiply with its own row-block. o here is the local view
+    # [T, n_local_heads, head_dim]; group gl consumes heads
+    # [gl*8:(gl+1)*8] (4096-dim input) and emits wo_a rows
+    # [2048*gl:2048*(gl+1)].
+    n_local_groups = n_groups
+    hpg_local = num_heads // n_local_groups  # 8 heads per local group
+    _out_per_group = wo_a.output_size_per_partition // n_local_groups
+    outs = []
+    for gl in range(n_local_groups):
+        hs = gl * hpg_local
+        x_g = o_full[:, hs:hs + hpg_local, :].reshape(num_tokens, -1)
+        x_g = x_g.to(torch.bfloat16)
+        y_g = wo_a(x_g).to(torch.bfloat16)  # [T, out_per_partition]
+        outs.append(y_g[:, gl * _out_per_group:(gl + 1) * _out_per_group])
+    z = torch.cat(outs, dim=-1)  # [T, n_local_groups * 2048]
+    return wo_b(z).to(torch.bfloat16)
 
 
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
@@ -40,6 +126,68 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization.fp8 import (
+            Fp8LinearMethod,
+        )
+
+        # The BF16 emulation path only applies to FP8-quantized o_proj
+        # weights (dequantize -> matmul). W4A16 / compressed-tensors
+        # checkpoints have their own kernels (humming/marlin) and must NOT
+        # take this path even under VLLM_FORCE_SM80 (their quant method
+        # dispatches internally; feeding the grouped o_flat shape here
+        # breaks their expected in_features).
+        if isinstance(getattr(self.wo_a, "quant_method", None), Fp8LinearMethod):
+            pass  # FP8 emulation path below
+        else:
+            import os
+            if os.environ.get("VLLM_DBG_OPROJ"):
+                _wa = self.wo_a
+                _attrs = {
+                    k: tuple(v.shape) if hasattr(v, "shape") else v
+                    for k, v in vars(_wa).items()
+                    if isinstance(v, torch.Tensor) and "scale" not in k
+                }
+                print(
+                    f"[oproj-dbg] o={tuple(o.shape)} n_groups={self.n_local_groups} "
+                    f"hpg={self.n_local_heads // self.n_local_groups} "
+                    f"wo_a_tensors={ {k: v for k, v in list(_attrs.items())[:4]} } "
+                    f"in_part={getattr(_wa, 'input_size_per_partition', None)} "
+                    f"out_parts={getattr(_wa, 'output_partition_sizes', None)} "
+                    f"in_size={getattr(_wa, 'input_size', None)}",
+                    flush=True,
+                )
+        if current_platform.is_sm80_context():
+            # Works for both FP8-emulation and compressed-tensors quantized
+            # o_proj weights: each path's wo_a/wo_b forward handles its own
+            # quantization; the per-group 3D input layout
+            # [T, n_groups, heads_per_group * head_dim] matches both.
+            return _o_proj_bf16_sm80(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a,
+                self.wo_b,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                o_lora_rank=self.o_lora_rank,
+            )
+        if not isinstance(getattr(self.wo_a, "quant_method", None), Fp8LinearMethod):
+            # compressed-tensors o_proj outside SM80 context: deep_gemm is
+            # FP8-specific; fall back to the generic path.
+            return _o_proj_bf16_sm80(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a,
+                self.wo_b,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                o_lora_rank=self.o_lora_rank,
+            )
         return deep_gemm_fp8_o_proj(
             o,
             positions,
@@ -209,12 +357,28 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 f"Unsupported compress_ratio={self.compress_ratio}; "
                 "expected 1, 4, or 128."
             )
-        assert tile_metadata is not None, (
-            "swa_metadata missing tile_sched entry for "
-            f"compress_ratio={self.compress_ratio}; "
-            "DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not "
-            "allocate one for this layer type."
-        )
+        if tile_metadata is None and not current_platform.is_sm80_context():
+            # Warmup / profile_run may not allocate tile_scheduler entries for
+            # every layer type on non-SM80 paths.  On SM80 the pure-Triton
+            # fallback (_flash_mla_with_kvcache_triton) does not require
+            # tile_scheduler_metadata.
+            output.zero_()
+            return
+
+        if os.environ.get("VLLM_DUMP_HIDDEN"):
+            try:
+                import json as _json
+                with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "comp": "decode_call_flashmla",
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "impl": flash_mla_with_kvcache.__name__,
+                        "swa_only": bool(swa_only),
+                        "topk_indices": None if topk_indices is None else list(topk_indices.shape),
+                        "tile_metadata": None if tile_metadata is None else "set",
+                    }) + "\n")
+            except Exception:
+                pass
 
         out, _ = flash_mla_with_kvcache(
             q=q,

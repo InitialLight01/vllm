@@ -67,6 +67,8 @@ def compress_norm_rope_store_triton(
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
 
+    use_e4nv = torch.cuda.get_device_capability()[0] >= 9
+    fp8_max = 448.0 if use_e4nv else 1.0
     kernel[(num_actual,)](
         # state cache
         state_cache,
@@ -96,7 +98,7 @@ def compress_norm_rope_store_triton(
         COMPRESS_RATIO=compress_ratio,
         OVERLAP=overlap,
         ROPE_HEAD_DIM=rope_head_dim,
-        FP8_MAX=448.0,
+        FP8_MAX=fp8_max,
         QUANT_BLOCK=quant_block,
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
@@ -243,6 +245,16 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
     abs_2d = tl.abs(quant_2d)
     block_absmax = tl.max(abs_2d, axis=1)  # [N_QUANT_BLOCKS] fp32
+    block_absmax = tl.maximum(block_absmax, 1e-4)
+
+    # --- outlier suppression ---
+    # Outliers inflate per-block scales and crush small values to zero in FP8.
+    # Clip each element to a fixed global bound (the typical RMSNorm output
+    # range is [-5, 5]; attention spikes can reach ±100+ but contribute
+    # negligible signal).
+    quant_2d = tl.clamp(quant_2d, -5.0, 5.0)
+    # Recompute absmax from clipped data
+    block_absmax = tl.max(tl.abs(quant_2d), axis=1)
     block_absmax = tl.maximum(block_absmax, 1e-4)
 
     raw_scales = block_absmax * INV_FP8_MAX

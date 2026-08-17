@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton-based MoE expert implementations."""
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -49,6 +51,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+# debug counter for VLLM_DUMP_SILU (per-process)
+_SILU_DUMP_N = [0]
 
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
@@ -251,6 +256,21 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 self.block_shape,
                 quantization_emulation=self.quantization_emulation,
             )
+            if os.environ.get("VLLM_DUMP_FC1"):
+                try:
+                    import json as _json
+                    _h = hidden_states.detach().float().cpu()
+                    _l = lora_unquantized_hidden_states.detach().float().cpu()
+                    with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                        _f.write(_json.dumps({
+                            "rank": torch.distributed.get_rank()
+                            if torch.distributed.is_initialized() else -1,
+                            "pre_qdq": _l[:1].reshape(-1)[:64].tolist(),
+                            "post_qdq": _h[0].tolist(),
+                            "qtype": str(self.quant_dtype),
+                        }) + "\n")
+                except Exception:
+                    pass
 
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
@@ -344,6 +364,26 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         )
 
         def _base_w13_fn():
+            if os.environ.get("VLLM_DUMP_FC1"):
+                try:
+                    import json as _json
+                    _eids = expert_ids.detach().cpu()
+                    _st = sorted_token_ids.detach().cpu()
+                    _w1e0 = w1[0].detach().float().cpu()
+                    with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                        _f.write(_json.dumps({
+                            "rank": torch.distributed.get_rank()
+                            if torch.distributed.is_initialized() else -1,
+                            "backend": "emu_fc1args",
+                            "expert_ids8": [int(v) for v in _eids[:8].tolist()],
+                            "expert_ids_shape": list(expert_ids.shape),
+                            "sorted8": [int(v) for v in _st[:8].tolist()],
+                            "num_padded": int(num_tokens_post_padded.item()),
+                            "w1e0_first8": [float(v) for v in _w1e0[0][:8].tolist()],
+                            "w1e0_row1_first8": [float(v) for v in _w1e0[1][:8].tolist()],
+                        }) + "\n")
+                except Exception:
+                    pass
             invoke_fused_moe_triton_kernel(
                 hidden_states,
                 w1,
@@ -427,6 +467,23 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
         a2q_scale: torch.Tensor | None = None
 
+        if os.environ.get("VLLM_DUMP_FC1"):
+            try:
+                import json as _json
+                _x1c = intermediate_cache1.detach().float().cpu()
+                _topk0 = _json.loads(
+                    os.environ.get("VLLM_DUMP_CHUNK_TOPK0", "[]")
+                )
+                with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else -1,
+                        "topk0": _topk0,
+                        "mm1_token0": _x1c[0].reshape(-1).tolist(),  # 6 slots x N
+                    }) + "\n")
+            except Exception:
+                pass
+
         # Fuse SiLU+Mul + FP8 block quantize into a single kernel
         # when conditions permit (gated SiLU, fp8 block quant with
         # group_size=128, no LoRA requiring the BF16 intermediate).
@@ -443,18 +500,114 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 quant_dtype=current_platform.fp8_dtype(),
             )
         else:
-            self.activation(
-                activation, intermediate_cache2, intermediate_cache1.view(-1, N)
-            )
+            if (
+                self.quantization_emulation
+                and os.environ.get("VLLM_EMU_DG_ACT")
+                and activation == MoEActivation.SILU
+            ):
+                # Bit-match DeepGEMM's FC2 activation path: silu computed in
+                # FP32 (alpha=1, beta=0), rounded through BF16, then FP8
+                # per-token-group-128 UE8M0 QDQ — identical to the fused
+                # silu+quant kernel DeepGEMM uses. Dequantizing back to BF16
+                # (qA * 2^s is exact in BF16) keeps the BF16 matmul below
+                # mathematically equivalent to DeepGEMM's qA*scale compute.
+                from vllm.model_executor.layers.fused_moe.utils import (
+                    _fp8_ptg_quant_dequant_ue8m0,
+                )
 
-            qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-                intermediate_cache2,
-                a2_scale,
-                self.quant_dtype,
-                self.per_act_token_quant,
-                self.block_shape,
-                quantization_emulation=self.quantization_emulation,
-            )
+                _x1 = intermediate_cache1.view(-1, N)
+                _g = _x1[:, : N // 2].float()
+                _u = _x1[:, N // 2 :].float()
+                # glu = gate / (1 + exp(-gate)) = gate * sigmoid(gate);
+                # y = (up + beta) * glu — bit-matches DeepGEMM's fused
+                # silu_mul_fp8_quant_packed (alpha=1, beta=0).
+                _glu = _g / (1.0 + torch.exp(-_g))
+                _y = (_u * _glu).to(torch.bfloat16).to(torch.float32)
+                if os.environ.get("VLLM_DUMP_SILU") and os.path.exists(
+                    os.environ.get(
+                        "VLLM_DUMP_SILU_TRIGGER", "/root/autodl-tmp/tmp/.silu_trigger"
+                    )
+                ):
+                    try:
+                        import json as _json
+                        _SILU_DUMP_N[0] += 1
+                        _n = _SILU_DUMP_N[0]
+                        _full = True  # trigger-gated runs are small; dump everything
+                        _x1c = intermediate_cache1.detach().float().cpu()
+                        _yc = _y.detach().float().cpu()
+                        _eids = expert_ids.detach().cpu()
+                        _chunk = _json.loads(
+                            os.environ.get("VLLM_DUMP_CHUNK_EXPERTS", "[]")
+                        )
+                        _glob = [
+                            _chunk[e] if e < len(_chunk) else e
+                            for e in [int(v) for v in _eids[:24].tolist()]
+                        ]
+                        with open(os.environ["VLLM_DUMP_SILU"], "a") as _f:
+                            _f.write(_json.dumps({
+                                "n": _n,
+                                "rank": torch.distributed.get_rank()
+                                if torch.distributed.is_initialized() else -1,
+                                "expert_ids": _glob,
+                                "fc1_out": _x1c[:8, :6].reshape(-1).tolist(),
+                                "silu_out": _yc[:8, :6].reshape(-1).tolist(),
+                                "fc1_row0_full": _x1c[0].tolist() if _full else None,
+                            }) + "\n")
+                    except Exception:
+                        pass
+                _q2, _ = _fp8_ptg_quant_dequant_ue8m0(_y, 128)
+                qintermediate_cache2 = _q2.to(torch.bfloat16)
+                if os.environ.get("VLLM_DUMP_FC1"):
+                    try:
+                        import json as _json
+                        _gc = _g.detach().float().cpu()
+                        _uc = _u.detach().float().cpu()
+                        _yc2 = _y.detach().float().cpu()
+                        _fc2in = qintermediate_cache2.detach().float().cpu()
+                        _eids = expert_ids.detach().cpu()
+                        _stids = sorted_token_ids.detach().cpu()
+                        _chunk = _json.loads(
+                            os.environ.get("VLLM_DUMP_CHUNK_EXPERTS", "[]")
+                        )
+                        _e0 = _chunk[int(_eids[0])] if len(_chunk) > int(_eids[0]) else int(_eids[0])
+                        with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                            _f.write(_json.dumps({
+                                "rank": torch.distributed.get_rank()
+                                if torch.distributed.is_initialized() else -1,
+                                "row0_expert": _e0,
+                                "local_ids0": [int(v) for v in _eids[:6].tolist()],
+                                "sorted_tokens0": [int(v) for v in _stids[:8].tolist()],
+                                "w1_shape": list(w1.shape),
+                                "hs_shape_silu": list(hidden_states.shape),
+                                "ic1_shape": list(intermediate_cache1.shape),
+                                "w1_e0_rows0_4": [float(v) for v in w1[0][:4].reshape(-1).tolist()],
+                                "row0_input_full": hidden_states.detach().float().cpu()[
+                                    int(_stids[0]) // top_k_num
+                                ].tolist(),
+                                "row0_input_flat": hidden_states.detach().float().cpu()[
+                                    int(_stids[0])
+                                ].tolist(),
+                                "gate_row0": _gc[0].tolist(),
+                                "up_row0": _uc[0].tolist(),
+                                "silu_row0": _yc2[0].tolist(),
+                                "fc2in_row0": _fc2in[0].tolist(),
+                            }) + "\n")
+                    except Exception:
+                        pass
+                a2q_scale = None
+            else:
+                self.activation(
+                    activation, intermediate_cache2, intermediate_cache1.view(-1, N)
+                )
+
+                qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+                    intermediate_cache2,
+                    a2_scale,
+                    self.quant_dtype,
+                    self.per_act_token_quant,
+                    self.block_shape,
+                    quantization_emulation=self.quantization_emulation,
+                )
 
         # LoRA w2: applied to intermediate_cache3 before moe_sum, using the
         # unquantized intermediate_cache2 as the lora_a input.  Reuses the
@@ -531,6 +684,28 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                     w2=w2,
                     top_k_num=top_k_num,
                 )
+
+        if os.environ.get("VLLM_DUMP_FC1"):
+            try:
+                import json as _json
+                _x3c = intermediate_cache3.detach().float().cpu()
+                _eids = expert_ids.detach().cpu()
+                _chunk = _json.loads(
+                    os.environ.get("VLLM_DUMP_CHUNK_EXPERTS", "[]")
+                )
+                _glob = [
+                    _chunk[e] if e < len(_chunk) else e
+                    for e in [int(v) for v in _eids[:6].tolist()]
+                ]
+                with open(os.environ["VLLM_DUMP_FC1"], "a") as _f:
+                    _f.write(_json.dumps({
+                        "rank": torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else -1,
+                        "row0_experts": _glob,
+                        "fc2_row0": _x3c[0, 0].tolist(),  # first sorted row, K
+                    }) + "\n")
+            except Exception:
+                pass
 
         # separate function is required for MoE + LoRA
         self.moe_sum(intermediate_cache3, output)

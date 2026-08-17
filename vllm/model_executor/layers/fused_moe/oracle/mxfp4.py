@@ -329,6 +329,7 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
     Get available backends in priority order. SM100+ prefers DeepGEMM FP4 /
     TRTLLM MXFP8; SM90 falls through to Triton_unfused or Marlin (the
     backend-level ``is_supported_config`` check filters by device capability).
+    SM80 (Ampere/A800) uses EMULATION backend with lazy MXFP4→BF16 dequant.
     """
     if current_platform.is_rocm():
         return [Mxfp4MoeBackend.AITER_MXFP4_BF16]
@@ -336,7 +337,10 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
         return [Mxfp4MoeBackend.XPU]
     _AVAILABLE_BACKENDS = [
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
-        Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+        # SM80: use EMULATION (lazy dequant) instead of DeepGEMM which
+        # requires SM90+.  On SM90/SM120, DeepGEMM is preferred.
+        Mxfp4MoeBackend.EMULATION if current_platform.is_sm80_context()
+        else Mxfp4MoeBackend.DEEPGEMM_MXFP4,
         # TRITON_UNFUSED has bug with MTP support
         # TODO re-enable after kernel is fixed
         # TRITON_UNFUSED
@@ -1555,10 +1559,25 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
+    elif mxfp4_backend == Mxfp4MoeBackend.EMULATION:
+        # EMULATION backend: weights stay in packed MXFP4 format.
+        # Dequantization is done on-the-fly in OCP_MXQuantizationEmulationTritonExperts.apply().
+        if w13_bias is not None:
+            w13_bias = w13_bias.to(torch.float32)
+        if w2_bias is not None:
+            w2_bias = w2_bias.to(torch.float32)
+        return (
+            w13_weight,
+            w2_weight,
+            w13_weight_scale,
+            w2_weight_scale,
+            w13_bias,
+            w2_bias,
+        )
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "
-            f"Expected TRTLLM, Triton, AITER, or XPU backend."
+            f"Expected TRTLLM, Triton, AITER, XPU, or EMULATION backend."
         )
 
 
