@@ -817,7 +817,8 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
                 "DeepSeek-V4 SM120 packed sparse-MLA decode is enabled "
                 f"(VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE=1) but: {reason}"
             )
-        return DeepseekV4FlashInferSM120Attention
+        # Explicit opt-out: upstream FlashMLA sparse-MLA path.
+        return DeepseekV4FlashMLAAttention
     return DeepseekV4FlashMLAAttention
 
 
