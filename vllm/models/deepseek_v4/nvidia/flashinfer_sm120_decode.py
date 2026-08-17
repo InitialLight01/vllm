@@ -34,7 +34,9 @@ from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops import compute_global_topk_indices_and_lens
-from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
+from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+    DeepseekV4FlashInferSM120Attention as _UpstreamSM120Attention,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -94,12 +96,44 @@ def _as_sparse_sm120_cache(kv_cache: torch.Tensor) -> torch.Tensor:
     return kv_cache.unsqueeze(-2)
 
 
-class DeepseekV4FlashInferSM120Attention(DeepseekV4FlashMLAAttention):
-    """FlashMLA V4 attention with the official FlashInfer SM120 packed decode.
+class DeepseekV4FlashInferSM120Attention(_UpstreamSM120Attention):
+    """Upstream SM120 attention with the direct FlashInfer packed decode.
 
-    Reuses every FlashMLA V4 behavior (packed ``fp8_ds_mla`` cache, metadata
-    pipeline, packed prefill); only :meth:`_forward_decode` differs.
+    NOTE (sm120-v0.25.0 port): codex bases this class on its reworked
+    FlashMLA prefill (D512 split kernels); our v0.25 base still routes
+    prefill through the FlashMLA sparse kernel, which only supports
+    SM90a/SM100f. We therefore subclass the UPSTREAM SM120 attention
+    (validated packed prefill + decode) and override only
+    :meth:`_forward_decode` with the direct low-level runner.
     """
+
+    @classmethod
+    def _reserve_prefill_workspace(
+        cls,
+        layer: "DeepseekV4FlashMLAAttention",
+    ) -> None:
+        """Mirror the FlashMLA warmup branch's bf16 gather reservation.
+
+        The codex base class gained a dedicated specs-driven reservation
+        method; our v0.25 base only reserves inside the warmup branch of
+        forward_mqa. Replicate that reservation here so the warmup path of
+        this subclass (which calls self._reserve_prefill_workspace) works.
+        """
+        try:
+            workspace_manager = current_workspace_manager()
+        except AssertionError:
+            return
+        swa_only = layer.compress_ratio <= 1
+        N = (
+            0
+            if swa_only
+            else (layer.max_model_len + layer.compress_ratio - 1)
+            // layer.compress_ratio
+        )
+        M = N + layer.window_size + layer.max_num_batched_tokens
+        workspace_manager.get_simultaneous(
+            ((layer.PREFILL_CHUNK_SIZE, M, layer.head_dim), torch.bfloat16),
+        )
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
