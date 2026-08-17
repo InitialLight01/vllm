@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -912,6 +913,27 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         # attn_norm is fused into mhc_pre_tilelang / mhc_fused_post_pre above.
         x = self.attn(positions, x, None)
+        if os.environ.get("VLLM_DUMP_HIDDEN"):
+            try:
+                import json as _json
+                torch.cuda.synchronize()  # sync ALL streams (aux streams too)
+                _attn_out = x.detach().float().cpu()
+                _stats = {
+                    "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    "layer": getattr(self, "_active_idx", -1),
+                    "fp": [round(float(v), 4) for v in self.hc_attn_base[:3].cpu().tolist()],
+                    "comp": "attn_out",
+                    "shape": list(x.shape),
+                    "nz": int((_attn_out != 0).sum().item()),
+                    "mean": round(_attn_out.mean().item(), 6),
+                    "std": round(_attn_out.std().item(), 6),
+                    "l2": round((_attn_out.norm().item() / (_attn_out.numel() ** 0.5)), 6),
+                    "max_abs": round(_attn_out.abs().max().item(), 6),
+                }
+                with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                    _f.write(_json.dumps(_stats) + "\n")
+            except Exception:
+                pass
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
@@ -935,6 +957,27 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
         x = self.ffn(x, input_ids)
+        if os.environ.get("VLLM_DUMP_HIDDEN"):
+            try:
+                import json as _json2
+                torch.cuda.synchronize()
+                _ffn_out = x.detach().float().cpu()
+                _stats = {
+                    "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    "layer": getattr(self, "_active_idx", -1),
+                    "fp": [round(float(v), 4) for v in self.hc_attn_base[:3].cpu().tolist()],
+                    "comp": "ffn_out",
+                    "shape": list(x.shape),
+                    "nz": int((_ffn_out != 0).sum().item()),
+                    "mean": round(_ffn_out.mean().item(), 6),
+                    "std": round(_ffn_out.std().item(), 6),
+                    "l2": round((_ffn_out.norm().item() / (_ffn_out.numel() ** 0.5)), 6),
+                    "max_abs": round(_ffn_out.abs().max().item(), 6),
+                }
+                with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
+                    _f.write(_json.dumps(_stats) + "\n")
+            except Exception:
+                pass
         return x, residual, post_mix, res_mix
 
 
