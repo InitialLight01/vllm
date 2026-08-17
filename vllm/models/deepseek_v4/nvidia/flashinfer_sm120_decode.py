@@ -251,6 +251,20 @@ class DeepseekV4FlashInferSM120Attention(_UpstreamSM120Attention):
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
 
+        # flashinfer >= 0.6.15 asserts num_tokens > 64 for the low-level
+        # runner (it is the MTP-verify multi-query kernel). Small decode
+        # batches (plain single-stream decode, DSpark draft forward with
+        # num_speculative_tokens) must stay on the upstream path.
+        if num_decode_tokens <= 64:
+            return super()._forward_decode(
+                q,
+                kv_cache,
+                swa_metadata,
+                attn_metadata,
+                swa_only,
+                output,
+            )
+
         # Identical decode-side index/length construction to the FlashMLA decode
         # path; only the kernel launch below differs.
         topk_indices = None
