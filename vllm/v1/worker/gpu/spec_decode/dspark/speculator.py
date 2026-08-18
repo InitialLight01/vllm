@@ -23,12 +23,16 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+import os
 from typing import Any
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.models.deepseek_v4.nvidia.dspark_triton import (
+    dspark_gumbel_argmax_sample,
+)
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
@@ -73,6 +77,27 @@ class DSparkSpeculator(DFlashSpeculator):
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
         self._d2t_scatter_index: torch.Tensor | None = None
         self._draft_scatter_buf: torch.Tensor | None = None
+
+        # Fused per-step Gumbel sampler (bit-exact replica of the eager
+        # gumbel_sample path, two launches instead of three + intermediates).
+        # Disable with VLLM_DSPARK_EAGER_GUMBEL=1.
+        self._use_fused_gumbel = os.environ.get("VLLM_DSPARK_EAGER_GUMBEL") is None
+        if self._use_fused_gumbel:
+            self._gumbel_num_blocks = (self.vocab_size + 1023) // 1024
+            self._gumbel_scratch = {
+                "block_gval": torch.zeros(
+                    self.max_num_reqs,
+                    self._gumbel_num_blocks,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "block_gid": torch.zeros(
+                    self.max_num_reqs,
+                    self._gumbel_num_blocks,
+                    dtype=torch.int64,
+                    device=device,
+                ),
+            }
 
     def load_draft_model(
         self,
@@ -131,17 +156,34 @@ class DSparkSpeculator(DFlashSpeculator):
                     logits_i = buf
                 # sample_pos is the predicted token's position Q; the target
                 # verifies it with the predecessor's Gumbel key (Q-1). Pass Q-1.
-                draft_sampled_i = gumbel_sample(
-                    logits_i,
-                    idx_map[:, i],
-                    self.temperature,
-                    self.seeds,
-                    sample_pos[:, i] - 1,
-                    apply_temperature=True,
-                    output_processed_logits=self.draft_logits,
-                    output_processed_logits_col=self._step_cols[i],
-                    use_fp64=self.use_fp64_gumbel,
-                )
+                if self._use_fused_gumbel:
+                    # Two-launch bit-exact replica of the eager gumbel_sample
+                    # path (dspark_gumbel_argmax_sample writes the temp-applied
+                    # logits into draft_logits[:, i, :] and the sampled token
+                    # into draft_tokens[:, i] directly).
+                    dspark_gumbel_argmax_sample(
+                        logits_i,
+                        self.temperature[:num_reqs],
+                        self.draft_tokens[:num_reqs, i],
+                        self.draft_logits[:num_reqs, i, :],
+                        self.seeds[:num_reqs],
+                        sample_pos[:, i] - 1,
+                        self._gumbel_scratch,
+                        use_fp64=self.use_fp64_gumbel,
+                    )
+                    draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                else:
+                    draft_sampled_i = gumbel_sample(
+                        logits_i,
+                        idx_map[:, i],
+                        self.temperature,
+                        self.seeds,
+                        sample_pos[:, i] - 1,
+                        apply_temperature=True,
+                        output_processed_logits=self.draft_logits,
+                        output_processed_logits_col=self._step_cols[i],
+                        use_fp64=self.use_fp64_gumbel,
+                    )
             else:
                 draft_sampled_i = self.model.map_draft_to_target(
                     logits_i.argmax(dim=-1)

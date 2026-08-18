@@ -5,6 +5,9 @@ import torch
 import triton
 import triton.language as tl
 
+from vllm.triton_utils import tldevice
+from vllm.v1.worker.gpu.sample.gumbel import tl_rand32, tl_rand64
+
 
 @triton.jit
 def _dspark_qkv_postprocess_kernel(
@@ -403,278 +406,185 @@ def dspark_triton_attention(
     return out
 
 
+
 @triton.jit
-def _dspark_markov_probs_blocks_kernel(
+def _dspark_gumbel_argmax_blocks_kernel(
     logits_ptr,
-    inv_temp_ptr,
-    block_max_ptr,
-    block_sumexp_ptr,
-    block_maxid_ptr,
+    temp_ptr,
+    seeds_ptr,
+    pos_ptr,
+    out_logits_ptr,
     block_gval_ptr,
     block_gid_ptr,
-    seed,
     vocab_size: tl.constexpr,
     logits_row_stride: tl.constexpr,
+    out_logits_row_stride: tl.constexpr,
     scratch_stride: tl.constexpr,
     block_v: tl.constexpr,
+    USE_FP64: tl.constexpr,
 ):
-    """Per-vocab-block partial reductions for the fused probabilistic sampler.
+    """Per-vocab-block gumbel-max for the fused DSpark draft sampler.
 
-    Computes, over one ``block_v`` slice of one request's logits:
-    online-softmax block stats (max + relative sum-exp), the plain argmax id
-    (greedy fallback), and an in-kernel Gumbel-max (block value + id) using
-    ``argmax(z - log(q))`` with ``q ~ Exp(1)`` drawn from Philox. Keeping the
-    Gumbel selection in raw-logit space avoids materializing softmax probs or a
-    separate exponential-noise tensor.
+    Bit-exact replica of ``gumbel_block_argmax`` semantics (the eager
+    ``gumbel_sample`` path this replaces): temperature scaling (div_rn),
+    the processed-logits store (temp-applied logits the rejection sampler
+    consumes), the (seeds, pos)-keyed Philox draw, and the block gumbel-max.
+    Greedy rows (temperature == 0) take the plain argmax with the raw-logits
+    store — identical to the reference.
     """
     batch_pid = tl.program_id(0)
     block_pid = tl.program_id(1)
     offs_v = block_pid * block_v + tl.arange(0, block_v)
     v_mask = offs_v < vocab_size
 
-    inv_t = tl.load(inv_temp_ptr + batch_pid).to(tl.float32)
-    z = (
-        tl.load(
-            logits_ptr + batch_pid * logits_row_stride + offs_v,
-            mask=v_mask,
-            other=-float("inf"),
-        ).to(tl.float32)
-        * inv_t
+    temp = tl.load(temp_ptr + batch_pid).to(tl.float32)
+    z = tl.load(
+        logits_ptr + batch_pid * logits_row_stride + offs_v,
+        mask=v_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    if temp != 0.0:
+        # Match _temperature_kernel / gumbel_block_argmax: div_rn.
+        z = z / temp
+
+    # Processed-logits store: temp-applied logits (raw for greedy rows),
+    # exactly what the eager gumbel_sample writes to the draft_logits cache.
+    tl.store(
+        out_logits_ptr + batch_pid * out_logits_row_stride + offs_v,
+        z,
+        mask=v_mask,
     )
 
-    active_mask = v_mask & (z != -float("inf"))
-    z_active = tl.where(active_mask, z, -float("inf"))
-    bmax = tl.max(z_active, axis=0)
-    bmax_for_exp = tl.where(bmax == -float("inf"), 0.0, bmax)
-    e = tl.where(active_mask, tl.exp(z_active - bmax_for_exp), 0.0)
-    bsum = tl.sum(e, axis=0)
-    bmaxid = tl.min(
-        tl.where((z_active == bmax) & active_mask, offs_v, vocab_size),
-        axis=0,
-    )
+    if temp != 0.0:
+        seed = tl.load(seeds_ptr + batch_pid)
+        pos = tl.load(pos_ptr + batch_pid)
+        gumbel_seed = tl.randint(seed, pos)
+        if USE_FP64:
+            u = tl_rand64(gumbel_seed, offs_v, includes_zero=False)
+            g = z + (-tl.log(-tl.log(u)))
+        else:
+            u = tl_rand32(gumbel_seed, offs_v, includes_zero=False)
+            # Same tail-preserving form as the reference: the winning tail
+            # lives at u -> 0 where fp32 has fine resolution.
+            g = z + (-tl.log(-tldevice.log1p(-u)))
+    else:
+        g = z
+    g = tl.where(v_mask, g, -float("inf"))
 
-    # In-kernel Exp(1) noise -> Gumbel-max token selection in raw-logit space.
-    rand_offset = batch_pid * vocab_size + offs_v
-    u = tl.rand(seed, rand_offset)
-    u = tl.maximum(u, 1e-20)
-    q = -tl.log(u)
-    g = tl.where(active_mask, z_active - tl.log(q), -float("inf"))
     bgval = tl.max(g, axis=0)
-    bgid = tl.min(tl.where((g == bgval) & active_mask, offs_v, vocab_size), axis=0)
-
-    out_idx = batch_pid * scratch_stride + block_pid
-    tl.store(block_max_ptr + out_idx, bmax)
-    tl.store(block_sumexp_ptr + out_idx, bsum)
-    tl.store(block_maxid_ptr + out_idx, bmaxid)
-    tl.store(block_gval_ptr + out_idx, bgval)
-    tl.store(block_gid_ptr + out_idx, bgid)
+    bgid = tl.min(
+        tl.where((g == bgval) & v_mask, offs_v, vocab_size), axis=0
+    )
+    tl.store(block_gval_ptr + batch_pid * scratch_stride + block_pid, bgval)
+    tl.store(block_gid_ptr + batch_pid * scratch_stride + block_pid, bgid)
 
 
 @triton.jit
-def _dspark_markov_probs_reduce_kernel(
-    block_max_ptr,
-    block_sumexp_ptr,
-    block_maxid_ptr,
+def _dspark_gumbel_pick_kernel(
     block_gval_ptr,
     block_gid_ptr,
-    is_greedy_ptr,
-    row_max_ptr,
-    row_invz_ptr,
     out_tokens_ptr,
     out_tokens_stride,
-    vocab_size: tl.constexpr,
-    scratch_stride: tl.constexpr,
     num_blocks: tl.constexpr,
     block_nb: tl.constexpr,
+    scratch_stride: tl.constexpr,
 ):
-    """Combine per-block stats into the row softmax denominator + sampled token.
+    """Combine per-block gumbel-max results into the sampled token.
 
-    Uses the standard online-softmax block combination for ``Z`` and selects
-    the Gumbel-max token (or plain argmax for greedy rows). Ties break to the
-    lowest vocab id, matching the greedy Triton kernel's convention.
+    Tie-break matches the reference two-stage reduction: the lowest vocab id
+    wins (first occurrence in block-major order).
     """
     batch_pid = tl.program_id(0)
     offs = tl.arange(0, block_nb)
     mask = offs < num_blocks
     base = batch_pid * scratch_stride + offs
 
-    bmax = tl.load(block_max_ptr + base, mask=mask, other=-float("inf")).to(tl.float32)
-    bsum = tl.load(block_sumexp_ptr + base, mask=mask, other=0.0).to(tl.float32)
-    row_max = tl.max(bmax, axis=0)
-    row_z = tl.sum(tl.where(mask, bsum * tl.exp(bmax - row_max), 0.0), axis=0)
-    tl.store(row_max_ptr + batch_pid, row_max)
-    tl.store(row_invz_ptr + batch_pid, 1.0 / row_z)
-
-    int_max = 2147483647
-    greedy = tl.load(is_greedy_ptr + batch_pid)
-
     bgval = tl.load(block_gval_ptr + base, mask=mask, other=-float("inf")).to(
         tl.float32
     )
-    bgid = tl.load(block_gid_ptr + base, mask=mask, other=int_max).to(tl.int64)
+    bgid = tl.load(block_gid_ptr + base, mask=mask, other=2147483647).to(tl.int64)
     gmax = tl.max(bgval, axis=0)
-    gumbel_token = tl.min(tl.where((bgval == gmax) & mask, bgid, int_max), axis=0)
-
-    bmaxid = tl.load(block_maxid_ptr + base, mask=mask, other=int_max).to(tl.int64)
-    greedy_token = tl.min(tl.where((bmax == row_max) & mask, bmaxid, int_max), axis=0)
-
-    token = tl.where(greedy != 0, greedy_token, gumbel_token)
-    # A fully-masked row -- every candidate -inf, which structured-output
-    # constraints can produce -- leaves no active lane in ANY block, so each
-    # block stores its `vocab_size` filler and both reductions above return that
-    # filler verbatim. A NaN row_max returns `int_max` the same way. Either
-    # escapes as an out-of-vocab token id, and nothing downstream bounds it:
-    # the runner clamps input_ids with min=0 only, and the DSv4 hash-MoE router
-    # then does tid2eid[token_id * 6 + lane] on a [vocab_size, 6] table, reading
-    # off the end -> illegal memory access on every TP rank.
-    #
-    # torch.argmax returns 0 on such a row, so fold to 0 rather than to
-    # vocab_size - 1: it keeps the fused kernel bit-identical to the eager
-    # reference on degenerate rows instead of introducing a divergence that only
-    # shows up where nobody looks.
-    token = tl.where(token >= vocab_size, 0, token)
+    token = tl.min(tl.where((bgval == gmax) & mask, bgid, 2147483647), axis=0)
     tl.store(out_tokens_ptr + batch_pid * out_tokens_stride, token)
 
 
-@triton.jit
-def _dspark_markov_probs_normalize_kernel(
-    logits_ptr,
-    inv_temp_ptr,
-    row_max_ptr,
-    row_invz_ptr,
-    out_probs_ptr,
-    vocab_size: tl.constexpr,
-    logits_row_stride: tl.constexpr,
-    probs_row_stride: tl.constexpr,
-    block_v: tl.constexpr,
-):
-    """Write the normalized softmax probabilities for the draft-probs output."""
-    batch_pid = tl.program_id(0)
-    block_pid = tl.program_id(1)
-    offs_v = block_pid * block_v + tl.arange(0, block_v)
-    v_mask = offs_v < vocab_size
-
-    inv_t = tl.load(inv_temp_ptr + batch_pid).to(tl.float32)
-    z = (
-        tl.load(
-            logits_ptr + batch_pid * logits_row_stride + offs_v,
-            mask=v_mask,
-            other=0.0,
-        ).to(tl.float32)
-        * inv_t
-    )
-    row_max = tl.load(row_max_ptr + batch_pid).to(tl.float32)
-    inv_z = tl.load(row_invz_ptr + batch_pid).to(tl.float32)
-    probs = tl.exp(z - row_max) * inv_z
-    tl.store(out_probs_ptr + batch_pid * probs_row_stride + offs_v, probs, mask=v_mask)
-
-
-def dspark_markov_probs_sample(
+def dspark_gumbel_argmax_sample(
     step_logits: torch.Tensor,
-    inv_temp: torch.Tensor,
-    is_greedy: torch.Tensor,
+    temperature: torch.Tensor,
     out_tokens: torch.Tensor,
-    out_probs: torch.Tensor,
+    out_logits: torch.Tensor,
+    seeds: torch.Tensor,
+    pos: torch.Tensor,
     scratch: dict[str, torch.Tensor],
-    seed: int,
     *,
+    use_fp64: bool = False,
     block_v: int = 1024,
 ) -> None:
-    """Fused probabilistic DSpark Markov sampler for one block step.
+    """Fused DSpark draft sampler for one sequential block step.
 
-    Given per-request ``step_logits`` (base LM-head logits already summed with
-    the Markov bias, *pre*-temperature), writes the sampled ``out_tokens`` and
-    the full softmax ``out_probs`` (draft probabilities the rejection sampler
-    consumes). Temperature scaling, softmax, Gumbel sampling, and the
-    draft-probs write are fused into three launches instead of the ~10 eager
-    ops of the reference sampler. The Markov ``w2`` GEMM is intentionally left
-    to the caller so its full-vocab weight is read once, not per pass.
+    Drop-in replacement for the eager ``gumbel_sample`` call in the DSpark
+    speculator: per-request Gumbel-max sampling over ``step_logits`` (base
+    logits + Markov bias, pre-temperature), writing the sampled ``out_tokens``
+    and the temp-applied ``out_logits`` (the draft_logits cache the rejection
+    sampler consumes). Two launches instead of the eager path's three plus
+    intermediates, with bit-identical semantics (verified by op test).
     """
     if step_logits.dim() != 2:
-        raise ValueError(f"step_logits must be [batch, vocab], got {step_logits.shape}")
-    batch_size, vocab_size = step_logits.shape
-    if out_probs.shape != step_logits.shape:
         raise ValueError(
-            f"out_probs shape {out_probs.shape} must match step_logits "
+            f"step_logits must be [batch, vocab], got {step_logits.shape}"
+        )
+    batch_size, vocab_size = step_logits.shape
+    if out_logits.shape != step_logits.shape:
+        raise ValueError(
+            f"out_logits shape {out_logits.shape} must match step_logits "
             f"{step_logits.shape}"
         )
-    if out_probs.stride(-1) != 1:
-        raise ValueError("out_probs must have a contiguous vocab dimension")
-    if inv_temp.shape[0] < batch_size or is_greedy.shape[0] < batch_size:
-        raise ValueError("inv_temp and is_greedy must cover batch_size")
-    if out_tokens.shape[0] < batch_size:
-        raise ValueError("out_tokens must cover batch_size")
+    if temperature.shape[0] < batch_size or seeds.shape[0] < batch_size:
+        raise ValueError("temperature and seeds must cover batch_size")
+    if pos.shape[0] < batch_size or out_tokens.shape[0] < batch_size:
+        raise ValueError("pos and out_tokens must cover batch_size")
 
     num_blocks = triton.cdiv(vocab_size, block_v)
-    for name in ("block_max", "block_sumexp", "block_gval"):
-        buf = scratch.get(name)
-        if buf is None or buf.shape[0] < batch_size or buf.shape[1] < num_blocks:
-            raise ValueError(
-                f"scratch['{name}'] too small: {None if buf is None else buf.shape}"
-            )
-    for name in ("block_maxid", "block_gid"):
-        buf = scratch.get(name)
-        if buf is None or buf.shape[0] < batch_size or buf.shape[1] < num_blocks:
-            raise ValueError(
-                f"scratch['{name}'] too small: {None if buf is None else buf.shape}"
-            )
-    for name in ("row_max", "row_invz"):
-        buf = scratch.get(name)
-        if buf is None or buf.shape[0] < batch_size:
-            raise ValueError(
-                f"scratch['{name}'] too small: {None if buf is None else buf.shape}"
-            )
-
-    block_max = scratch["block_max"]
-    block_sumexp = scratch["block_sumexp"]
-    block_maxid = scratch["block_maxid"]
-    block_gval = scratch["block_gval"]
-    block_gid = scratch["block_gid"]
-    row_max = scratch["row_max"]
-    row_invz = scratch["row_invz"]
+    block_gval = scratch.get("block_gval")
+    block_gid = scratch.get("block_gid")
+    if (
+        block_gval is None
+        or block_gid is None
+        or block_gval.shape[0] < batch_size
+        or block_gval.shape[1] < num_blocks
+        or block_gid.shape[0] < batch_size
+        or block_gid.shape[1] < num_blocks
+    ):
+        raise ValueError(
+            "scratch['block_gval'/'block_gid'] too small: "
+            f"{None if block_gval is None else block_gval.shape}, "
+            f"{None if block_gid is None else block_gid.shape}"
+        )
 
     grid = (batch_size, num_blocks)
-    _dspark_markov_probs_blocks_kernel[grid](
+    _dspark_gumbel_argmax_blocks_kernel[grid](
         step_logits,
-        inv_temp,
-        block_max,
-        block_sumexp,
-        block_maxid,
+        temperature,
+        seeds,
+        pos,
+        out_logits,
         block_gval,
         block_gid,
-        int(seed) & 0x7FFFFFFF,
         vocab_size=vocab_size,
         logits_row_stride=step_logits.stride(0),
-        scratch_stride=block_max.stride(0),
+        out_logits_row_stride=out_logits.stride(0),
+        scratch_stride=block_gval.stride(0),
         block_v=block_v,
+        USE_FP64=use_fp64,
         num_warps=8,
     )
-    _dspark_markov_probs_reduce_kernel[(batch_size,)](
-        block_max,
-        block_sumexp,
-        block_maxid,
+    _dspark_gumbel_pick_kernel[(batch_size,)](
         block_gval,
         block_gid,
-        is_greedy,
-        row_max,
-        row_invz,
         out_tokens,
         out_tokens.stride(0),
-        vocab_size=vocab_size,
-        scratch_stride=block_max.stride(0),
         num_blocks=num_blocks,
         block_nb=triton.next_power_of_2(num_blocks),
-        num_warps=8,
-    )
-    _dspark_markov_probs_normalize_kernel[grid](
-        step_logits,
-        inv_temp,
-        row_max,
-        row_invz,
-        out_probs,
-        vocab_size=vocab_size,
-        logits_row_stride=step_logits.stride(0),
-        probs_row_stride=out_probs.stride(0),
-        block_v=block_v,
-        num_warps=8,
+        scratch_stride=block_gval.stride(0),
+        num_warps=4,
     )
