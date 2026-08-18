@@ -418,9 +418,13 @@ class DSparkDeepseekV4Model(nn.Module):
         self.num_dspark_layers = getattr(config, "n_mtp_layers", None) or len(
             self.target_layer_ids
         )
+        # The draft block is num_speculative_tokens wide; the checkpoint's
+        # dspark_block_size (5) is the trained default, but the DSpark
+        # attention handles any block size (non-causal within the block), so
+        # honor an explicit num_speculative_tokens override.
         self.block_size = int(
-            getattr(config, "dspark_block_size", 0)
-            or vllm_config.speculative_config.num_speculative_tokens
+            vllm_config.speculative_config.num_speculative_tokens
+            or getattr(config, "dspark_block_size", 0)
         )
         if self.block_size <= 0:
             raise ValueError("DSpark requires dspark_block_size > 0")
