@@ -192,6 +192,15 @@ static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
   return flag;
 }
 
+// Backoff for the flag-spin waits: poll for 64 rounds at full rate, then
+// nanosleep briefly. Plain busy-polling floods the PCIe link with flag reads
+// that compete with the actual reduce copies (and the peer rank's progress),
+// amplifying cross-rank skew; the backoff keeps near-ready latency (first 64
+// polls ~ unchanged) while de-amplifying the contention.
+static DINLINE void spin_backoff(uint32_t& spins) {
+  if ((++spins & 63) == 0) __nanosleep(200);
+}
+
 // This function is meant to be used as the first synchronization in the all
 // reduce kernel. Thus, it doesn't need to make any visibility guarantees for
 // prior memory accesses. Note: volatile writes will not be reordered against
@@ -206,7 +215,8 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
     // Write the expected counter value to peer and wait for correct value
     // from peer.
     st_flag_volatile(peer_counter_ptr, flag);
-    while (ld_flag_volatile(self_counter_ptr) != flag);
+    uint32_t spins = 0;
+    while (ld_flag_volatile(self_counter_ptr) != flag) spin_backoff(spins);
   }
   __syncthreads();
   // use one thread to update flag
@@ -228,10 +238,12 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
     // peer.
     if constexpr (!final_sync) {
       st_flag_release(peer_counter_ptr, flag);
-      while (ld_flag_acquire(self_counter_ptr) != flag);
+      uint32_t spins = 0;
+      while (ld_flag_acquire(self_counter_ptr) != flag) spin_backoff(spins);
     } else {
       st_flag_volatile(peer_counter_ptr, flag);
-      while (ld_flag_volatile(self_counter_ptr) != flag);
+      uint32_t spins = 0;
+      while (ld_flag_volatile(self_counter_ptr) != flag) spin_backoff(spins);
     }
   }
   if constexpr (!final_sync) __syncthreads();
@@ -252,9 +264,11 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
     __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
                             flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
     // wait until we got true from all ranks
+    uint32_t spins = 0;
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
                                   __ATOMIC_RELAXED,
-                                  __MEMORY_SCOPE_DEVICE) < flag);
+                                  __MEMORY_SCOPE_DEVICE) < flag)
+      spin_backoff(spins);
   }
   __syncthreads();
   // use one thread to update flag
@@ -273,10 +287,12 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
                             final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
                             __MEMORY_SCOPE_SYSTEM);
     // wait until we got true from all ranks
+    uint32_t spins = 0;
     while (
         __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
                                final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                               __MEMORY_SCOPE_DEVICE) < flag);
+                               __MEMORY_SCOPE_DEVICE) < flag)
+      spin_backoff(spins);
   }
   if constexpr (!final_sync) __syncthreads();
   // use one thread to update flag

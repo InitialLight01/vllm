@@ -4086,6 +4086,11 @@ class GPUModelRunner(
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
+        if envs.VLLM_TP_STEP_BARRIER and get_tp_group().world_size > 1:
+            # Align the TP ranks' graph submission to reduce cross-rank skew
+            # that spins out inside the per-step all-reduces.
+            torch.distributed.barrier(group=get_tp_group().device_group)
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.

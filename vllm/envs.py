@@ -224,6 +224,10 @@ if TYPE_CHECKING:
     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = True
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
+    # Experimental: CPU-side TP barrier at each execute_model entry, aligning
+    # the two ranks' CUDA-graph submission and reducing cross-rank skew that
+    # spins out as waiting time inside the 92 per-step all-reduces.
+    VLLM_TP_STEP_BARRIER: bool = False
     VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
     VLLM_KV_CACHE_LAYOUT: Literal["NHD", "HND"] | None = None
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
@@ -1696,6 +1700,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Timeout in seconds for execute_model RPC calls in multiprocessing
     # executor (only applies when TP > 1).
+    "VLLM_TP_STEP_BARRIER": lambda: bool(
+        int(os.getenv("VLLM_TP_STEP_BARRIER", "0"))
+    ),
     "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": lambda: int(
         os.getenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "300")
     ),
