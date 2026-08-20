@@ -543,6 +543,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the
             # MLA compressor. Slot [2] is reserved for the indexer's inner
             # overlap. ROCm (aux_streams is None) falls back to sequential.
+            # NOTE(2026-08-20): VLLM_INDEXER_STRIDE>1 (skip rescoring on some
+            # prefill chunks) is semantically broken for long context — stale
+            # topk selections leave newly-written compressed KV blocks unseen
+            # (2needle 1M n=10 all-fail at stride=4). The correct fix is an
+            # incremental scoring kernel (score only new blocks + merge).
             q, _ = execute_in_parallel(
                 wq_b_kv_insert,
                 [
@@ -883,4 +888,22 @@ class DeepseekV4Indexer(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
-        return self.indexer_op(hidden_states, q_quant, k, weights)
+
+        # GEMM-based prefill scoring (VLLM_INDEXER_GEMM=1): additionally
+        # prepare the bf16 RoPE'd Q and the unfolded per-head weights
+        # (q per-token scale x softmax x head scale). The paged kernel still
+        # serves decode steps; indexer_gemm_prefill replaces the prefill
+        # scoring inside SparseAttnIndexer.forward_cuda.
+        q_rope_bf16: torch.Tensor | None = None
+        weights_eff: torch.Tensor | None = None
+        if os.environ.get("VLLM_INDEXER_GEMM") == "1" and not self.use_fp4_kv:
+            q_bf, _ = self.wq_b(qr)
+            q_bf = q_bf.view(-1, self.n_head, self.head_dim)
+            q_rope_bf16, _ = rotary_emb(positions, q_bf)
+            q_scale = q_rope_bf16.abs().amax(dim=-1, keepdim=True).div(448.0)
+            weights_eff = (indexer_weights * q_scale.squeeze(-1)) * (
+                self.softmax_scale * self.n_head**-0.5
+            )
+        return self.indexer_op(
+            hidden_states, q_quant, k, weights, q_rope_bf16, weights_eff
+        )
