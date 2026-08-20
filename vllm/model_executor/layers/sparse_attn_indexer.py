@@ -465,6 +465,10 @@ def sparse_attn_indexer(
             values_spec,
             scales_spec,
         )
+        # [DIAG] env-gated: record per-chunk path + last chunk's topk row for
+        # needle-selection membership checks at long context.
+        _diag_topk = os.environ.get("VLLM_DUMP_INDEXER_TOPK")
+        _diag_last_chunk = None  # (topk view, path, t0, t1, cu_seqlen_ke)
         for chunk in prefill_metadata.chunks:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
@@ -504,14 +508,21 @@ def sparse_attn_indexer(
                     q_slice_cast = q_slice
                     k_quant_cast = k_quant
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-                if not current_platform.is_xpu() and fp8_fp4_mqa_topk_indices(
-                    (q_slice_cast, q_scale_slice),
-                    (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_indices,
-                ):
+                # [DIAG] VLLM_FORCE_LOGITS_TOPK=1 forces the logits+topk path
+                # (default: fused direct top-k when supported).
+                _used_fused = (
+                    not current_platform.is_xpu()
+                    and os.environ.get("VLLM_FORCE_LOGITS_TOPK", "0") != "1"
+                    and fp8_fp4_mqa_topk_indices(
+                        (q_slice_cast, q_scale_slice),
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        topk_indices,
+                    )
+                )
+                if _used_fused:
                     # Direct fused top-k path (SM12x fallback): topk_indices
                     # filled in-place; no logits materialization.
                     pass
@@ -559,6 +570,44 @@ def sparse_attn_indexer(
                         row_starts=chunk.cu_seqlen_ks,
                     )
 
+                # [DIAG] remember the last chunk's topk view for the dump.
+                if _diag_topk is not None:
+                    _ke_last = chunk.cu_seqlen_ke[-1]
+                    _diag_last_chunk = (
+                        topk_indices,
+                        "fused" if _used_fused else "logits",
+                        chunk.token_start,
+                        chunk.token_end,
+                        _ke_last.item() if torch.is_tensor(_ke_last) else _ke_last,
+                    )
+
+        # [DIAG] dump the query token's (last row of last chunk) top-512
+        # compressed positions per layer, appended as JSONL.
+        if (
+            _diag_topk is not None
+            and _diag_last_chunk is not None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            import json as _json
+
+            _topk_view, _path, _t0, _t1, _ke = _diag_last_chunk
+            if _topk_view.shape[0] > 0:
+                with open(_diag_topk, "a") as _f:
+                    _f.write(
+                        _json.dumps(
+                            {
+                                "prefix": k_cache_prefix,
+                                "path": _path,
+                                "chunk_t0": int(_t0),
+                                "chunk_t1": int(_t1),
+                                "compressed_seq_len": int(_ke),
+                                "topk_last_row": [
+                                    int(x) for x in _topk_view[-1].cpu().tolist()
+                                ],
+                            }
+                        )
+                        + "\n"
+                    )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -753,6 +802,43 @@ def sparse_attn_indexer(
             topk_indices_buffer[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
                 topk_indices
             )
+
+        # [DIAG] decode-path dump: the last real row (sentinel -1 rows are
+        # padding) carries the chunked-prefill tail's last token = query token.
+        _diag_topk = os.environ.get("VLLM_DUMP_INDEXER_TOPK")
+        if _diag_topk is not None and not torch.cuda.is_current_stream_capturing():
+            import json as _json
+
+            _tk = topk_indices
+            _real = (_tk[:, 0] != -1).nonzero()
+            if len(_real) > 0:
+                _last_real = int(_real[-1].item())
+                _row = [int(x) for x in _tk[_last_real].cpu().tolist()]
+                # context length (tokens) for the last real row
+                _cl = decode_metadata.decode_lens.reshape(-1)[_last_real]
+                _cl = _cl.item() if torch.is_tensor(_cl) else int(_cl)
+                with open(_diag_topk, "a") as _f:
+                    _f.write(
+                        _json.dumps(
+                            {
+                                "prefix": k_cache_prefix,
+                                "phase": "decode",
+                                "path": (
+                                    "paged-direct"
+                                    if used_direct_topk
+                                    else (
+                                        "triton"
+                                        if os.getenv("VLLM_SM120_TRITON_INDEXER", "0") == "1"
+                                        else "logits"
+                                    )
+                                ),
+                                "last_real_row": _last_real,
+                                "ctx_tokens": _cl,
+                                "topk_last_row": _row,
+                            }
+                        )
+                        + "\n"
+                    )
 
     return topk_indices_buffer
 
