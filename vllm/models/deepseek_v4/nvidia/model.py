@@ -1049,6 +1049,27 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_eps=ffn_norm_eps,
         )
 
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jsonfp3
+                torch.cuda.synchronize()
+                _b = x.detach().view(torch.int16)
+                _bitsum = int(_b.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                _zc = int(((_b == 0) | (_b == -32768)).sum().item())
+                _h8 = [_b.view(-1)[i].item() for i in range(8)]
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jsonfp3.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "layer": getattr(self, "_active_idx", -1),
+                        "comp": "pre_ffn",
+                        "pos0": int(positions[0].item()),
+                        "shape": list(x.shape),
+                        "bitsum": _bitsum,
+                        "zc": _zc,
+                        "h8": _h8,
+                    }) + "\n")
+            except Exception:
+                pass
         _prof = os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
         if _prof:
             _pf = torch.cuda.Event(enable_timing=True)
