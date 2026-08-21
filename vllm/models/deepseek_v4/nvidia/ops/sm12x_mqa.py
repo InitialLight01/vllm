@@ -797,6 +797,11 @@ def _indexer_score_logits_kernel(
     k_sc = tl.load(scale_ptr + offs_n, mask=valid_n, other=1.0)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Single accumulator with BN=64 (see launcher): preserves the sequential
+    # h-summation order bit-for-bit while reaching ~460 TFLOPS (vs ~190 at
+    # BN=128). A dual-accumulator variant hits ~550 but changes the fp32
+    # summation order (~1e-7), which flipped a real tie in validation
+    # (ratio 1.000 -> 0.956) and OOM'd at 1M tile shapes — rejected.
     for h in tl.static_range(H):
         q_f8 = tl.load(
             q_ptr
@@ -846,7 +851,7 @@ def indexer_score_logits_triton(
     if num_q == 0 or seq_len_kv == 0:
         return logits
 
-    block_m, block_n = 32, 128
+    block_m, block_n = 32, 64
     grid = (triton.cdiv(num_q, block_m), triton.cdiv(seq_len_kv, block_n))
     _indexer_score_logits_kernel[grid](
         q,
