@@ -5,6 +5,7 @@
 from collections.abc import Callable
 
 import torch
+import os
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -169,6 +170,28 @@ def _fused_marlin_moe(
         beta=gemm1_beta,
     )
 
+    if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+        try:
+            import json as _jmq
+            torch.cuda.synchronize()
+            _b = intermediate_cache2.detach().view(torch.int8)
+            _bitsum = int(_b.to(torch.int32).sum(dim=1, dtype=torch.int64).sum().item())
+            _zc = int((_b == 0).sum().item())
+            _h8 = [_b.view(-1)[i].item() for i in range(8)]
+            with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                _f.write(_jmq.dumps({
+                    "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    "layer": -3,
+                    "comp": "moe_quant2_in",
+                    "pos0": -1,
+                    "shape": list(intermediate_cache2.shape),
+                    "bitsum": _bitsum,
+                    "zc": _zc,
+                    "h8": _h8,
+                }) + "\n")
+        except Exception:
+            pass
+
     if output is None:
         output = intermediate_cache3
 
@@ -215,6 +238,28 @@ def _fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
     )
+
+    if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+        try:
+            import json as _jmx
+            torch.cuda.synchronize()
+            _b = output.detach().view(torch.int16)
+            _bitsum = int(_b.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+            _zc = int(((_b == 0) | (_b == -32768)).sum().item())
+            _h8 = [_b.view(-1)[i].item() for i in range(8)]
+            with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                _f.write(_jmx.dumps({
+                    "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    "layer": -2,
+                    "comp": "moe_gemm2_out",
+                    "pos0": -1,
+                    "shape": list(output.shape),
+                    "bitsum": _bitsum,
+                    "zc": _zc,
+                    "h8": _h8,
+                }) + "\n")
+        except Exception:
+            pass
 
     return output
 
