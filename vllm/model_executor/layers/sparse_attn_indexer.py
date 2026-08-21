@@ -469,12 +469,20 @@ def sparse_attn_indexer(
         # needle-selection membership checks at long context.
         _diag_topk = os.environ.get("VLLM_DUMP_INDEXER_TOPK")
         _diag_last_chunk = None  # (topk view, path, t0, t1, cu_seqlen_ke)
+        # [DIAG] intra-chunk phase timing (last layer only), VLLM_DUMP_TIMING.
+        _phase_timing = (
+            os.environ.get("VLLM_DUMP_TIMING") is not None
+            and ".42." in k_cache_prefix
+        )
         for chunk in prefill_metadata.chunks:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
             assert chunk.local_cu_seq_lens is not None
             k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
             k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
+            if _phase_timing:
+                _te = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
+                _te[0].record()
             if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
                 ops.cp_gather_indexer_k_quant_cache(
                     kv_cache,
@@ -483,6 +491,8 @@ def sparse_attn_indexer(
                     chunk.block_table,
                     chunk.local_cu_seq_lens,
                 )
+            if _phase_timing:
+                _te[1].record()
 
             q_slice = q_quant[chunk.token_start : chunk.token_end]
             q_scale_slice = (
@@ -570,6 +580,8 @@ def sparse_attn_indexer(
                             chunk.cu_seqlen_ke,
                             clean_logits=False,
                         )
+                    if _phase_timing:
+                        _te[2].record()
                     num_rows = logits.shape[0]
                     ops.top_k_per_row_prefill(
                         logits,
@@ -590,6 +602,17 @@ def sparse_attn_indexer(
                         cp_kv_cache_interleave_size,
                         row_starts=chunk.cu_seqlen_ks,
                     )
+                    if _phase_timing:
+                        _te[3].record()
+                        torch.cuda.synchronize()
+                        print(
+                            f"[IDX-PHASE] n={chunk.local_total_seq_lens} "
+                            f"path={'fused' if _used_fused else ('triton' if _use_triton_logits else 'other')} "
+                            f"gather={_te[0].elapsed_time(_te[1]):.1f}ms "
+                            f"score={_te[1].elapsed_time(_te[2]):.1f}ms "
+                            f"topk={_te[2].elapsed_time(_te[3]):.1f}ms",
+                            flush=True,
+                        )
 
                 # [DIAG] remember the last chunk's topk view for the dump.
                 if _diag_topk is not None:

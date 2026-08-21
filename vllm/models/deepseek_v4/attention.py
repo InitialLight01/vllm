@@ -353,7 +353,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Metadata-independent input GEMMs + RMSNorm stay in the captured
         # graph; the metadata-dependent rest (q up-proj + kv-insert, indexer,
         # compressor, MLA attention) runs in the eager break.
-        if os.environ.get("VLLM_PROFILE"):
+        if os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing():
             _tqkv0 = torch.cuda.Event(enable_timing=True)
             _tqkv1 = torch.cuda.Event(enable_timing=True)
             _tqkv0.record()
@@ -368,7 +368,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.kv_norm.weight.data,
             self.eps,
         )
-        if os.environ.get("VLLM_PROFILE"):
+        if os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing():
             _tqkv1.record()
             torch.cuda.synchronize()
             with open(os.environ["VLLM_PROFILE"], "a") as _f:
@@ -377,7 +377,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # attention_impl is wrapped with @eager_break_during_capture: this is
         # where the breakable cudagraph capture breaks (the attention op runs
         # eagerly between captured graph segments).
-        if os.environ.get("VLLM_PROFILE"):
+        if os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing():
             _tatt0 = torch.cuda.Event(enable_timing=True)
             _tatt1 = torch.cuda.Event(enable_timing=True)
             _tatt0.record()
@@ -392,7 +392,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
         o = o_padded[:, : self.n_local_heads, :]
-        if os.environ.get("VLLM_PROFILE"):
+        if os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing():
             _tatt1.record()
             torch.cuda.synchronize()
             with open(os.environ["VLLM_PROFILE"], "a") as _f:
@@ -436,12 +436,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 pass
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
-        if os.environ.get("VLLM_PROFILE"):
+        if os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing():
             _top0 = torch.cuda.Event(enable_timing=True)
             _top1 = torch.cuda.Event(enable_timing=True)
             _top0.record()
         _r = self._o_proj(o, positions)
-        if os.environ.get("VLLM_PROFILE"):
+        if os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing():
             _top1.record()
             torch.cuda.synchronize()
             with open(os.environ["VLLM_PROFILE"], "a") as _f:
@@ -535,14 +535,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
+                import os as _os2
+                _prof2 = _os2.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
+                if _prof2:
+                    _w0 = torch.cuda.Event(enable_timing=True)
+                    _w1 = torch.cuda.Event(enable_timing=True)
+                    _w0.record()
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                if _prof2:
+                    _w1.record()
+                    torch.cuda.synchronize()
+                    with open(_os2.environ["VLLM_PROFILE"], "a") as _f2:
+                        _f2.write(f"wqbkv r{self.compress_ratio} {_w0.elapsed_time(_w1):.3f}ms\n")
                 return q
 
             # 3-way overlap (matches TRT-LLM PR #14142 Level 1): default runs
             # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the
             # MLA compressor. Slot [2] is reserved for the indexer's inner
             # overlap. ROCm (aux_streams is None) falls back to sequential.
+            import os as _os
+            _prof = _os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
+            if _prof:
+                _pp0 = torch.cuda.Event(enable_timing=True)
+                _pp1 = torch.cuda.Event(enable_timing=True)
+                _pp0.record()
             q, _ = execute_in_parallel(
                 wq_b_kv_insert,
                 [
@@ -554,13 +571,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                         positions,
                         self.indexer_rotary_emb,
                     ),
-                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                    lambda: _timed_compressor(
+                        compressor, kv_score, positions, self.rotary_emb,
+                        self.compress_ratio,
+                    ),
                 ],
                 self.ln_events[0],
                 [self.ln_events[1], self.ln_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
                 enable=aux_streams is not None,
             )
+            if _prof:
+                _pp1.record()
+                torch.cuda.synchronize()
+                with open(_os.environ["VLLM_PROFILE"], "a") as _f:
+                    _f.write(f"parallel3way r{self.compress_ratio} {_pp0.elapsed_time(_pp1):.3f}ms\n")
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = (
@@ -569,8 +594,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
+                import os as _os2
+                _prof2 = _os2.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
+                if _prof2:
+                    _w0 = torch.cuda.Event(enable_timing=True)
+                    _w1 = torch.cuda.Event(enable_timing=True)
+                    _w0.record()
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                if _prof2:
+                    _w1.record()
+                    torch.cuda.synchronize()
+                    with open(_os2.environ["VLLM_PROFILE"], "a") as _f2:
+                        _f2.write(f"wqbkv r{self.compress_ratio} {_w0.elapsed_time(_w1):.3f}ms\n")
                 return q
 
             q, _ = maybe_execute_in_parallel(
@@ -876,6 +912,12 @@ class DeepseekV4Indexer(nn.Module):
 
         # compressor returns None and writes K to the indexer KV cache; the
         # join orders that write before indexer_op (skip_k_cache_insert=True).
+        import os as _os
+        _prof = _os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
+        if _prof:
+            _pc0 = torch.cuda.Event(enable_timing=True)
+            _pc1 = torch.cuda.Event(enable_timing=True)
+            _pc0.record()
         (q_quant, weights), k = maybe_execute_in_parallel(
             wq_b_and_q_quant,
             lambda: compressor(compressed_kv_score, positions, rotary_emb),
@@ -883,4 +925,39 @@ class DeepseekV4Indexer(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
+        if _prof:
+            _pc1.record()
+            torch.cuda.synchronize()
+            with open(_os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"compressor+wq r{self.compress_ratio} {_pc0.elapsed_time(_pc1):.3f}ms\n")
         return self.indexer_op(hidden_states, q_quant, k, weights)
+
+
+def _timed_compressor(compressor, kv_score, positions, rotary_emb, ratio) -> None:
+    import os as _os
+    if _os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing():
+        _c0 = torch.cuda.Event(enable_timing=True)
+        _c1 = torch.cuda.Event(enable_timing=True)
+        _c0.record()
+        compressor(kv_score, positions, rotary_emb)
+        _c1.record()
+        torch.cuda.synchronize()
+        with open(_os.environ["VLLM_PROFILE"], "a") as _f:
+            _f.write(f"mlacompress r{ratio} {_c0.elapsed_time(_c1):.3f}ms\n")
+    else:
+        compressor(kv_score, positions, rotary_emb)
+
+
+def _timed_compressor(compressor, kv_score, positions, rotary_emb, ratio) -> None:
+    import os as _os
+    if _os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing():
+        _c0 = torch.cuda.Event(enable_timing=True)
+        _c1 = torch.cuda.Event(enable_timing=True)
+        _c0.record()
+        compressor(kv_score, positions, rotary_emb)
+        _c1.record()
+        torch.cuda.synchronize()
+        with open(_os.environ["VLLM_PROFILE"], "a") as _f:
+            _f.write(f"mlacompress r{ratio} {_c0.elapsed_time(_c1):.3f}ms\n")
+    else:
+        compressor(kv_score, positions, rotary_emb)

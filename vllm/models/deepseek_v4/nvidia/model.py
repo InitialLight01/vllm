@@ -963,16 +963,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         # attn_norm is fused into mhc_pre_tilelang / mhc_fused_post_pre above.
-        if os.environ.get("VLLM_PROFILE"):
+        _prof = os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
+        if _prof:
             _pa = torch.cuda.Event(enable_timing=True)
             _pa.record()
         x = self.attn(positions, x, None)
-        if os.environ.get("VLLM_PROFILE"):
+        if _prof:
             _qa = torch.cuda.Event(enable_timing=True)
             _qa.record()
             torch.cuda.synchronize()
             with open(os.environ["VLLM_PROFILE"], "a") as _f:
-                _f.write(f"attn {_pa.elapsed_time(_qa):.3f}ms M={x.shape[0]}\n")
+                _f.write(f"attn L{getattr(self, '_active_idx', -1)} {_pa.elapsed_time(_qa):.3f}ms M={x.shape[0]}\n")
         if os.environ.get("VLLM_DUMP_HIDDEN"):
             try:
                 import json as _json
@@ -1026,7 +1027,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_eps=ffn_norm_eps,
         )
 
+        _prof = os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
+        if _prof:
+            _pf = torch.cuda.Event(enable_timing=True)
+            _qf = torch.cuda.Event(enable_timing=True)
+            _pf.record()
         x = self.ffn(x, input_ids)
+        if _prof:
+            _qf.record()
+            torch.cuda.synchronize()
+            with open(os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"ffn L{getattr(self, '_active_idx', -1)} {_pf.elapsed_time(_qf):.3f}ms M={x.shape[0]}\n")
         if os.environ.get("VLLM_DUMP_HIDDEN"):
             try:
                 import json as _json2
@@ -1222,6 +1233,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        _timing_evts = None
+        if os.environ.get("VLLM_DUMP_TIMING"):
+            _timing_evts = []  # (start_evt, end_evt, idx)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1244,6 +1258,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         _f.write(_json.dumps(_stats) + "\n")
                 except Exception:
                     pass
+            if _timing_evts is not None and not torch.cuda.is_current_stream_capturing():
+                _e0 = torch.cuda.Event(enable_timing=True)
+                _e1 = torch.cuda.Event(enable_timing=True)
+                _e0.record()
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1259,6 +1277,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
+            if _timing_evts is not None and not torch.cuda.is_current_stream_capturing():
+                _e1.record()
+                _timing_evts.append((_e0, _e1, idx))
+        if _timing_evts is not None and not torch.cuda.is_current_stream_capturing():
+            # Aggregate per-layer-category elapsed GPU time for this forward
+            # (one chunked-prefill step). Categories: c4a / c128a / swa layers.
+            torch.cuda.synchronize()
+            _cum: dict[str, float] = {}
+            for _e0, _e1, _idx in _timing_evts:
+                _ly = self.layers[_idx] if hasattr(self.layers, "__getitem__") else None
+                try:
+                    _ratio = getattr(_ly.attn, "compress_ratio", 0)
+                except Exception:
+                    _ratio = 0
+                _cat = "swa" if _ratio <= 1 else ("c4a" if _ratio == 4 else "c128a")
+                _cum[_cat] = _cum.get(_cat, 0.0) + _e0.elapsed_time(_e1)
+            _parts = " ".join(f"{k}={v:.1f}ms" for k, v in sorted(_cum.items()))
+            print(
+                f"[TIMING] rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else -1} "
+                f"tokens={hidden_states.shape[0]} {_parts}",
+                flush=True,
+            )
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
@@ -1585,14 +1625,15 @@ class DeepseekV4ForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        if os.environ.get("VLLM_PROFILE"):
+        _prof = os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
+        if _prof:
             _tf0 = torch.cuda.Event(enable_timing=True)
             _tf1 = torch.cuda.Event(enable_timing=True)
             _tf0.record()
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
-        if os.environ.get("VLLM_PROFILE"):
+        if _prof:
             _tf1.record()
             torch.cuda.synchronize()
             with open(os.environ["VLLM_PROFILE"], "a") as _f:

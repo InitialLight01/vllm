@@ -434,6 +434,12 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         if num_tokens == 0:
             return
 
+        import os as _os
+        _prof = _os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
+        if _prof:
+            _pb0 = torch.cuda.Event(enable_timing=True)
+            _pb1 = torch.cuda.Event(enable_timing=True)
+            _pb0.record()
         (
             compressed_kv_cache,
             seq_lens,
@@ -446,6 +452,11 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
             attn_metadata=attn_metadata,
             swa_only=swa_only,
         )
+        if _prof:
+            _pb1.record()
+            torch.cuda.synchronize()
+            with open(_os.environ["VLLM_PROFILE"], "a") as _f:
+                _f.write(f"idxbuild r{self.compress_ratio} {_pb0.elapsed_time(_pb1):.3f}ms\n")
 
         # CUDA graph execution can pad q/output past the scheduled token count;
         # restrict to the real tokens (the launcher validates sparse indices).
@@ -508,6 +519,12 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
             )
             prefill_cu_cpu = query_start_loc_cpu[num_decodes : num_reqs + 1]
             prefill_lens_cpu = prefill_cu_cpu[1:] - prefill_cu_cpu[:-1]
+            import os as _os
+            _prof = _os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
+            if _prof:
+                _pk0 = torch.cuda.Event(enable_timing=True)
+                _pk1 = torch.cuda.Event(enable_timing=True)
+                _pk0.record()
             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
                 query=query[num_decode_tokens:num_tokens],
                 swa_kv_cache=swa_k_cache,
@@ -523,6 +540,11 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 cum_seq_lens_q=prefill_cu,
                 max_q_len=int(prefill_lens_cpu.max().item()),
             )
+            if _prof:
+                _pk1.record()
+                torch.cuda.synchronize()
+                with open(_os.environ["VLLM_PROFILE"], "a") as _f:
+                    _f.write(f"sparsekernel r{self.compress_ratio} {_pk0.elapsed_time(_pk1):.3f}ms")
 
 
 class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
@@ -830,6 +852,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
             block_size = attn_metadata.block_size // self.compress_ratio
+            import os as _os
+            _prof = _os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
+            if _prof:
+                _pm0 = torch.cuda.Event(enable_timing=True)
+                _pm1 = torch.cuda.Event(enable_timing=True)
+                _pm0.record()
             extra_sparse_indices, extra_sparse_lengths = (
                 compute_global_topk_indices_and_lens(
                     local_topk_indices,
@@ -839,6 +867,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     swa_metadata.is_valid_token[prefill_token_slice],
                 )
             )
+            if _prof:
+                _pm1.record()
+                torch.cuda.synchronize()
+                with open(_os.environ["VLLM_PROFILE"], "a") as _f:
+                    _f.write(f"topkmap r{self.compress_ratio} {_pm0.elapsed_time(_pm1):.3f}ms\n")
 
         assert swa_metadata.prefill_swa_indices is not None
         assert swa_metadata.prefill_swa_lens is not None
@@ -885,6 +918,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
+            import os as _os
+            _prof = _os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
+            if _prof:
+                _pk0 = torch.cuda.Event(enable_timing=True)
+                _pk1 = torch.cuda.Event(enable_timing=True)
+                _pk0.record()
             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
                 query=q_chunk,
                 swa_kv_cache=swa_kv_paged,
@@ -899,3 +938,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
             )
+            if _prof:
+                _pk1.record()
+                torch.cuda.synchronize()
+                with open(_os.environ["VLLM_PROFILE"], "a") as _f:
+                    _f.write(f"sparsekernel r{self.compress_ratio} {_pk0.elapsed_time(_pk1):.3f}ms\n")
