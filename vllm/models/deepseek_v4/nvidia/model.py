@@ -1006,6 +1006,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 _h8 = [_b.view(-1)[i].item() for i in range(8)]
                 with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
                     _f.write(_jsonfp.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
                         "layer": getattr(self, "_active_idx", -1),
                         "comp": "attn_out",
                         "pos0": int(positions[0].item()),
@@ -1090,6 +1091,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 _h8 = [_b.view(-1)[i].item() for i in range(8)]
                 with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
                     _f.write(_jsonfp2.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
                         "layer": getattr(self, "_active_idx", -1),
                         "comp": "ffn_out",
                         "pos0": int(positions[0].item()),
