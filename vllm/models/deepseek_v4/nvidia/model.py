@@ -725,6 +725,30 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             routed_scaling_factor=self.routed_scaling_factor,
         )
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jsonfp4
+                torch.cuda.synchronize()
+                _w = topk_weights.detach().view(torch.int16)
+                _wbitsum = int(_w.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                _wh8 = [_w.view(-1)[i].item() for i in range(8)]
+                _ids = topk_ids.detach().reshape(-1)
+                _idsum = int(_ids.to(torch.int64).sum().item())
+                _idh8 = [_ids[i].item() for i in range(8)]
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jsonfp4.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "layer": getattr(self, "_active_idx", -1),
+                        "comp": "router",
+                        "pos0": -1,
+                        "shape": list(topk_weights.shape),
+                        "wbitsum": _wbitsum,
+                        "wh8": _wh8,
+                        "idsum": _idsum,
+                        "idh8": _idh8,
+                    }) + "\n")
+            except Exception:
+                pass
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
