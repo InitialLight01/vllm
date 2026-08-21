@@ -996,6 +996,27 @@ class DeepseekV4DecoderLayer(nn.Module):
             except Exception:
                 pass
 
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jsonfp
+                torch.cuda.synchronize()
+                _b = x.detach().view(torch.int16)
+                _bitsum = int(_b.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                _zc = int(((_b == 0) | (_b == -32768)).sum().item())
+                _h8 = [_b.view(-1)[i].item() for i in range(8)]
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jsonfp.dumps({
+                        "layer": getattr(self, "_active_idx", -1),
+                        "comp": "attn_out",
+                        "pos0": int(positions[0].item()),
+                        "shape": list(x.shape),
+                        "bitsum": _bitsum,
+                        "zc": _zc,
+                        "h8": _h8,
+                    }) + "\n")
+            except Exception:
+                pass
+
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
         import os as _os
@@ -1057,6 +1078,26 @@ class DeepseekV4DecoderLayer(nn.Module):
                 }
                 with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
                     _f.write(_json.dumps(_stats) + "\n")
+            except Exception:
+                pass
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jsonfp2
+                torch.cuda.synchronize()
+                _b = x.detach().view(torch.int16)
+                _bitsum = int(_b.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                _zc = int(((_b == 0) | (_b == -32768)).sum().item())
+                _h8 = [_b.view(-1)[i].item() for i in range(8)]
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jsonfp2.dumps({
+                        "layer": getattr(self, "_active_idx", -1),
+                        "comp": "ffn_out",
+                        "pos0": int(positions[0].item()),
+                        "shape": list(x.shape),
+                        "bitsum": _bitsum,
+                        "zc": _zc,
+                        "h8": _h8,
+                    }) + "\n")
             except Exception:
                 pass
         if os.environ.get("VLLM_DUMP_HIDDEN_FULL") and not torch.cuda.is_current_stream_capturing():
