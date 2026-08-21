@@ -510,8 +510,17 @@ def sparse_attn_indexer(
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
                 # [DIAG] VLLM_FORCE_LOGITS_TOPK=1 forces the logits+topk path
                 # (default: fused direct top-k when supported).
-                _used_fused = (
+                # [PERF] VLLM_INDEXER_TRITON_LOGITS=1 replaces the SM120 logits
+                # fallback (torch reference, ~80x slow) with the exact
+                # fp8-dot Triton kernel (~190 TFLOPS); topk stays C++.
+                _use_triton_logits = (
                     not current_platform.is_xpu()
+                    and not use_fp4_cache
+                    and os.environ.get("VLLM_INDEXER_TRITON_LOGITS", "0") == "1"
+                )
+                _used_fused = (
+                    not _use_triton_logits
+                    and not current_platform.is_xpu()
                     and os.environ.get("VLLM_FORCE_LOGITS_TOPK", "0") != "1"
                     and fp8_fp4_mqa_topk_indices(
                         (q_slice_cast, q_scale_slice),
@@ -536,6 +545,18 @@ def sparse_attn_indexer(
                             q_slice_cast,
                             k_quant_cast,
                             k_scale_cast,
+                            weights[chunk.token_start : chunk.token_end],
+                            chunk.cu_seqlen_ks,
+                            chunk.cu_seqlen_ke,
+                        )
+                    elif _use_triton_logits:
+                        from vllm.models.deepseek_v4.nvidia.ops.sm12x_mqa import (
+                            indexer_score_logits_triton,
+                        )
+
+                        logits = indexer_score_logits_triton(
+                            q_slice_cast,
+                            (k_quant_cast, k_scale_cast),
                             weights[chunk.token_start : chunk.token_end],
                             chunk.cu_seqlen_ks,
                             chunk.cu_seqlen_ke,

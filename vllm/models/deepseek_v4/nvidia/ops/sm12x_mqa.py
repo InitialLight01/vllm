@@ -738,3 +738,139 @@ def tf32_hc_prenorm_gemm_triton(
         BLOCK_K=block_k,
         num_warps=4,
     )
+
+
+@triton.jit
+def _indexer_score_logits_kernel(
+    q_ptr,
+    k_ptr,
+    scale_ptr,
+    weights_ptr,
+    cu_ks_ptr,
+    cu_ke_ptr,
+    out_ptr,
+    M,
+    N,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    stride_qm,
+    stride_qh,
+    stride_qd,
+    stride_kn,
+    stride_kd,
+    stride_wm,
+    stride_wh,
+    stride_om,
+    stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Indexer dense scoring: logits[m,n] = sum_h W[m,h] * relu(Q[m,h] . (K[n] * scale[n])).
+
+    vs _fp8_mqa_logits_kernel (the original SM12x fallback): K tile is staged
+    ONCE per program and reused across a fully unrolled static h-loop; the
+    dot runs on fp8 tensor cores (fp8 x fp8 products are exact in fp32
+    accumulation, per-n scale applied post-dot) so the result matches the
+    fp32 reference semantics.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+
+    valid_m = offs_m < M
+    valid_n = offs_n < N
+
+    ks = tl.load(cu_ks_ptr + offs_m, mask=valid_m, other=0)
+    ke = tl.load(cu_ke_ptr + offs_m, mask=valid_m, other=0)
+
+    # K tile [D, BLOCK_N] staged once, kept in fp8. The per-n scale is
+    # applied AFTER the dot: (q . (k * s))[m,n] == s[n] * (q . k)[m,n], and
+    # fp8 x fp8 products are exact in fp32 accumulation, so this matches the
+    # fp32 reference semantics without bf16 input rounding.
+    k_f8 = tl.load(
+        k_ptr + offs_d[:, None] * stride_kd + offs_n[None, :] * stride_kn,
+        mask=valid_n[None, :],
+        other=0.0,
+    )
+    k_sc = tl.load(scale_ptr + offs_n, mask=valid_n, other=1.0)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for h in tl.static_range(H):
+        q_f8 = tl.load(
+            q_ptr
+            + offs_m[:, None] * stride_qm
+            + h * stride_qh
+            + offs_d[None, :] * stride_qd,
+            mask=valid_m[:, None],
+            other=0.0,
+        )
+        s = tl.dot(q_f8, k_f8)  # fp8 x fp8 -> fp32 acc, products exact
+        s = s * k_sc[None, :]  # per-n K scale
+        s = tl.maximum(s, 0.0)  # per-head ReLU
+        w = tl.load(
+            weights_ptr + offs_m * stride_wm + h * stride_wh,
+            mask=valid_m,
+            other=0.0,
+        )
+        acc += s * w[:, None]
+
+    row_valid = (offs_n[None, :] >= ks[:, None]) & (offs_n[None, :] < ke[:, None])
+    store_mask = valid_m[:, None] & valid_n[None, :]
+    acc = tl.where(row_valid & store_mask, acc, float("-inf"))
+    tl.store(
+        out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+        acc,
+        mask=store_mask,
+    )
+
+
+def indexer_score_logits_triton(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """Optimized Triton indexer dense scoring (bf16 tensor cores).
+
+    Same semantics as fp8_mqa_logits_triton (which see); invalid positions
+    outside [cu_seqlen_ks, cu_seqlen_ke) are written as -inf, matching
+    clean_logits=True so downstream top-k kernels can consume it directly.
+    """
+    k_fp8, scale = kv
+    num_q, num_heads, head_dim = q.shape
+    seq_len_kv = k_fp8.shape[0]
+    logits = _bucketed_logits_buffer(num_q, seq_len_kv, q.device)
+    if num_q == 0 or seq_len_kv == 0:
+        return logits
+
+    block_m, block_n = 32, 128
+    grid = (triton.cdiv(num_q, block_m), triton.cdiv(seq_len_kv, block_n))
+    _indexer_score_logits_kernel[grid](
+        q,
+        k_fp8,
+        scale,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        logits,
+        num_q,
+        seq_len_kv,
+        num_heads,
+        head_dim,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_fp8.stride(0),
+        k_fp8.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        logits.stride(0),
+        logits.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+    return logits
