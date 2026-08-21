@@ -328,7 +328,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if os.environ.get("VLLM_DUMP_HIDDEN"):
+        if os.environ.get("VLLM_DUMP_HIDDEN") and not torch.cuda.is_current_stream_capturing():
             try:
                 import json as _json
                 with open(os.environ["VLLM_DUMP_HIDDEN"], "a") as _f:
@@ -397,7 +397,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             torch.cuda.synchronize()
             with open(os.environ["VLLM_PROFILE"], "a") as _f:
                 _f.write(f"attn_impl {_tatt0.elapsed_time(_tatt1):.3f}ms\n")
-        if os.environ.get("VLLM_DUMP_HIDDEN"):
+        if os.environ.get("VLLM_DUMP_HIDDEN") and not torch.cuda.is_current_stream_capturing():
             try:
                 import json as _json
                 torch.cuda.synchronize()
@@ -420,7 +420,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     }) + "\n")
             except Exception:
                 pass
-        if os.environ.get("VLLM_DUMP_HIDDEN_FULL"):
+        if os.environ.get("VLLM_DUMP_HIDDEN_FULL") and not torch.cuda.is_current_stream_capturing():
             try:
                 import json as _json
                 torch.cuda.synchronize()

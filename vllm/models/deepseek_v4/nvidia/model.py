@@ -974,7 +974,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             torch.cuda.synchronize()
             with open(os.environ["VLLM_PROFILE"], "a") as _f:
                 _f.write(f"attn L{getattr(self, '_active_idx', -1)} {_pa.elapsed_time(_qa):.3f}ms M={x.shape[0]}\n")
-        if os.environ.get("VLLM_DUMP_HIDDEN"):
+        if os.environ.get("VLLM_DUMP_HIDDEN") and not torch.cuda.is_current_stream_capturing():
             try:
                 import json as _json
                 torch.cuda.synchronize()  # sync ALL streams (aux streams too)
@@ -1038,7 +1038,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             torch.cuda.synchronize()
             with open(os.environ["VLLM_PROFILE"], "a") as _f:
                 _f.write(f"ffn L{getattr(self, '_active_idx', -1)} {_pf.elapsed_time(_qf):.3f}ms M={x.shape[0]}\n")
-        if os.environ.get("VLLM_DUMP_HIDDEN"):
+        if os.environ.get("VLLM_DUMP_HIDDEN") and not torch.cuda.is_current_stream_capturing():
             try:
                 import json as _json2
                 torch.cuda.synchronize()
@@ -1059,7 +1059,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     _f.write(_json.dumps(_stats) + "\n")
             except Exception:
                 pass
-        if os.environ.get("VLLM_DUMP_HIDDEN_FULL"):
+        if os.environ.get("VLLM_DUMP_HIDDEN_FULL") and not torch.cuda.is_current_stream_capturing():
             try:
                 import json as _json
                 torch.cuda.synchronize()
@@ -1257,7 +1257,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             start=self.start_layer,
         ):
             layer._active_idx = idx  # for component-level dump hooks
-            if os.environ.get("VLLM_DUMP_HIDDEN"):
+            if os.environ.get("VLLM_DUMP_HIDDEN") and not torch.cuda.is_current_stream_capturing():
                 try:
                     import json as _json
                     h = hidden_states.detach().float().cpu()  # .cpu() syncs kernels
