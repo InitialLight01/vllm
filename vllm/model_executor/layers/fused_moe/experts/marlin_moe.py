@@ -131,6 +131,29 @@ def _fused_marlin_moe(
     elif input_dtype == torch.float8_e4m3fn:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
 
+    if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+        try:
+            import json as _jq1
+            torch.cuda.synchronize()
+            _b = gate_up_input.detach().view(torch.int8)
+            _bitsum = int(_b.to(torch.int32).sum(dim=1, dtype=torch.int64).sum().item())
+            _h8 = [_b.view(-1)[i].item() for i in range(8)]
+            _s = a_scales1.detach().view(-1)
+            _ssum = int((_s.to(torch.int32).sum().item())) if _s.dtype == torch.int8 else float(_s.float().sum().item())
+            with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                _f.write(_jq1.dumps({
+                    "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    "layer": -4,
+                    "comp": "moe_quant1_out",
+                    "pos0": -1,
+                    "shape": list(gate_up_input.shape),
+                    "bitsum": _bitsum,
+                    "zc": int((_b == 0).sum().item()),
+                    "h8": _h8,
+                    "ssum": _ssum,
+                }) + "\n")
+        except Exception:
+            pass
     intermediate_cache1 = ops.moe_wna16_marlin_gemm(
         gate_up_input,
         intermediate_cache1,
@@ -159,6 +182,27 @@ def _fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
     )
+    if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+        try:
+            import json as _jg1
+            torch.cuda.synchronize()
+            _b = intermediate_cache1.detach().view(torch.int16)
+            _bitsum = int(_b.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+            _zc = int(((_b == 0) | (_b == -32768)).sum().item())
+            _h8 = [_b.view(-1)[i].item() for i in range(8)]
+            with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                _f.write(_jg1.dumps({
+                    "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    "layer": -5,
+                    "comp": "moe_gemm1_out",
+                    "pos0": -1,
+                    "shape": list(intermediate_cache1.shape),
+                    "bitsum": _bitsum,
+                    "zc": _zc,
+                    "h8": _h8,
+                }) + "\n")
+        except Exception:
+            pass
     # apply_moe_activation fuses the clamp/gate params: SILU + clamp_limit and
     # SWIGLUOAI_UNINTERLEAVE both map to the silu_and_mul_with_clamp kernel.
     activation_func(
