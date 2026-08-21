@@ -520,13 +520,14 @@ def sparse_attn_indexer(
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
                 # [DIAG] VLLM_FORCE_LOGITS_TOPK=1 forces the logits+topk path
                 # (default: fused direct top-k when supported).
-                # [PERF] VLLM_INDEXER_TRITON_LOGITS=1 replaces the SM120 logits
-                # fallback (torch reference, ~80x slow) with the exact
-                # fp8-dot Triton kernel (~190 TFLOPS); topk stays C++.
+                # [PERF] VLLM_INDEXER_TRITON_LOGITS=0 opts out of the Triton
+                # logits path. Default ON (2026-08-22): BN=64 kernel, 2.4x,
+                # logits bit-identical to the C++ path; 完整精度门通过
+                # (600q 491/600=81.83% vs 基线 81.5%, smoke30 23/30)。
                 _use_triton_logits = (
                     not current_platform.is_xpu()
                     and not use_fp4_cache
-                    and os.environ.get("VLLM_INDEXER_TRITON_LOGITS", "0") == "1"
+                    and os.environ.get("VLLM_INDEXER_TRITON_LOGITS", "1") != "0"
                 )
                 _used_fused = (
                     not _use_triton_logits
