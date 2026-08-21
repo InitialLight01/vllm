@@ -209,7 +209,7 @@ def _fused_marlin_moe(
             torch.cuda.synchronize()
             _b = intermediate_cache1.detach().view(torch.int16)
             _rows = _b.sum(dim=1, dtype=torch.int32)
-            _rowsum = _rows.sum(dtype=torch.int64).tolist()
+            _rowsum = _rows.tolist()
             with open(os.environ["VLLM_DUMP_HIDDEN_FP_ROWS"], "a") as _f:
                 _f.write(_jgr.dumps({
                     "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
