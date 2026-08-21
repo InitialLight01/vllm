@@ -203,6 +203,24 @@ def _fused_marlin_moe(
                 }) + "\n")
         except Exception:
             pass
+    if os.environ.get("VLLM_DUMP_HIDDEN_FP_ROWS") and not torch.cuda.is_current_stream_capturing():
+        try:
+            import json as _jgr
+            torch.cuda.synchronize()
+            _b = intermediate_cache1.detach().view(torch.int16)
+            _rows = _b.sum(dim=1, dtype=torch.int32)
+            _rowsum = _rows.sum(dtype=torch.int64).tolist()
+            with open(os.environ["VLLM_DUMP_HIDDEN_FP_ROWS"], "a") as _f:
+                _f.write(_jgr.dumps({
+                    "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    "layer": -5,
+                    "comp": "moe_gemm1_rows",
+                    "pos0": -1,
+                    "shape": list(intermediate_cache1.shape),
+                    "rowsum": _rowsum,
+                }) + "\n")
+        except Exception:
+            pass
     # apply_moe_activation fuses the clamp/gate params: SILU + clamp_limit and
     # SWIGLUOAI_UNINTERLEAVE both map to the silu_and_mul_with_clamp kernel.
     activation_func(
