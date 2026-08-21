@@ -554,23 +554,33 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the
             # MLA compressor. Slot [2] is reserved for the indexer's inner
             # overlap. ROCm (aux_streams is None) falls back to sequential.
+            # Measured 2026-08-21: with the fast Triton indexer the branches are
+            # wqbkv 0.9ms / indexer 7.5ms / compressor 0.1ms but the parallel
+            # block's wall time is ~30ms (join/stream-queue overhead) — the
+            # overlap saves <1ms and costs ~22ms. VLLM_SKIP_ATTN_OVERLAP=1
+            # runs the branches sequentially on the default stream.
             import os as _os
+            _overlap_enabled = (
+                aux_streams is not None
+                and _os.environ.get("VLLM_SKIP_ATTN_OVERLAP", "0") != "1"
+            )
             _prof = _os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
             if _prof:
                 _pp0 = torch.cuda.Event(enable_timing=True)
                 _pp1 = torch.cuda.Event(enable_timing=True)
                 _pp0.record()
+            _indexer_fn = lambda: indexer(
+                hidden_states,
+                qr,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                self.indexer_rotary_emb,
+            )
             q, _ = execute_in_parallel(
                 wq_b_kv_insert,
                 [
-                    lambda: indexer(
-                        hidden_states,
-                        qr,
-                        indexer_kv_score,
-                        indexer_weights,
-                        positions,
-                        self.indexer_rotary_emb,
-                    ),
+                    _indexer_fn,
                     lambda: _timed_compressor(
                         compressor, kv_score, positions, self.rotary_emb,
                         self.compress_ratio,
@@ -579,7 +589,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.ln_events[0],
                 [self.ln_events[1], self.ln_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
-                enable=aux_streams is not None,
+                enable=_overlap_enabled,
             )
             if _prof:
                 _pp1.record()
@@ -923,7 +933,9 @@ class DeepseekV4Indexer(nn.Module):
             lambda: compressor(compressed_kv_score, positions, rotary_emb),
             self.ln_events[0],
             self.ln_events[1],
-            self.aux_stream,
+            None
+            if _os.environ.get("VLLM_SKIP_ATTN_OVERLAP", "0") == "1"
+            else self.aux_stream,
         )
         if _prof:
             _pc1.record()

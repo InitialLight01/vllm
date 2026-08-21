@@ -1236,6 +1236,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         _timing_evts = None
         if os.environ.get("VLLM_DUMP_TIMING"):
             _timing_evts = []  # (start_evt, end_evt, idx)
+        # [DIAG] VLLM_TORCH_PROF=<file>: torch CUDA profiler over this single
+        # forward (fires when token count == VLLM_TORCH_PROF_TOKENS, default
+        # 7845 = the 128K sample's last chunk). Dumps kernel table to <file>.
+        _prof = None
+        _prof_tok = int(os.environ.get("VLLM_TORCH_PROF_TOKENS", "7845"))
+        if (
+            os.environ.get("VLLM_TORCH_PROF")
+            and hidden_states.shape[0] == _prof_tok
+            and not torch.cuda.is_current_stream_capturing()
+            and not getattr(self, "_torch_prof_done", False)
+        ):
+            self._torch_prof_done = True
+            import torch.profiler as _tp
+
+            _prof = _tp.profile(activities=[_tp.ProfilerActivity.CUDA])
+            _prof.__enter__()
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1299,6 +1315,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 f"tokens={hidden_states.shape[0]} {_parts}",
                 flush=True,
             )
+        if _prof is not None:
+            _prof.__exit__(None, None, None)
+            torch.cuda.synchronize()
+            try:
+                with open(os.environ["VLLM_TORCH_PROF"], "w") as _pf:
+                    _pf.write(
+                        _prof.key_averages().table(
+                            sort_by="cuda_time_total", row_limit=60
+                        )
+                    )
+                print(
+                    f"[TORCHPROF] dumped to {os.environ['VLLM_TORCH_PROF']}",
+                    flush=True,
+                )
+            except Exception as _pe:
+                print(f"[TORCHPROF] dump failed: {_pe}", flush=True)
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
