@@ -428,6 +428,11 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
+    # [DIAG] VLLM_MARLIN_MOE_BLOCK_SIZE 覆盖 (确定性调查: 不同 config 表条目)
+    _bs_override = os.environ.get("VLLM_MARLIN_MOE_BLOCK_SIZE")
+    if _bs_override:
+        block_size_m = int(_bs_override)
+
     if global_num_experts == -1:
         global_num_experts = E
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
