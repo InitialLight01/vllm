@@ -925,6 +925,23 @@ class DeepseekV4Indexer(nn.Module):
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
         compressor = self.compressor
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jiw
+                torch.cuda.synchronize()
+                _w = indexer_weights.detach().contiguous().view(torch.int16)
+                _ws = int(_w.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jiw.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "idx_weights",
+                        "prefix": self.prefix,
+                        "pos0": int(positions.view(-1)[0].item()),
+                        "wsum": _ws,
+                        "h8": [_w.view(-1)[i].item() for i in range(8)],
+                    }) + "\n")
+            except Exception:
+                pass
 
         def wq_b_and_q_quant():
             # ReplicatedLinear returns (output, bias); bias is None.
