@@ -418,6 +418,22 @@ class DeepseekCompressor(nn.Module):
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jpre
+                torch.cuda.synchronize()
+                _cv = kv_cache.detach().contiguous().view(torch.uint8)
+                _bitsum = int(_cv.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jpre.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "comp_pre_call",
+                        "prefix": self.prefix,
+                        "pos0": int(positions.view(-1)[0].item()),
+                        "pre_bitsum": _bitsum,
+                    }) + "\n")
+            except Exception:
+                pass
         compress_norm_rope_store_fn(
             state_cache=state_cache,
             num_actual=num_actual,
@@ -447,7 +463,7 @@ class DeepseekCompressor(nn.Module):
             try:
                 import json as _jcomp
                 torch.cuda.synchronize()
-                _cv = kv_cache.detach().view(torch.uint8)
+                _cv = kv_cache.detach().contiguous().view(torch.uint8)
                 _bitsum = int(_cv.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
                 _h8 = [_cv.view(-1)[i].item() for i in range(8)]
                 with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
@@ -460,5 +476,11 @@ class DeepseekCompressor(nn.Module):
                         "bitsum": _bitsum,
                         "h8": _h8,
                     }) + "\n")
-            except Exception:
-                pass
+            except Exception as _ekv:
+                try:
+                    import json as _jekv
+                    with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f3:
+                        _f3.write(_jekv.dumps({"comp": "comp_tail_err", "err": str(_ekv),
+                                               "prefix": self.prefix}) + "\n")
+                except Exception:
+                    pass
