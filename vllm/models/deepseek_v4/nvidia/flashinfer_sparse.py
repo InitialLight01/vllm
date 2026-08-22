@@ -386,6 +386,18 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
             _rows = torch.unique(compressed_block_table.flatten())
             compressed_kv_cache[_rows] = 0
 
+        # 退化短路: prefill 选择全空 (首 chunk, 压缩缓存无有效块) 时,
+        # 改为 0 宽度选择 (与 dense 层同构) — 数学等价 (空选择零贡献),
+        # 且避开 FlashInfer sparse kernel 的全 -1 退化路径 (该路径输出
+        # 逐次不确定, 见附3 更新9)。VLLM_C4A_EMPTY_SHORT=0 可关闭。
+        if (
+            num_prefill_tokens > 0
+            and os.environ.get("VLLM_C4A_EMPTY_SHORT", "1") != "0"
+            and bool((prefill_topk_indices[:num_prefill_tokens] < 0).all().item())
+        ):
+            prefill_topk_indices = prefill_topk_indices[:, :0]
+            top_k = 0
+
         query_start_loc = swa_metadata.query_start_loc[: num_reqs + 1]
         seq_lens = swa_metadata.seq_lens[:num_reqs]
         assert seq_lens.dtype == torch.int32
