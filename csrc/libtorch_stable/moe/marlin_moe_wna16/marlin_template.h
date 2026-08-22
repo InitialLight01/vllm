@@ -191,7 +191,10 @@ __device__ inline void barrier_acquire(int* lock, int count) {
       asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
                    : "=r"(state)
                    : "l"(lock));
-    while (state != count);
+    // NOTE(确定性修复): 用 < 而非 != — slice 组内多个 block 的 release 计数
+    // 可能已越过本 block 的目标值 (迟到到达), != 会死等; < 语义等价
+    // (本 block 之前的 block 全部 release 即可), 且不受 overshoot 影响。
+    while (state < count);
   }
   __syncthreads();
 }
@@ -593,6 +596,16 @@ __global__ void Marlin(
       locks_off++;
     }
 
+    if (first_init && slice_count > 1 && slice_idx == 0 && threadIdx.x == 0) {
+      // NOTE(确定性修复): fp32 归约路径的锁协议依赖初值 0 (release 自增计数),
+      // 原先只在 use_atomic_add 分支初始化 (写 1-slice_count), fp32 路径隐式
+      // 依赖 workspace=torch.zeros — 显式原子置 0, 消除对分配器状态的依赖。
+      if (use_atomic_add) {
+        atomicExch(&locks[locks_off], 1 - slice_count);
+      } else {
+        atomicExch(&locks[locks_off], 0);
+      }
+    }
     if (first_init && use_atomic_add && slice_count > 1 && slice_idx == 0) {
       constexpr int threads_per_m = 16 * thread_n_blocks / 8;
       int m_per_thread =
