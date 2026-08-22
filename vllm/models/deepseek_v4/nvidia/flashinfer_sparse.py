@@ -5,6 +5,7 @@
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
+import os
 
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -370,6 +371,20 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 else:
                     decode_compressed_indices = prefill_topk_indices[:0]
                     decode_compressed_topk_lens = swa_metadata.seq_lens[:0]
+
+        # 确定性修复: 请求首 chunk 时压缩缓存尚无有效条目 (topk 全 -1),
+        # 退化路径可能读取 KV 池的陈旧区块 (请求间内容不同 → 输出不确定)。
+        # 防御性清零本请求的压缩缓存区块 — 有效区域读前必写, 语义等价;
+        # 消除陈旧读取的确定性影响。VLLM_C4A_ZERO_STALE=0 可关闭。
+        if (
+            num_prefill_tokens > 0
+            and os.environ.get("VLLM_C4A_ZERO_STALE", "1") != "0"
+            and compressed_block_table is not None
+            and compressed_kv_cache is not None
+            and bool((prefill_topk_indices[:num_prefill_tokens] < 0).all().item())
+        ):
+            _rows = torch.unique(compressed_block_table.flatten())
+            compressed_kv_cache[_rows] = 0
 
         query_start_loc = swa_metadata.query_start_loc[: num_reqs + 1]
         seq_lens = swa_metadata.seq_lens[:num_reqs]
