@@ -591,6 +591,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
                 enable=_overlap_enabled,
             )
+            if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+                try:
+                    import json as _jtopk
+                    torch.cuda.synchronize()
+                    _nt = hidden_states.shape[0]
+                    _tk = self.topk_indices_buffer[:min(_nt, 16)].detach().to(torch.int64)
+                    _tk8 = [_tk.view(-1)[i].item() for i in range(min(8, _tk.numel()))]
+                    _tkall = self.topk_indices_buffer[:min(_nt, self.topk_indices_buffer.shape[0])].detach().to(torch.int64)
+                    _tksum = int(_tkall.sum().item())
+                    with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                        _f.write(_jtopk.dumps({
+                            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                            "comp": "idx_topk",
+                            "prefix": self.prefix,
+                            "pos0": int(positions.view(-1)[0].item()),
+                            "tksum": _tksum,
+                            "tk8": _tk8,
+                        }) + "\n")
+                except Exception:
+                    pass
             if _prof:
                 _pp1.record()
                 torch.cuda.synchronize()
