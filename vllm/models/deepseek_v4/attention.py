@@ -514,7 +514,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
                     "comp": "p3way",
                     "prefix": self.prefix,
-                    "pos0": int(positions.view(-1)[0].item()),
+                    "ntok": int(hidden_states.shape[0]),
                 }
                 for _name, _t in (("qr_kv", qr_kv), ("kv_score", kv_score),
                                   ("indexer_kv_score", indexer_kv_score)):
