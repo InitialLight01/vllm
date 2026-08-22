@@ -42,7 +42,7 @@ def _fake_quant(x):
 _mu._quant_fp8_method = _fake_quant
 
 # 生产形状 (DSV4-Flash gemm1): M=8188 tokens, K=7168, N=2048, topk=6
-E, M, K, N, TOPK = 16, 8188, 7168, 2048, 6
+E, M, K, N, TOPK = 16, 8188, 4096, 2048, 6
 BLOCK = 64  # moe_block_size (对齐粒度)
 
 torch.manual_seed(42)

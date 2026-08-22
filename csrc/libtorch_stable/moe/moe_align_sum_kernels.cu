@@ -350,6 +350,55 @@ __global__ void count_and_sort_expert_tokens_kernel(
       max_num_tokens_padded, nullptr, 0, topk_num, has_expert_map);
 }
 
+// 确定性版 sort: 每 block 处理一个 expert, 按 index 序串行收集。
+// 与 atomicAdd 到达序版本输出语义相同 (同 expert 内按 token index 排序),
+// 但 rank 分配与线程调度无关 → 逐次位级一致。
+template <typename scalar_t>
+__device__ void _count_and_sort_expert_tokens_deterministic(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ cumsum_buffer,
+    int32_t* __restrict__ expert_map, size_t numel, int32_t num_experts,
+    int32_t max_num_tokens_padded, int32_t model_offset, int32_t topk_num,
+    int32_t* __restrict__ token_mask, bool has_expert_map) {
+  const int expert_id = blockIdx.x;
+  if (expert_id >= num_experts || threadIdx.x != 0) {
+    return;
+  }
+  int32_t rank =
+      cumsum_buffer[model_offset * (num_experts + 1) + expert_id];
+  for (size_t i = 0; i < numel; i++) {
+    int32_t e = topk_ids[i];
+    if (e >= num_experts) {
+      continue;
+    }
+    if (has_expert_map) {
+      e = expert_map[e];
+      // filter invalid experts
+      if (e == -1) continue;
+    }
+    if (e != expert_id) {
+      continue;
+    }
+    if (token_mask != nullptr && !token_mask[i / topk_num]) {
+      continue;
+    }
+    sorted_token_ids[max_num_tokens_padded * model_offset + rank] =
+        static_cast<int32_t>(i);
+    ++rank;
+  }
+}
+
+template <typename scalar_t>
+__global__ void count_and_sort_expert_tokens_deterministic_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ cumsum_buffer,
+    int32_t* __restrict__ expert_map, size_t numel, int32_t num_experts,
+    int32_t max_num_tokens_padded, int32_t topk_num, bool has_expert_map) {
+  _count_and_sort_expert_tokens_deterministic(
+      topk_ids, sorted_token_ids, cumsum_buffer, expert_map, numel, num_experts,
+      max_num_tokens_padded, 0, topk_num, nullptr, has_expert_map);
+}
+
 // Reduce the topk expert outputs per token (summed in fp32). The output is
 // dense [num_tokens, d]; the input is addressed by its strides so non-
 // contiguous inputs work without a copy. A 16B-vectorized path is used when
@@ -660,14 +709,12 @@ void moe_align_block_size(
               sorted_token_ids.size(0), topk_ids.size(1), has_expert_map);
 
           const int block_threads = std::min(256, (int)threads);
-          const int num_blocks =
-              (topk_ids.numel() + block_threads - 1) / block_threads;
-          const int max_blocks = 65535;
-          const int actual_blocks = std::min(num_blocks, max_blocks);
-          dim3 gridDims(1, actual_blocks);
+          // 确定性排序: 每 expert 一块 (grid.x = num_experts), index 序收集
+          dim3 gridDims(num_experts, 1);
 
           auto sort_kernel =
-              vllm::moe::count_and_sort_expert_tokens_kernel<scalar_t>;
+              vllm::moe::count_and_sort_expert_tokens_deterministic_kernel<
+                  scalar_t>;
           sort_kernel<<<gridDims, block_threads, 0, stream>>>(
               reinterpret_cast<const scalar_t*>(topk_ids.const_data_ptr()),
               reinterpret_cast<int32_t*>(sorted_token_ids.mutable_data_ptr()),
