@@ -281,6 +281,16 @@ class DeepseekCompressor(nn.Module):
         positions: torch.Tensor,
         rotary_emb,
     ) -> None:
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jprobe
+                torch.cuda.synchronize()
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jprobe.dumps({"rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                                            "comp": "comp_fwd_probe", "pos0": int(positions.view(-1)[0].item()),
+                                            "shape": list(kv_score.shape)}) + "\n")
+            except Exception:
+                pass
         # Each of shape [num_tokens, coff * self.head_dim]
         # input bf16, output are fp32
         kv, score = kv_score.split(
@@ -289,6 +299,33 @@ class DeepseekCompressor(nn.Module):
 
         # Get the metadata and handle dummy profiling run.
         attn_metadata = get_forward_context().attn_metadata
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jmt
+                torch.cuda.synchronize()
+                _rec = {
+                    "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    "comp": "comp_meta_probe",
+                    "prefix": self.prefix,
+                    "pos0": int(positions.view(-1)[0].item()),
+                    "meta_type": type(attn_metadata).__name__,
+                    "cache_bitsum": None,
+                    "cache_h8": None,
+                }
+                try:
+                    _cv = self.state_cache.kv_cache.detach().view(torch.uint8)
+                    _rec["cache_bitsum"] = int(_cv.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                    _rec["cache_h8"] = [_cv.view(-1)[i].item() for i in range(8)]
+                except Exception as _e2:
+                    _rec["cache_err"] = str(_e2)
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jmt.dumps(_rec) + "\n")
+            except Exception as _e3:
+                try:
+                    with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f2:
+                        _f2.write(_jmt.dumps({"comp": "comp_probe_err", "err": str(_e3)}) + "\n")
+                except Exception:
+                    pass
         if not isinstance(attn_metadata, dict):
             return
 
@@ -424,5 +461,9 @@ class DeepseekCompressor(nn.Module):
                         "zc": int(((_cv == 0) | (_cv == -32768)).sum().item()),
                         "h8": _h8,
                     }) + "\n")
-            except Exception:
-                pass
+            except Exception as _e:
+                try:
+                    with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                        _f.write(json.dumps({"comp": "comp_hook_err", "err": str(_e)}) + "\n")
+                except Exception:
+                    pass
