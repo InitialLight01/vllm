@@ -530,6 +530,26 @@ class DSparkDeepseekV4Model(nn.Module):
                 batch_size,
                 num_rejected_tokens,
             )
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jbuf
+                torch.cuda.synchronize()
+                _b = self.layers[0]._main_kv_cache.detach().view(torch.int16)
+                _bitsum = int(_b.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                _h8 = [_b.view(-1)[i].item() for i in range(8)]
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jbuf.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "layer": -11,
+                        "comp": "draft_buf",
+                        "pos0": int(context_positions.view(-1)[0].item()),
+                        "shape": list(self.layers[0]._main_kv_cache.shape),
+                        "bitsum": _bitsum,
+                        "zc": int(((_b == 0) | (_b == -32768)).sum().item()),
+                        "h8": _h8,
+                    }) + "\n")
+            except Exception:
+                pass
 
     def forward(
         self,
@@ -572,6 +592,26 @@ class DSparkDeepseekV4Model(nn.Module):
             self.rms_norm_eps,
             self.hc_eps,
         )
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jdraft
+                torch.cuda.synchronize()
+                _b = hidden_states.detach().view(torch.int16)
+                _bitsum = int(_b.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                _h8 = [_b.view(-1)[i].item() for i in range(8)]
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jdraft.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "layer": -10,
+                        "comp": "draft_fwd_out",
+                        "pos0": int(positions.view(-1)[0].item()),
+                        "shape": list(hidden_states.shape),
+                        "bitsum": _bitsum,
+                        "zc": int(((_b == 0) | (_b == -32768)).sum().item()),
+                        "h8": _h8,
+                    }) + "\n")
+            except Exception:
+                pass
         return hidden_states
 
 
