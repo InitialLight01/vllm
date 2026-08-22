@@ -506,6 +506,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
         )
 
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jp3
+                torch.cuda.synchronize()
+                _rec = {
+                    "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    "comp": "p3way",
+                    "prefix": self.prefix,
+                    "pos0": int(positions.view(-1)[0].item()),
+                }
+                for _name, _t in (("qr_kv", qr_kv), ("kv_score", kv_score),
+                                  ("indexer_kv_score", indexer_kv_score)):
+                    _v = _t.detach().contiguous().view(torch.int16)
+                    _rec[_name] = int(_v.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                    _rec[_name + "_h8"] = [_v.view(-1)[i].item() for i in range(4)]
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jp3.dumps(_rec) + "\n")
+            except Exception:
+                pass
+
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
     @eager_break_during_capture
