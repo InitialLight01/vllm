@@ -973,20 +973,47 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 _pk0 = torch.cuda.Event(enable_timing=True)
                 _pk1 = torch.cuda.Event(enable_timing=True)
                 _pk0.record()
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-                query=q_chunk,
-                swa_kv_cache=swa_kv_paged,
-                workspace_buffer=self._get_workspace(q.device),
-                sparse_indices=swa_indices_chunk,
-                compressed_kv_cache=extra_kv_paged,
-                out=output[query_start:query_end],
-                bmm1_scale=self.scale,
-                sinks=self.attn_sink,
-                kv_layout="NHD",
-                swa_topk_lens=swa_lens_chunk,
-                extra_sparse_indices=extra_sparse_indices_chunk,
-                extra_sparse_topk_lens=extra_sparse_lengths_chunk,
-            )
+            # 确定性 Triton 替代 (VLLM_TRITON_SPARSE_PREFILL=1): 固定序
+            # 流式注意力, 布局与生产者一致 (576B/token + 块尾 UE8M0
+            # scales)。默认关, 原 cubin 路径不变。
+            if os.environ.get("VLLM_TRITON_SPARSE_PREFILL", "0") == "1":
+                from vllm.models.deepseek_v4.nvidia.ops.triton_prefill_sparse_mla import (
+                    triton_prefill_sparse_mla_sm120,
+                )
+
+                triton_prefill_sparse_mla_sm120(
+                    query=q_chunk,
+                    swa_kv_cache=swa_k_cache,
+                    swa_indices=swa_indices_chunk,
+                    swa_lens=swa_lens_chunk,
+                    compressed_kv_cache=compressed_k_cache,
+                    extra_indices=extra_sparse_indices_chunk,
+                    extra_lens=extra_sparse_lengths_chunk,
+                    # 完整批序数: req_idx (全批 token→req) 直接索引
+                    seq_lens=swa_metadata.seq_lens,
+                    req_idx=swa_metadata.token_to_req_indices[
+                        num_decode_tokens + query_start :
+                        num_decode_tokens + query_end
+                    ],
+                    sinks=self.attn_sink,
+                    out=output[query_start:query_end],
+                    bmm1_scale=self.scale,
+                )
+            else:
+                flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                    query=q_chunk,
+                    swa_kv_cache=swa_kv_paged,
+                    workspace_buffer=self._get_workspace(q.device),
+                    sparse_indices=swa_indices_chunk,
+                    compressed_kv_cache=extra_kv_paged,
+                    out=output[query_start:query_end],
+                    bmm1_scale=self.scale,
+                    sinks=self.attn_sink,
+                    kv_layout="NHD",
+                    swa_topk_lens=swa_lens_chunk,
+                    extra_sparse_indices=extra_sparse_indices_chunk,
+                    extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+                )
             if _prof:
                 _pk1.record()
                 torch.cuda.synchronize()
