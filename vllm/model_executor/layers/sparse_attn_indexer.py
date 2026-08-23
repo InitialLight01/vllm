@@ -344,6 +344,133 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+def indexer_gemm_prefill(
+    hidden_states: torch.Tensor,
+    k_cache_prefix: LayerNameType,
+    kv_cache: torch.Tensor,
+    q_bf16: torch.Tensor,
+    weights_eff: torch.Tensor,
+    quant_block_size: int,
+    scale_fmt: str | None,
+    topk_tokens: int,
+    head_dim: int,
+    max_model_len: int,
+    total_seq_lens: int,
+    topk_indices_buffer: torch.Tensor,
+    use_fp4_cache: bool = False,
+    dcp_rank: int = 0,
+    dcp_world_size: int = 1,
+    cp_kv_cache_interleave_size: int = 1,
+) -> None:
+    """GEMM-based prefill scoring (VLLM_INDEXER_GEMM=1).
+
+    Replaces the paged per-block scoring kernel with a blocked bf16 GEMM plus
+    streaming top-k. Mathematically identical to the paged kernel:
+        logits[t, n] = sum_h W_eff[t, h] * relu(Q[t, h] . K[n] * k_scale[n])
+    (per-head ReLU; W_eff carries q's per-token scale, softmax scale and head
+    scale — see fused_indexer_q_rope_quant docstring). Parity is verified by
+    tests_local/test_indexer_gemm_parity.py (logits rel-err < 5%, topk match
+    >= 99.9%).
+    """
+    assert not use_fp4_cache, "GEMM path currently supports the FP8 indexer cache only"
+    attn_metadata = get_forward_context().attn_metadata
+    assert isinstance(attn_metadata, dict)
+    fp8_dtype = current_platform.fp8_dtype()
+    k_cache_prefix = _resolve_layer_name(k_cache_prefix)
+    attn_metadata_narrowed = attn_metadata[k_cache_prefix]
+    assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
+    prefill_metadata = attn_metadata_narrowed.prefill
+    if prefill_metadata is None or len(prefill_metadata.chunks) == 0:
+        # Decode-only step (e.g. warmup): nothing to score in the GEMM path.
+        return
+
+    # Same K-gather workspace as the paged path (FP8 layout: [T, D] fp8 + [T, 4] scales).
+    workspace_manager = current_workspace_manager()
+    values_spec, scales_spec = _gather_workspace_shapes(
+        total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+    )
+    k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
+        values_spec, scales_spec
+    )
+
+    T = q_bf16.shape[0]
+    H = q_bf16.shape[1]
+    topk_indices_buffer[:T] = -1
+
+    BLK = 512  # K-column block for streaming top-k (memory-bound merge window)
+
+    for chunk in prefill_metadata.chunks:
+        assert chunk.local_cu_seq_lens is not None
+        if chunk.local_total_seq_lens == 0:
+            continue
+        k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
+        k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
+        if not chunk.skip_kv_gather:
+            ops.cp_gather_indexer_k_quant_cache(
+                kv_cache,
+                k_quant,
+                k_scale,
+                chunk.block_table,
+                chunk.local_cu_seq_lens,
+            )
+
+        t0, t1 = chunk.token_start, chunk.token_end
+        q_chunk = q_bf16[t0:t1]  # [t, H, D] bf16
+        w_chunk = weights_eff[t0:t1]  # [t, H] fp32
+        t = t1 - t0
+        k_bf = k_quant[: chunk.local_total_seq_lens].float()  # [n, D] fp32 (dequant values)
+        k_s = (
+            k_scale[: chunk.local_total_seq_lens]
+            .view(torch.float32)
+            .squeeze(-1)
+        )
+        k_bf = (k_bf * k_s.unsqueeze(1)).to(torch.bfloat16)  # [n, D] bf16
+
+        cu_ks = chunk.cu_seqlen_ks  # [t] — chunk-local query count, global K bounds
+        cu_ke = chunk.cu_seqlen_ke  # [t]
+        n = k_bf.shape[0]
+
+        # Streaming per-column-block GEMM + merge with the current top-k.
+        topk_vals = torch.full(
+            (t, topk_tokens), float("-inf"),
+            dtype=torch.float32, device=q_chunk.device,
+        )
+        topk_idx = torch.full(
+            (t, topk_tokens), -1,
+            dtype=torch.int32, device=q_chunk.device,
+        )
+        q2d = q_chunk.reshape(t * H, head_dim)  # [t*H, D]
+        for c0 in range(0, n, BLK):
+            c1 = min(c0 + BLK, n)
+            lg = torch.matmul(q2d, k_bf[c0:c1].T)  # [t*H, b] bf16
+            lg = lg.reshape(t, H, c1 - c0).clamp(min=0)  # per-head ReLU
+            lg = (lg * w_chunk.unsqueeze(-1)).sum(1)  # [t, b] fp32? keep dtype
+            col_idx = torch.arange(c0, c1, device=lg.device, dtype=torch.int32)
+            lg = lg.masked_fill(
+                (col_idx.unsqueeze(0) >= cu_ke.unsqueeze(1))
+                | (col_idx.unsqueeze(0) < cu_ks.unsqueeze(1)),
+                float("-inf"),
+            )
+            merged_v = torch.cat([topk_vals, lg], dim=1)
+            merged_i = torch.cat(
+                [topk_idx, col_idx.expand(t, -1)], dim=1
+            )
+            topk_vals, pick = merged_v.topk(topk_tokens, dim=1)
+            topk_idx = merged_i.gather(1, pick)
+
+        # Local indices relative to the chunk's K start: the paged path writes
+        # per-chunk local indices here; the consumer adds the chunk offset.
+        topk_indices_buffer[t0:t1, :topk_tokens] = topk_idx
+        # Fill -1 for rows whose valid range is smaller than topk_tokens.
+        valid_counts = (cu_ke - cu_ks).clamp(max=topk_tokens)
+        row_pos = torch.arange(topk_tokens, device=topk_idx.device).unsqueeze(0)
+        topk_indices_buffer[t0:t1, :topk_tokens] = torch.where(
+            row_pos < valid_counts.unsqueeze(1),
+            topk_indices_buffer[t0:t1, :topk_tokens],
+            torch.tensor(-1, dtype=torch.int32, device=topk_idx.device),
+        )
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -366,6 +493,7 @@ def sparse_attn_indexer(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     skip_topk_buffer_clear: bool = False,
+    skip_prefill: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -449,7 +577,7 @@ def sparse_attn_indexer(
     # fill.
     if not skip_topk_buffer_clear:
         topk_indices_buffer[: hidden_states.shape[0]] = -1
-    if has_prefill:
+    if has_prefill and not skip_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
 
@@ -988,9 +1116,13 @@ class SparseAttnIndexer(CustomOp):
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         k: torch.Tensor,
         weights: torch.Tensor,
+        q_rope_bf16: torch.Tensor | None = None,
+        weights_eff: torch.Tensor | None = None,
     ):
         if current_platform.is_cuda() or current_platform.is_xpu():
-            return self.forward_cuda(hidden_states, q_quant, k, weights)
+            return self.forward_cuda(
+                hidden_states, q_quant, k, weights, q_rope_bf16, weights_eff
+            )
         elif current_platform.is_rocm():
             return self.forward_hip(hidden_states, q_quant, k, weights)
         else:
@@ -1005,6 +1137,8 @@ class SparseAttnIndexer(CustomOp):
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         k: torch.Tensor,
         weights: torch.Tensor,
+        q_rope_bf16: torch.Tensor | None = None,
+        weights_eff: torch.Tensor | None = None,
     ):
         # FP8 path: single tensor (per-token scale is folded into `weights`).
         # FP4 path: (values, scales) tuple with scales required by the kernel.
@@ -1012,6 +1146,35 @@ class SparseAttnIndexer(CustomOp):
             q_values, q_scale = q_quant
         else:
             q_values, q_scale = q_quant, None
+
+        # GEMM-based prefill scoring (VLLM_INDEXER_GEMM=1): replaces the paged
+        # per-block prefill kernel with a blocked bf16 GEMM + streaming top-k.
+        # Decode keeps the paged kernel (it does not gather the full history).
+        use_gemm = (
+            os.environ.get("VLLM_INDEXER_GEMM") == "1"
+            and not self.use_fp4_cache
+            and q_rope_bf16 is not None
+            and weights_eff is not None
+            and self.dcp_world_size <= 1
+            and get_forward_context().attn_metadata is not None
+        )
+        if use_gemm:
+            indexer_gemm_prefill(
+                hidden_states,
+                _encode_layer_name(self.k_cache.prefix),
+                self.k_cache.kv_cache,
+                q_rope_bf16,
+                weights_eff,
+                self.quant_block_size,
+                self.scale_fmt,
+                self.topk_tokens,
+                self.head_dim,
+                self.max_model_len,
+                self.max_total_seq_len,
+                self.topk_indices_buffer,
+                use_fp4_cache=self.use_fp4_cache,
+            )
+
         return torch.ops.vllm.sparse_attn_indexer(
             hidden_states,
             _encode_layer_name(self.k_cache.prefix),
@@ -1032,6 +1195,8 @@ class SparseAttnIndexer(CustomOp):
             self.dcp_rank,
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
+            skip_topk_buffer_clear=use_gemm,
+            skip_prefill=use_gemm,
         )
 
     def forward_xpu(

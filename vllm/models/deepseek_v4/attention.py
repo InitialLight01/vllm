@@ -615,6 +615,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # block's wall time is ~30ms (join/stream-queue overhead) — the
             # overlap saves <1ms and costs ~22ms. VLLM_SKIP_ATTN_OVERLAP=1
             # runs the branches sequentially on the default stream.
+            # NOTE(2026-08-20): VLLM_INDEXER_STRIDE>1 (skip rescoring on some
+            # prefill chunks) is semantically broken for long context — stale
+            # topk selections leave newly-written compressed KV blocks unseen
+            # (2needle 1M n=10 all-fail at stride=4). The correct fix is an
+            # incremental scoring kernel (score only new blocks + merge).
             import os as _os
             _overlap_enabled = (
                 aux_streams is not None
@@ -1163,22 +1168,25 @@ class DeepseekV4Indexer(nn.Module):
             torch.cuda.synchronize()
             with open(_os.environ["VLLM_PROFILE"], "a") as _f:
                 _f.write(f"compressor+wq r{self.compress_ratio} {_pc0.elapsed_time(_pc1):.3f}ms\n")
-        return self.indexer_op(hidden_states, q_quant, k, weights)
 
-
-def _timed_compressor(compressor, kv_score, positions, rotary_emb, ratio) -> None:
-    import os as _os
-    if _os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing():
-        _c0 = torch.cuda.Event(enable_timing=True)
-        _c1 = torch.cuda.Event(enable_timing=True)
-        _c0.record()
-        compressor(kv_score, positions, rotary_emb)
-        _c1.record()
-        torch.cuda.synchronize()
-        with open(_os.environ["VLLM_PROFILE"], "a") as _f:
-            _f.write(f"mlacompress r{ratio} {_c0.elapsed_time(_c1):.3f}ms\n")
-    else:
-        compressor(kv_score, positions, rotary_emb)
+        # GEMM-based prefill scoring (VLLM_INDEXER_GEMM=1): additionally
+        # prepare the bf16 RoPE'd Q and the unfolded per-head weights
+        # (q per-token scale x softmax x head scale). The paged kernel still
+        # serves decode steps; indexer_gemm_prefill replaces the prefill
+        # scoring inside SparseAttnIndexer.forward_cuda.
+        q_rope_bf16: torch.Tensor | None = None
+        weights_eff: torch.Tensor | None = None
+        if os.environ.get("VLLM_INDEXER_GEMM") == "1" and not self.use_fp4_kv:
+            q_bf, _ = self.wq_b(qr)
+            q_bf = q_bf.view(-1, self.n_head, self.head_dim)
+            q_rope_bf16, _ = rotary_emb(positions, q_bf)
+            q_scale = q_rope_bf16.abs().amax(dim=-1, keepdim=True).div(448.0)
+            weights_eff = (indexer_weights * q_scale.squeeze(-1)) * (
+                self.softmax_scale * self.n_head**-0.5
+            )
+        return self.indexer_op(
+            hidden_states, q_quant, k, weights, q_rope_bf16, weights_eff
+        )
 
 
 def _timed_compressor(compressor, kv_score, positions, rotary_emb, ratio) -> None:
