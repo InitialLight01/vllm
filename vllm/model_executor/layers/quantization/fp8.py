@@ -389,7 +389,12 @@ class Fp8LinearMethod(LinearMethodBase):
         # NOTE(确定性排查): VLLM_FP8_FORCE_TRITON=1 强制 Triton block-FP8
         # kernel (确定性候选), 用于二分 FlashInfer-DeepGEMM 的逐次不确定。
         _force_kernel = None
-        if os.environ.get("VLLM_FP8_FORCE_TRITON", "0") == "1":
+        if (
+            os.environ.get("VLLM_FP8_FORCE_TRITON", "0") == "1"
+            and getattr(layer, "prefix", "").endswith(".wq_b")
+        ):
+            # 仅 wq_b: 其余 linear (wo_a/wo_b 等) 保持 DeepGEMM 的
+            # 权重布局, 避免 o_proj einsum 的形状不匹配。
             from vllm.model_executor.kernels.linear import (
                 TritonFp8BlockScaledMMKernel,
             )
