@@ -386,6 +386,15 @@ class Fp8LinearMethod(LinearMethodBase):
             set_weight_attrs(scale, {"scale_type": "input_scale"})
             layer.register_parameter("input_scale", scale)
 
+        # NOTE(确定性排查): VLLM_FP8_FORCE_TRITON=1 强制 Triton block-FP8
+        # kernel (确定性候选), 用于二分 FlashInfer-DeepGEMM 的逐次不确定。
+        _force_kernel = None
+        if os.environ.get("VLLM_FP8_FORCE_TRITON", "0") == "1":
+            from vllm.model_executor.kernels.linear import (
+                TritonFp8BlockScaledMMKernel,
+            )
+
+            _force_kernel = TritonFp8BlockScaledMMKernel
         self.fp8_linear = init_fp8_linear_kernel(
             activation_quant_key=self.activation_quant_key,
             weight_quant_key=self.weight_quant_key,
@@ -393,6 +402,7 @@ class Fp8LinearMethod(LinearMethodBase):
             input_dtype=self.input_dtype,
             out_dtype=self.out_dtype,
             module_name=self.__class__.__name__,
+            force_kernel=_force_kernel,
         )
 
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
