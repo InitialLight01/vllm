@@ -556,6 +556,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
+                if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+                    try:
+                        import json as _jqr
+                        torch.cuda.synchronize()
+                        _rv = qr.detach().contiguous().view(torch.int16)
+                        _rs = int(_rv.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                        with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                            _f.write(_jqr.dumps({
+                                "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                                "comp": "wq_b_qr",
+                                "prefix": self.prefix,
+                                "pos0": int(positions.view(-1)[0].item()),
+                                "qr_shape": list(qr.shape),
+                                "qrsum": _rs,
+                                "h8": [_rv.view(-1)[i].item() for i in range(8)],
+                            }) + "\n")
+                    except Exception:
+                        pass
                 import os as _os2
                 _prof2 = _os2.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing()
                 if _prof2:
