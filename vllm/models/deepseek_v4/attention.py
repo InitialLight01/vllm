@@ -517,7 +517,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     "ntok": int(hidden_states.shape[0]),
                 }
                 for _name, _t in (("qr_kv", qr_kv), ("kv_score", kv_score),
-                                  ("indexer_kv_score", indexer_kv_score)):
+                                  ("indexer_kv_score", indexer_kv_score),
+                                  ("indexer_weights", indexer_weights)):
                     _v = _t.detach().contiguous().view(torch.int16)
                     _rec[_name] = int(_v.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
                     _rec[_name + "_h8"] = [_v.view(-1)[i].item() for i in range(4)]
