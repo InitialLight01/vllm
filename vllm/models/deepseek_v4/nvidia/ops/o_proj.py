@@ -84,6 +84,24 @@ def deep_gemm_fp8_o_proj(
             list(einsum_recipe),
         )
     else:
+        # NOTE(确定性排查): 打印 einsum 各张量的 shape/dim — 定位
+        # force-Triton 下 dummy 预热的 layout 断言 (t.dim()==N)。
+        import os as _os
+        if _os.environ.get("VLLM_FP8_FORCE_TRITON", "0") == "1":
+            print(
+                "[oproj-probe] o_fp8",
+                tuple(o_fp8.shape),
+                o_fp8.dim(),
+                "o_scale",
+                tuple(o_scale.shape),
+                "wo_a",
+                tuple(wo_a.weight.shape),
+                "wo_a_scale",
+                tuple(wo_a_scale.shape) if wo_a_scale is not None else None,
+                "recipe",
+                list(einsum_recipe),
+                flush=True,
+            )
         # DeepGEMM C++ fp8_einsum (SM90/SM100, SM12x TMA recipe) — the
         # original direct-call semantics with the 2D weight.
         fp8_einsum(
