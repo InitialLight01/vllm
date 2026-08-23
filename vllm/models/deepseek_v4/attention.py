@@ -786,7 +786,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             #            the padded q tensor.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            # 指纹: kv 输入 (fused_wqa_wkv GEMM 输出) — 写入侧因果链的源头
+            if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+                try:
+                    import json as _jkvin
+                    torch.cuda.synchronize()
+                    _vv = kv.detach().contiguous().view(torch.int16)
+                    _vs = int(_vv.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                    with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                        _f.write(_jkvin.dumps({
+                            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                            "comp": "kv_in",
+                            "prefix": self.prefix,
+                            "pos0": int(positions.view(-1)[0].item()),
+                            "bitsum": _vs,
+                            "h8": [_vv.view(-1)[i].item() for i in range(8)],
+                        }) + "\n")
+                except Exception:
+                    pass
+            q = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
                 swa_kv_cache_2d,
@@ -797,6 +815,82 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.eps,
                 swa_metadata.block_size,
             )
+            # 指纹: 刚写入的 SWA cache 行 (flat slot, 584B/token packed uint8)
+            if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+                try:
+                    import json as _jsww
+                    torch.cuda.synchronize()
+                    _sm = swa_metadata.slot_mapping
+                    _ok = _sm >= 0
+                    if _ok.any():
+                        # flat token 行: 原始 [num_blocks, block_size, 584] → [-1, 584]
+                        _swa_flat = swa_kv_cache.reshape(-1, swa_kv_cache.shape[-1])
+                        _nrows_tot = _swa_flat.shape[0]
+                        _oob = int((_sm[_ok] >= _nrows_tot).sum().item())
+                        _idx = _sm[_ok].to(torch.int64).clamp(0, _nrows_tot - 1)
+                        _rows = _swa_flat[_idx]
+                        _bitsum = int(_rows.sum(dtype=torch.int64).item())
+                        _h8 = [_rows.view(-1)[i].item() for i in range(8)]
+                        # 区域指纹: [0:448) fp8 数据 / [448:576) rope bf16 /
+                        # [576:584) UE8M0 scale 字节
+                        _w = _rows.shape[-1]
+                        _bsd = int(_rows[..., :448].sum(dtype=torch.int64).item())
+                        _bsr = int(_rows[..., 448:576].sum(dtype=torch.int64).item())
+                        _bsc = int(_rows[..., 576:_w].sum(dtype=torch.int64).item())
+                        # 行分桶指纹: 行号 %8 → 8 桶和; 尾部行残留 vs 均匀翻转判别
+                        _nb = _rows.shape[0]
+                        _bk = [int(_rows[_i::8].sum(dtype=torch.int64).item())
+                               for _i in range(8)]
+                        # 逐行指纹: bucket 3 (已知脏桶) 的每行和 — 锁定具体行
+                        _r3 = _rows[3::8]
+                        _s3 = _r3.sum(dim=1).to(torch.int64).tolist() if _r3.shape[0] else []
+                        # 最后一行全字节 + 槽号 + 倒数第二行 (干净参照)
+                        _slotl = int(_sm[_ok][-1].item())
+                        _rowl = _rows[-1].to(torch.int64).tolist()
+                        _rowp = _rows[-2].to(torch.int64).tolist() if _rows.shape[0] > 1 else []
+                        # 张量布局 + kernel append-scale 位置的 8 字节
+                        _tshape = list(swa_kv_cache.shape)
+                        _tstride = list(swa_kv_cache.stride())
+                        try:
+                            _b0 = (_slotl // 64) * _tstride[0] if len(_tstride) > 0 else 0
+                            _scbl = swa_kv_cache.reshape(-1)[
+                                _b0 + 64 * 576 + (_slotl % 64) * 8:
+                                _b0 + 64 * 576 + (_slotl % 64) * 8 + 8
+                            ].to(torch.int64).tolist()
+                        except Exception:
+                            _scbl = []
+                        _h8l = [_rows.view(-1)[_i].item()
+                                for _i in range((_nb - 1) * _w, min(_nb * _w, (_nb - 1) * _w + 8))]
+                        with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                            _f.write(_jsww.dumps({
+                                "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                                "comp": "swa_write",
+                                "prefix": self.prefix,
+                                "pos0": int(positions.view(-1)[0].item()),
+                                "nrows": int(_ok.sum().item()),
+                                "oob": _oob,
+                                "bitsum": _bitsum,
+                                "bd": _bsd, "br": _bsr, "bc": _bsc,
+                                "bk": _bk,
+                                "s3": _s3,
+                                "slotl": _slotl,
+                                "rowl": _rowl,
+                                "rowp": _rowp,
+                                "tshape": _tshape,
+                                "tstride": _tstride,
+                                "scbl": _scbl,
+                                "h8": _h8,
+                                "h8l": _h8l,
+                            }) + "\n")
+                except Exception as _esw:
+                    try:
+                        import json as _jesw
+                        with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                            _f.write(_jesw.dumps({"comp": "swa_write_err", "err": str(_esw),
+                                                  "prefix": self.prefix}) + "\n")
+                    except Exception:
+                        pass
+            return q
 
         # Plain-row path: the [num_blocks, block_size, 512] cache stores the KV
         # row in its element dtype (no Q padding). bf16 rewrites q in place;

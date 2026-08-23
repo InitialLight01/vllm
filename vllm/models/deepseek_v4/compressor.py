@@ -366,6 +366,32 @@ class DeepseekCompressor(nn.Module):
             compress_ratio=self.compress_ratio,
             pdl_kwargs=pdl_kwargs,
         )
+        # 指纹: save_partial_states 刚写入的 state cache 行 (compress kernel 的输入)
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jstw
+                torch.cuda.synchronize()
+                _ss = slot_mapping
+                _sc = state_cache.detach()
+                _sflat = _sc.reshape(-1, _sc.shape[-1])
+                _ok2 = _ss >= 0
+                if _ok2.any():
+                    _idx2 = _ss[_ok2].to(torch.int64).clamp(0, _sflat.shape[0] - 1)
+                    _rows2 = _sflat[_idx2].view(torch.int32)
+                    _bitsum2 = int(_rows2.sum(dtype=torch.int64).item())
+                    _h82 = [_rows2.view(-1)[i].item() for i in range(8)]
+                    with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                        _f.write(_jstw.dumps({
+                            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                            "comp": "state_write",
+                            "prefix": self.prefix,
+                            "pos0": int(positions.view(-1)[0].item()),
+                            "nrows": int(_ok2.sum().item()),
+                            "bitsum": _bitsum2,
+                            "h8": _h82,
+                        }) + "\n")
+            except Exception:
+                pass
 
         # Fused: compress → RMSNorm → RoPE → FP8 quant → KV cache write.
         # RoPE requirements (kernel applies forward GPT-J style rotation):
@@ -459,6 +485,61 @@ class DeepseekCompressor(nn.Module):
             scale_dim=self._scale_dim,
             **extra_kwargs,
         )
+        # 指纹: 刚写入的压缩 KV cache 行 (k_cache_metadata.slot_mapping 为
+        # flat slot: block = slot // block_size, 行 = block*stride0 + off*width)
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jcw
+                torch.cuda.synchronize()
+                _ks = k_cache_metadata.slot_mapping
+                _kc = kv_cache.detach()
+                # 压缩 cache 与 KV blocks 共享物理张量, 可能非连续 → reshape
+                _kflat = _kc.reshape(-1, _kc.shape[-1])
+                _ok = _ks >= 0
+                if _ok.any():
+                    _idx = _ks[_ok].to(torch.int64).clamp(0, _kflat.shape[0] - 1)
+                    _rows = _kflat[_idx]
+                    _bitsum = int(_rows.sum(dtype=torch.int64).item())
+                    _h8 = [_rows.view(-1)[i].item() for i in range(8)]
+                    _w = _rows.shape[-1]
+                    _bsd = int(_rows[..., :448].sum(dtype=torch.int64).item())
+                    _bsr = int(_rows[..., 448:576].sum(dtype=torch.int64).item())
+                    _bsc = int(_rows[..., 576:_w].sum(dtype=torch.int64).item())
+                    _nb = _rows.shape[0]
+                    _bk = [int(_rows[_i::8].sum(dtype=torch.int64).item())
+                           for _i in range(8)]
+                    _r6 = _rows[6::8]
+                    _s6 = _r6.sum(dim=1).to(torch.int64).tolist() if _r6.shape[0] else []
+                    _slotl = int(_ks[_ok][-1].item())
+                    _rowl = _rows[-1].to(torch.int64).tolist()
+                    _rowp = _rows[-2].to(torch.int64).tolist() if _rows.shape[0] > 1 else []
+                    _h8l = [_rows.view(-1)[_i].item()
+                            for _i in range((_nb - 1) * _w, min(_nb * _w, (_nb - 1) * _w + 8))]
+                    with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                        _f.write(_jcw.dumps({
+                            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                            "comp": "comp_write",
+                            "prefix": self.prefix,
+                            "pos0": int(positions.view(-1)[0].item()),
+                            "nrows": int(_ok.sum().item()),
+                            "bitsum": _bitsum,
+                            "bd": _bsd, "br": _bsr, "bc": _bsc,
+                            "bk": _bk,
+                            "s6": _s6,
+                            "slotl": _slotl,
+                            "rowl": _rowl,
+                            "rowp": _rowp,
+                            "h8": _h8,
+                            "h8l": _h8l,
+                        }) + "\n")
+            except Exception as _ecw:
+                try:
+                    import json as _jecw
+                    with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                        _f.write(_jecw.dumps({"comp": "comp_write_err", "err": str(_ecw),
+                                              "prefix": self.prefix}) + "\n")
+                except Exception:
+                    pass
         if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
             try:
                 import json as _jcomp
