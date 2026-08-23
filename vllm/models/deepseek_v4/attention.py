@@ -563,6 +563,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     _w1 = torch.cuda.Event(enable_timing=True)
                     _w0.record()
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+                    try:
+                        import json as _jqw
+                        torch.cuda.synchronize()
+                        _qv = q.detach().contiguous().view(torch.int16)
+                        _qs = int(_qv.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                        with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                            _f.write(_jqw.dumps({
+                                "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                                "comp": "attn_q_wqb",
+                                "prefix": self.prefix,
+                                "pos0": int(positions.view(-1)[0].item()),
+                                "qsum": _qs,
+                                "h8": [_qv.view(-1)[i].item() for i in range(8)],
+                            }) + "\n")
+                    except Exception:
+                        pass
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 if _prof2:
                     _w1.record()
