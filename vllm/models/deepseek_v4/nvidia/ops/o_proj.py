@@ -87,7 +87,7 @@ def deep_gemm_fp8_o_proj(
         # NOTE(确定性排查): 打印 einsum 各张量的 shape/dim — 定位
         # force-Triton 下 dummy 预热的 layout 断言 (t.dim()==N)。
         import os as _os
-        if _os.environ.get("VLLM_FP8_FORCE_TRITON", "0") == "1":
+        if _os.environ.get("VLLM_OPROJ_PROBE", "1") == "1":
             print(
                 "[oproj-probe] o_fp8",
                 tuple(o_fp8.shape),
