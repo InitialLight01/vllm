@@ -580,6 +580,37 @@ def _per_token_group_quant_fp8_colmajor(
     tl.store(y_s_ptr, y_s)
 
 
+def _dump_act_quant(x, x_q, x_s, group_size):
+    try:
+        import os, json
+        import torch as _t
+        if not os.environ.get("VLLM_DUMP_HIDDEN_FP"):
+            return
+        if _t.cuda.is_current_stream_capturing():
+            return
+        _t.cuda.synchronize()
+        _in = x.detach().contiguous().view(_t.int16)
+        _in_s = int(_in.sum(dim=1, dtype=_t.int32).sum(dtype=_t.int64).item())
+        _out = x_q.detach().contiguous().view(_t.int8)
+        _out_s = int(_out.to(_t.int32).sum(dim=1, dtype=_t.int64).sum().item())
+        _sc = x_s.detach().contiguous().view(_t.int16)
+        _sc_s = int(_sc.sum(dim=1, dtype=_t.int32).sum(dtype=_t.int64).item())
+        with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+            _f.write(json.dumps({
+                "rank": _t.distributed.get_rank() if _t.distributed.is_initialized() else -1,
+                "comp": "act_quant",
+                "shape": list(x.shape),
+                "group": group_size,
+                "in_sum": _in_s,
+                "out_sum": _out_s,
+                "sc_sum": _sc_s,
+                "in_h8": [_in.view(-1)[i].item() for i in range(8)],
+                "out_h8": [_out.view(-1)[i].item() for i in range(8)],
+            }) + "\n")
+    except Exception:
+        pass
+
+
 def per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
@@ -651,6 +682,7 @@ def per_token_group_quant_fp8(
     if (
         current_platform.is_cuda_alike() or current_platform.is_xpu()
     ) and x.is_contiguous():
+        _dump_act_quant(x, x_q, x_s, group_size)
         torch.ops._C.per_token_group_fp8_quant(
             x,
             x_q,
