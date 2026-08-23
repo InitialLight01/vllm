@@ -615,11 +615,17 @@ static void launchFusedDeepseekV4Templated(
   config.blockDim = dim3(kBlockSize);
   config.dynamicSmemBytes = 0;
   config.stream = stream;
+  // NOTE(确定性修复): PSS (programmatic stream serialization) 要求上游
+  // 生产者 (q/kv GEMM) 通过 cudaTriggerProgrammaticLaunchCompletion 触发
+  // 网格依赖 — 本栈的上游为 cuBLAS/DeepGEMM (非 PDL 感知), 触发缺失时
+  // cudaGridDependencySynchronize 变为 no-op → kernel 在生产者写回前
+  // 读取 q_in/kv_in → 读后写竞态 (位级指纹证实: L2 q 在 chunk0 逐次
+  // 巨大分歧)。关闭 PSS 恢复标准流串行化 (正确性), 代价为 µs 级重叠收益。
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = 1;
   config.attrs = attrs;
-  config.numAttrs = (sm_version >= 90) ? 1 : 0;
+  config.numAttrs = 0;
 
   if (num_tokens_full < NUM_TOKEN_CUTOFF) {
     cudaLaunchKernelEx(
@@ -917,11 +923,17 @@ static void launchFullCacheKernel(
   config.blockDim = dim3(kBlockSize);
   config.dynamicSmemBytes = 0;
   config.stream = stream;
+  // NOTE(确定性修复): PSS (programmatic stream serialization) 要求上游
+  // 生产者 (q/kv GEMM) 通过 cudaTriggerProgrammaticLaunchCompletion 触发
+  // 网格依赖 — 本栈的上游为 cuBLAS/DeepGEMM (非 PDL 感知), 触发缺失时
+  // cudaGridDependencySynchronize 变为 no-op → kernel 在生产者写回前
+  // 读取 q_in/kv_in → 读后写竞态 (位级指纹证实: L2 q 在 chunk0 逐次
+  // 巨大分歧)。关闭 PSS 恢复标准流串行化 (正确性), 代价为 µs 级重叠收益。
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = 1;
   config.attrs = attrs;
-  config.numAttrs = (sm_version >= 90) ? 1 : 0;
+  config.numAttrs = 0;
   cudaLaunchKernelEx(&config, kernel, q_inout, q_fp8_out, q_fp8_stride0,
                      q_fp8_stride1, kv_in, k_cache, slot_mapping, position_ids,
                      cos_sin_cache, fp8_scale, q_fp8_scale_inv, eps,
