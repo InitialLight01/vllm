@@ -614,6 +614,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
             if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
                 try:
+                    import json as _jq
+                    torch.cuda.synchronize()
+                    _qv = q.detach().contiguous().view(torch.int16)
+                    _qs = int(_qv.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                    with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                        _f.write(_jq.dumps({
+                            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                            "comp": "attn_q",
+                            "prefix": self.prefix,
+                            "pos0": int(positions.view(-1)[0].item()),
+                            "qsum": _qs,
+                            "h8": [_qv.view(-1)[i].item() for i in range(8)],
+                        }) + "\n")
+                except Exception:
+                    pass
+            if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+                try:
                     import json as _jtopk
                     torch.cuda.synchronize()
                     _nt = hidden_states.shape[0]
