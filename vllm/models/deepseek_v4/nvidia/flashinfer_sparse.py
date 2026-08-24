@@ -883,6 +883,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             local_topk_indices = self.topk_indices_buffer[
                 num_decode_tokens : num_decode_tokens + num_prefill_tokens
             ]
+            # 确定性修复 (附3 更新33): topk 输出顺序随物理分配变化
+            # (indexer kernel 按物理块序处理 → 块级置换, allocator
+            # free-list 复用跨请求改变块序) → 注意力累积顺序改变 →
+            # ulp 级 o 分歧 (2051 起, 位级 1.17%, 翻转 0.018)。
+            # 规范化为逻辑索引升序 (-1 填充置前) → 位级确定。
+            local_topk_indices = torch.sort(local_topk_indices, dim=-1).values
         else:
             if attn_metadata is None:
                 raise RuntimeError("C128A prefill metadata is missing.")
