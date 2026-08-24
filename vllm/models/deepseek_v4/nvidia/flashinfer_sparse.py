@@ -1088,9 +1088,52 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                         _wrowdata = _smd[torch.arange(_sm.numel(), device=_sm.device), _sm_p]
                         _sms = _fs[_sm_b].view(-1, 64, 8)
                         _wrowsc = _sms[torch.arange(_sm.numel(), device=_sm.device), _sm_p]
+                        # 压缩读行指纹: unique 槽 sum (顺序无关, 无伪像)
+                        # + token 2040-2059 的完整读行序列 (2051 分歧起点采样)
+                        _csum = None
+                        _csample = None
+                        if extra_sparse_indices_chunk is not None and compressed_k_cache is not None:
+                            _cflat576 = compressed_k_cache.as_strided(
+                                (compressed_k_cache.shape[0], compressed_k_cache.shape[1] * 576),
+                                (compressed_k_cache.stride(0), 1),
+                            )
+                            _cflatsc = compressed_k_cache.as_strided(
+                                (compressed_k_cache.shape[0], 512),
+                                (compressed_k_cache.stride(0), 1),
+                            )
+                            _cb = compressed_k_cache.shape[1]
+                            _eidx = extra_sparse_indices_chunk
+                            _ev = _eidx.view(-1).to(torch.int64)
+                            _ev = _ev[_ev >= 0]
+                            if _ev.numel():
+                                _cu = _ev.unique()
+                                _cblk = _cu // _cb
+                                _cpos = _cu % _cb
+                                _cd = _cflat576[_cblk].view(-1, _cb, 576)
+                                _crows = _cd[torch.arange(_cu.numel(), device=_cu.device), _cpos]
+                                _csum = int(_crows.sum(dtype=torch.int64).item())
+                                _csc = _cflatsc[_cblk].view(-1, _cb, 8)
+                                _csum_s = int(_csc[torch.arange(_cu.numel(), device=_cu.device), _cpos].sum(dtype=torch.int64).item())
+                            # 采样: token 2040-2059
+                            _s0, _s1 = min(2040, _eidx.shape[0]), min(2060, _eidx.shape[0])
+                            if _s1 > _s0:
+                                _es = _eidx[_s0:_s1]
+                                _els = extra_sparse_lengths_chunk[_s0:_s1]
+                                _sample_rows = []
+                                for _t in range(_es.shape[0]):
+                                    for _c in range(int(_els[_t].item())):
+                                        _sv = int(_es[_t, _c].item())
+                                        if _sv >= 0:
+                                            _b2, _p2 = _sv // _cb, _sv % _cb
+                                            _sample_rows.append(_cflat576[_b2, _p2 * 576:(_p2 + 1) * 576].cpu())
+                                            _sample_rows.append(_cflatsc[_b2, _p2 * 8:(_p2 + 1) * 8].cpu())
+                                _csample = torch.cat(_sample_rows) if _sample_rows else torch.zeros(0)
                         torch.save(
                             {
                                 "n": int(_capn),
+                                "csum": _csum,
+                                "csum_s": _csum_s,
+                                "csample": _csample,
                                 "q": q_chunk.detach().contiguous().cpu(),
                                 "swa_indices": swa_indices_chunk.detach().cpu(),
                                 "swa_lens": swa_lens_chunk.detach().cpu(),

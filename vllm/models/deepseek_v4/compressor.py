@@ -485,6 +485,43 @@ class DeepseekCompressor(nn.Module):
             scale_dim=self._scale_dim,
             **extra_kwargs,
         )
+        # comp 写行位级捕获 (VLLM_TRITON_DIFFCAP=<path>): token 序提取
+        # (slot_mapping[t] → 576B 行 + 8B scale) — L2 compressor + step1 环形
+        if os.environ.get("VLLM_TRITON_DIFFCAP") and self.prefix == "model.layers.2.attn.compressor":
+            try:
+                _cwn = getattr(self, "_diffcap_w_n", 0)
+                _p0 = int(positions.view(-1)[0].item())
+                _nn = k_cache_metadata.slot_mapping.shape[0]
+                if _p0 == 0:
+                    _ksm = k_cache_metadata.slot_mapping
+                    _n = _ksm.shape[0]
+                    _okm = _ksm >= 0
+                    if _n > 1000 and bool(_okm.any()):
+                        self._diffcap_w_n = _cwn + 1
+                        torch.cuda.synchronize()
+                        _slot = (_cwn + 1) % 2
+                        _cb = kv_cache.shape[1]
+                        _k576 = kv_cache.detach().as_strided(
+                            (kv_cache.shape[0], _cb * 576),
+                            (kv_cache.stride(0), 1),
+                        )
+                        _ksc = kv_cache.detach().as_strided(
+                            (kv_cache.shape[0], 512), (kv_cache.stride(0), 1)
+                        )
+                        _ksmv = _ksm[_okm]
+                        _b = _ksmv // _cb
+                        _p = _ksmv % _cb
+                        _d = _k576[_b].view(-1, _cb, 576)
+                        _rows = _d[torch.arange(_ksmv.numel(), device=_ksm.device), _p]
+                        _sc = _ksc[_b].view(-1, _cb, 8)
+                        _rowsc = _sc[torch.arange(_ksmv.numel(), device=_ksm.device), _p]
+                        torch.save(
+                            {"n": _cwn, "wrows": _rows.detach().cpu(), "wrowsc": _rowsc.detach().cpu(),
+                             "slots": _ksmv.detach().cpu()},
+                            os.environ["VLLM_TRITON_DIFFCAP"] + f".cw{_slot}.pt",
+                        )
+            except Exception as _ecw2:
+                print(f"[DIFFCAP-cw] err: {_ecw2}", flush=True)
         # 指纹: 刚写入的压缩 KV cache 行 (k_cache_metadata.slot_mapping 为
         # flat slot: block = slot // block_size, 行 = block*stride0 + off*width)
         if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
