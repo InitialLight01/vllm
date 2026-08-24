@@ -392,21 +392,45 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
         o = o_padded[:, : self.n_local_heads, :]
-        # 注意力输出 o 位级捕获 (VLLM_TRITON_DIFFCAP2) — L2 step1 前 2 请求
-        if os.environ.get("VLLM_TRITON_DIFFCAP2") and self.prefix == "model.layers.2.attn":
+        # 注意力输出 o 位级捕获 (VLLM_TRITON_DIFFCAP2) — L2/L3 chunk0 前 2
+        # 请求 + 最后 chunk (附3 更新39: run 35 指纹显示 L3 注意力在最后
+        # chunk 首个分歧, 需捕获最后 chunk 的 L2/L3 o 与 chunk0 对照)
+        if os.environ.get("VLLM_TRITON_DIFFCAP2") and self.prefix in (
+            "model.layers.2.attn",
+            "model.layers.3.attn",
+        ):
             try:
-                _cn2 = getattr(self, "_diffcap2_on", 0)
-                if int(positions.view(-1)[0].item()) == 0:
+                _p0 = int(positions.view(-1)[0].item())
+                if _p0 == 0:
                     _fctx2 = get_forward_context()
                     _smd2 = _fctx2.attn_metadata.get(self.swa_cache_layer.prefix) if isinstance(_fctx2.attn_metadata, dict) else None
                     _sl2 = int(_smd2.seq_lens[0].item()) if _smd2 is not None and _smd2.seq_lens is not None else None
-                    if _sl2 == 8188 and _cn2 < 2:
-                        self._diffcap2_on = _cn2 + 1
+                    if _sl2 == 8188:
+                        _l3 = self.prefix.endswith("layers.3.attn")
+                        _cattr = "_diffcap2_o3n" if _l3 else "_diffcap2_on"
+                        _cn2 = getattr(self, _cattr, 0)
+                        if _cn2 < 2:
+                            setattr(self, _cattr, _cn2 + 1)
+                            torch.cuda.synchronize()
+                            _slot2 = (_cn2 + 1) % 2
+                            _fname = f".o3_{_slot2}.pt" if _l3 else f".o{_slot2}.pt"
+                            torch.save(
+                                {"n": _cn2, "o": o.detach().contiguous().cpu()},
+                                os.environ["VLLM_TRITON_DIFFCAP2"] + _fname,
+                            )
+                elif _p0 > 100000:
+                    # 最后 chunk (130838 ctx: 起点 122820) — 独立环形
+                    _l3 = self.prefix.endswith("layers.3.attn")
+                    _cattr = "_diffcap2_ol3n" if _l3 else "_diffcap2_oln"
+                    _cnl = getattr(self, _cattr, 0)
+                    if _cnl < 2:
+                        setattr(self, _cattr, _cnl + 1)
                         torch.cuda.synchronize()
-                        _slot2 = (_cn2 + 1) % 2
+                        _slotl = (_cnl + 1) % 2
+                        _fname = f".o3last{_slotl}.pt" if _l3 else f".olast{_slotl}.pt"
                         torch.save(
-                            {"n": _cn2, "o": o.detach().contiguous().cpu()},
-                            os.environ["VLLM_TRITON_DIFFCAP2"] + f".o{_slot2}.pt",
+                            {"n": _cnl, "o": o.detach().contiguous().cpu()},
+                            os.environ["VLLM_TRITON_DIFFCAP2"] + _fname,
                         )
             except Exception as _e3:
                 print(f"[DIFFCAP2-o] err: {_e3}", flush=True)

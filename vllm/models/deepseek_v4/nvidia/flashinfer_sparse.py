@@ -1049,20 +1049,30 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             # 双请求 kernel 边界全量捕获 (VLLM_TRITON_DIFFCAP=<path>):
             # L2 chunk0 前 2 请求 — 保存 q/索引/lens/seq/req/sinks + 按
             # 真布局 (576 数据 + 块尾 scale) 提取的读行, 供离线位级比对。
+            # 附3 更新39: 同时捕获最后 chunk (chunk_idx == num_chunks-1,
+            # 短 chunk 1961 行 — run 35 指纹显示 L3 注意力在此分歧),
+            # 独立计数与文件后缀 .last{N}.pt。
+            _capn = None
+            _cap_suffix = ""
             if (
                 os.environ.get("VLLM_TRITON_DIFFCAP")
                 and self.prefix == "model.layers.2.attn"
-                and chunk_idx == 0
                 and q_chunk.shape[0] > 1000
                 and bool(swa_lens_chunk.max() > 0)
                 and int(swa_metadata.seq_lens[0].item()) == 8188
                 and (torch.distributed.get_rank() if torch.distributed.is_initialized() else 0) == 0
                 and not torch.cuda.is_current_stream_capturing()
             ):
-                try:
+                if chunk_idx == 0:
                     _capn = getattr(self, "_diffcap_n", 0)
+                elif chunk_idx == num_chunks - 1:
+                    _capn = getattr(self, "_diffcap_last_n", 0)
+                    _cap_suffix = "last"
+            if _capn is not None:
+                try:
+                    _cap_attr = "_diffcap_n" if not _cap_suffix else "_diffcap_last_n"
                     if _capn < 2:
-                        self._diffcap_n = _capn + 1
+                        setattr(self, _cap_attr, _capn + 1)
                         torch.cuda.synchronize()
                         _sidx2 = swa_indices_chunk.contiguous().view(-1).to(torch.int64)
                         _v2 = _sidx2[_sidx2 >= 0].unique()
@@ -1160,7 +1170,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                                 "scale": self.scale,
                             },
                             os.environ["VLLM_TRITON_DIFFCAP"]
-                            + f".n{q_chunk.shape[0]}.{_capn}.pt",
+                            + f".{_cap_suffix + '.' if _cap_suffix else ''}n{q_chunk.shape[0]}.{_capn}.pt",
                         )
                 except Exception as _edc:
                     print(f"[DIFFCAP] err: {_edc}", flush=True)
