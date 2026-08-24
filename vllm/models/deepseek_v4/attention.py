@@ -392,6 +392,28 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
         o = o_padded[:, : self.n_local_heads, :]
+        # 指纹: 注意力输出 (o_proj 前) — 与 attn_r 配对判别 o_proj 分歧
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jao
+                torch.cuda.synchronize()
+                _ov = o.detach().contiguous().view(torch.int16)
+                _os = int(_ov.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                # 行级 bucket (行%8) + 首 8 行 h8 — 定位分歧位置
+                _bk = [int(_ov[_i::8].sum(dtype=torch.int32).sum(dtype=torch.int64).item())
+                       for _i in range(8)]
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jao.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "attn_o",
+                        "prefix": self.prefix,
+                        "pos0": int(positions.view(-1)[0].item()),
+                        "bitsum": _os,
+                        "bk": _bk,
+                        "h8": [_ov.view(-1)[i].item() for i in range(8)],
+                    }) + "\n")
+            except Exception:
+                pass
         if os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing():
             _tatt1.record()
             torch.cuda.synchronize()
@@ -441,6 +463,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             _top1 = torch.cuda.Event(enable_timing=True)
             _top0.record()
         _r = self._o_proj(o, positions)
+        # 指纹: o_proj 输出 — 与 attn_o 配对判别 o_proj (wo_a/wo_b) 分歧
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jar
+                torch.cuda.synchronize()
+                _rv = _r.detach().contiguous().view(torch.int16)
+                _rs = int(_rv.sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item())
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jar.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "attn_r",
+                        "prefix": self.prefix,
+                        "pos0": int(positions.view(-1)[0].item()),
+                        "bitsum": _rs,
+                        "h8": [_rv.view(-1)[i].item() for i in range(8)],
+                    }) + "\n")
+            except Exception:
+                pass
         if os.environ.get("VLLM_PROFILE") and not torch.cuda.is_current_stream_capturing():
             _top1.record()
             torch.cuda.synchronize()
