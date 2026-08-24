@@ -485,41 +485,61 @@ class DeepseekCompressor(nn.Module):
             scale_dim=self._scale_dim,
             **extra_kwargs,
         )
-        # comp 写行位级捕获 (VLLM_TRITON_DIFFCAP=<path>): token 序提取
-        # (slot_mapping[t] → 576B 行 + 8B scale) — L2 compressor + step1 环形
+        # comp 写行位级捕获 (VLLM_TRITON_DIFFCAP=<path>): token 序提取, 全请求跨 chunk 累积
+        # (slot_mapping[t] → 576B 行 + 块尾 8B scale) — L2 compressor, rank0 专用 (防 TP 双写)
+        # 环形: 请求 N 的完整捕获在请求 N+1 的 chunk0 到达时落盘到 .cw{(N+1)%2}.pt
         if os.environ.get("VLLM_TRITON_DIFFCAP") and self.prefix == "model.layers.2.attn.compressor":
             try:
-                _cwn = getattr(self, "_diffcap_w_n", 0)
-                _p0 = int(positions.view(-1)[0].item())
-                _nn = k_cache_metadata.slot_mapping.shape[0]
-                if _p0 == 0:
-                    _ksm = k_cache_metadata.slot_mapping
-                    _n = _ksm.shape[0]
-                    _okm = _ksm >= 0
-                    if _n > 1000 and bool(_okm.any()):
-                        self._diffcap_w_n = _cwn + 1
+                _rank0 = (torch.distributed.get_rank() == 0) if torch.distributed.is_initialized() else True
+                if _rank0:
+                    _cwn = getattr(self, "_diffcap_w_n", 0)
+                    _p0 = int(positions.view(-1)[0].item())
+                    _nn = k_cache_metadata.slot_mapping.shape[0]
+                    _okm = k_cache_metadata.slot_mapping >= 0
+                    if _nn > 1000 and bool(_okm.any()):
                         torch.cuda.synchronize()
-                        _slot = (_cwn + 1) % 2
                         _cb = kv_cache.shape[1]
                         _k576 = kv_cache.detach().as_strided(
                             (kv_cache.shape[0], _cb * 576),
                             (kv_cache.stride(0), 1),
                         )
                         _ksc = kv_cache.detach().as_strided(
-                            (kv_cache.shape[0], 512), (kv_cache.stride(0), 1)
-                        )
-                        _ksmv = _ksm[_okm]
+                            (kv_cache.shape[0], _cb * 584), (kv_cache.stride(0), 1)
+                        )[:, _cb * 576 : _cb * 576 + _cb * 8]
+                        _ksmv = k_cache_metadata.slot_mapping[_okm]
                         _b = _ksmv // _cb
                         _p = _ksmv % _cb
                         _d = _k576[_b].view(-1, _cb, 576)
-                        _rows = _d[torch.arange(_ksmv.numel(), device=_ksm.device), _p]
+                        _rows = _d[torch.arange(_ksmv.numel(), device=_ksmv.device), _p]
                         _sc = _ksc[_b].view(-1, _cb, 8)
-                        _rowsc = _sc[torch.arange(_ksmv.numel(), device=_ksm.device), _p]
-                        torch.save(
-                            {"n": _cwn, "wrows": _rows.detach().cpu(), "wrowsc": _rowsc.detach().cpu(),
-                             "slots": _ksmv.detach().cpu()},
-                            os.environ["VLLM_TRITON_DIFFCAP"] + f".cw{_slot}.pt",
-                        )
+                        _rowsc = _sc[torch.arange(_ksmv.numel(), device=_ksmv.device), _p]
+                        _pend = getattr(self, "_diffcap_pend", None)
+                        if _p0 == 0:
+                            if _pend is not None and _pend["wrows"].shape[0] > 10000:
+                                # 前一请求已累积完整 → 落盘到其槽位, 开启新请求
+                                _slot = (_pend["n"] + 1) % 2
+                                torch.save(_pend, os.environ["VLLM_TRITON_DIFFCAP"] + f".cw{_slot}.pt")
+                                print(
+                                    f"[DIFFCAP-cw] flush n={_pend['n']} rows={_pend['wrows'].shape[0]} "
+                                    f"slot={_slot}", flush=True)
+                                self._diffcap_w_n = _cwn + 1
+                            elif _pend is not None:
+                                # 同请求 chunk0 重放 (verify 等) → 丢弃残片重启
+                                print(f"[DIFFCAP-cw] restart n={_cwn} (prev rows={_pend['wrows'].shape[0]})",
+                                      flush=True)
+                            else:
+                                self._diffcap_w_n = _cwn + 1
+                            self._diffcap_pend = {
+                                "n": _cwn,
+                                "wrows": _rows.detach().cpu(),
+                                "wrowsc": _rowsc.detach().cpu(),
+                                "slots": _ksmv.detach().cpu(),
+                            }
+                            print(f"[DIFFCAP-cw] new req n={_cwn} rows={_rows.shape[0]} cb={_cb}", flush=True)
+                        elif _pend is not None:
+                            _pend["wrows"] = torch.cat([_pend["wrows"], _rows.detach().cpu()], 0)
+                            _pend["wrowsc"] = torch.cat([_pend["wrowsc"], _rowsc.detach().cpu()], 0)
+                            _pend["slots"] = torch.cat([_pend["slots"], _ksmv.detach().cpu()], 0)
             except Exception as _ecw2:
                 print(f"[DIFFCAP-cw] err: {_ecw2}", flush=True)
         # 指纹: 刚写入的压缩 KV cache 行 (k_cache_metadata.slot_mapping 为
