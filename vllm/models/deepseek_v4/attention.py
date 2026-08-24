@@ -400,7 +400,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     _fctx2 = get_forward_context()
                     _smd2 = _fctx2.attn_metadata.get(self.swa_cache_layer.prefix) if isinstance(_fctx2.attn_metadata, dict) else None
                     _sl2 = int(_smd2.seq_lens[0].item()) if _smd2 is not None and _smd2.seq_lens is not None else None
-                    if _sl2 == 8188:
+                    if _sl2 == 8188 and _cn2 < 2:
                         self._diffcap2_on = _cn2 + 1
                         torch.cuda.synchronize()
                         _slot2 = (_cn2 + 1) % 2
@@ -489,7 +489,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     _fctx3 = get_forward_context()
                     _smd3 = _fctx3.attn_metadata.get(self.swa_cache_layer.prefix) if isinstance(_fctx3.attn_metadata, dict) else None
                     _sl3 = int(_smd3.seq_lens[0].item()) if _smd3 is not None and _smd3.seq_lens is not None else None
-                    if _sl3 == 8188:
+                    if _sl3 == 8188 and _cn3 < 2:
                         self._diffcap2_rn = _cn3 + 1
                         torch.cuda.synchronize()
                         _slot3 = (_cn3 + 1) % 2
@@ -631,7 +631,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     if isinstance(attn_metadata, dict):
                         _smd = attn_metadata.get(self.swa_cache_layer.prefix)
                         _sm_len = int(_smd.seq_lens[0].item()) if _smd is not None and _smd.seq_lens is not None else None
-                    if _sm_len == 8188:
+                    if _sm_len == 8188 and _cn < 2:
                         self._diffcap2_n = _cn + 1
                         torch.cuda.synchronize()
                         _slot = (_cn + 1) % 2  # 环形: 保留最近 2 个
