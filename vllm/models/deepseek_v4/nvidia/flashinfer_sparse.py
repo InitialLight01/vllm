@@ -883,12 +883,22 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             local_topk_indices = self.topk_indices_buffer[
                 num_decode_tokens : num_decode_tokens + num_prefill_tokens
             ]
-            # 确定性修复 (附3 更新33): topk 输出顺序随物理分配变化
+            # 确定性修复 (附3 更新33/34): topk 输出顺序随物理分配变化
             # (indexer kernel 按物理块序处理 → 块级置换, allocator
             # free-list 复用跨请求改变块序) → 注意力累积顺序改变 →
             # ulp 级 o 分歧 (2051 起, 位级 1.17%, 翻转 0.018)。
-            # 规范化为逻辑索引升序 (-1 填充置前) → 位级确定。
-            local_topk_indices = torch.sort(local_topk_indices, dim=-1).values
+            # 规范化为逻辑索引升序; 无效项 (任意负数) 以 INT_MAX 作
+            # 排序键保持置尾 (valid-front 约定: 注意力只读 [0, lens)),
+            # 排序后还原 -1 哨兵。v2: 直接升序会把 -1 置前破坏约定
+            # (run 31: o 99.59% 分歧自 token 0)。
+            _imax = torch.iinfo(local_topk_indices.dtype).max
+            _sort_key = torch.where(local_topk_indices >= 0, local_topk_indices, _imax)
+            local_topk_indices = torch.sort(_sort_key, dim=-1).values
+            local_topk_indices = torch.where(
+                local_topk_indices == _imax,
+                torch.tensor(-1, dtype=local_topk_indices.dtype, device=local_topk_indices.device),
+                local_topk_indices,
+            )
         else:
             if attn_metadata is None:
                 raise RuntimeError("C128A prefill metadata is missing.")
