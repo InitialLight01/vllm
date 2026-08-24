@@ -647,18 +647,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # 位级捕获 (VLLM_TRITON_DIFFCAP2=<path>): L2 + step1 (seq_len 8188)
         # 前 2 请求 — hidden (层输入) / qr (wq_a 输出) / kv (fused_wqa_wkv
         # kv 列) — 定位写入分歧的源头 (附3 更新28: q 净 kv 脏)。
-        if os.environ.get("VLLM_TRITON_DIFFCAP2") and self.prefix == "model.layers.2.attn":
+        if os.environ.get("VLLM_TRITON_DIFFCAP2") and self.prefix in (
+            "model.layers.2.attn",
+            "model.layers.3.attn",
+        ):
             try:
-                _cn = getattr(self, "_diffcap2_n", 0)
+                _l3 = self.prefix.endswith("layers.3.attn")
+                _cattr = "_diffcap2_r3n" if _l3 else "_diffcap2_n"
+                _cn = getattr(self, _cattr, 0)
                 if int(positions.view(-1)[0].item()) == 0:
                     _sm_len = None
                     if isinstance(attn_metadata, dict):
                         _smd = attn_metadata.get(self.swa_cache_layer.prefix)
                         _sm_len = int(_smd.seq_lens[0].item()) if _smd is not None and _smd.seq_lens is not None else None
                     if _sm_len == 8188 and _cn < 2:
-                        self._diffcap2_n = _cn + 1
+                        setattr(self, _cattr, _cn + 1)
                         torch.cuda.synchronize()
                         _slot = (_cn + 1) % 2  # 环形: 保留最近 2 个
+                        _fname = f".ring3_{_slot}.pt" if _l3 else f".ring{_slot}.pt"
                         torch.save(
                             {
                                 "n": _cn,
@@ -666,7 +672,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                                 "qr": qr.detach().contiguous().cpu(),
                                 "kv": kv.detach().contiguous().cpu(),
                             },
-                            os.environ["VLLM_TRITON_DIFFCAP2"] + f".ring{_slot}.pt",
+                            os.environ["VLLM_TRITON_DIFFCAP2"] + _fname,
                         )
             except Exception as _e2:
                 print(f"[DIFFCAP2] err: {_e2}", flush=True)
