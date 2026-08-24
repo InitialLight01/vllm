@@ -982,11 +982,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                             (swa_k_cache.shape[0], swa_k_cache.shape[1] * swa_k_cache.shape[2]),
                             (swa_k_cache.stride(0), 1),
                         )
-                        # 只 gather 实际被读的块 (swa_indices 引用的块去重)
-                        _blocks = (_vl // swa_k_cache.shape[1]).unique()
-                        _rows = _sflat[_blocks]
+                        # 只 gather 有效槽引用的行 (去重) — 整块 gather 会
+                        # 混入未写的残留行 (伪像)
+                        _uslots = _vl.clamp(max=_sflat.shape[0] - 1).unique()
+                        _rows = _sflat[_uslots]
                         _bitsum = int(_rows.sum(dtype=torch.int64).item())
-                        # 压缩读侧: extra 槽引用的块
+                        # 压缩读侧: extra 槽引用的行
                         _cbitsum = None
                         _cextra = None
                         if extra_sparse_indices_chunk is not None and compressed_k_cache is not None:
@@ -997,8 +998,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                                     (compressed_k_cache.shape[0], compressed_k_cache.shape[1] * compressed_k_cache.shape[2]),
                                     (compressed_k_cache.stride(0), 1),
                                 )
-                                _cblocks = (_ev // compressed_k_cache.shape[1]).unique()
-                                _cbitsum = int(_cflat[_cblocks].sum(dtype=torch.int64).item())
+                                _cbitsum = int(_cflat[_ev.clamp(max=_cflat.shape[0] - 1).unique()].sum(dtype=torch.int64).item())
                                 _cextra = [int(_ev.min().item()), int(_ev.max().item())]
                         with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
                             _f.write(_jrs.dumps({
@@ -1007,7 +1007,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                                 "prefix": self.prefix,
                                 "pos0": int(swa_metadata.query_start_loc_cpu[
                                     num_decodes].item()) if swa_metadata.query_start_loc_cpu is not None else -1,
-                                "nblocks": int(_blocks.numel()),
+                                "nrows": int(_uslots.numel()),
                                 "bitsum": _bitsum,
                                 "cbitsum": _cbitsum,
                                 "cextra": _cextra,
@@ -1015,6 +1015,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                                 "idx_min": int(_vl.min().item()) if _vl.numel() else -1,
                                 "idx_max": int(_vl.max().item()) if _vl.numel() else -1,
                                 "lens_sum": int(swa_lens_chunk.sum().item()),
+                                "is_valid_sum": int(swa_metadata.is_valid_token.sum().item()) if swa_metadata.is_valid_token is not None else -1,
                             }) + "\n")
                 except Exception as _ers:
                     try:
