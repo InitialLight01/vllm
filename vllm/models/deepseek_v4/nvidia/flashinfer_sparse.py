@@ -1079,6 +1079,15 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                         _rowdata = _bd[torch.arange(_v2.numel(), device=_v2.device), _pos]  # [n, 576]
                         _sc = _fs[_blk].view(-1, 64, 8)
                         _rowsc = _sc[torch.arange(_v2.numel(), device=_v2.device), _pos]   # [n, 8]
+                        # 写域行: 按 token 顺序 (slot_mapping[t] → 576B 行)
+                        # — 槽值排序会导致跨请求行序错位 (伪像)
+                        _sm = swa_metadata.slot_mapping[: q_chunk.shape[0]]
+                        _sm_b = _sm // 64
+                        _sm_p = _sm % 64
+                        _smd = _f576[_sm_b].view(-1, 64, 576)
+                        _wrowdata = _smd[torch.arange(_sm.numel(), device=_sm.device), _sm_p]
+                        _sms = _fs[_sm_b].view(-1, 64, 8)
+                        _wrowsc = _sms[torch.arange(_sm.numel(), device=_sm.device), _sm_p]
                         torch.save(
                             {
                                 "n": int(_capn),
@@ -1094,8 +1103,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                                     num_decode_tokens + query_start :
                                     num_decode_tokens + query_end].detach().cpu(),
                                 "sinks": self.attn_sink.detach().cpu(),
+                                "slot_mapping": swa_metadata.slot_mapping.detach().cpu(),
                                 "rowdata": _rowdata.detach().cpu(),
                                 "rowsc": _rowsc.detach().cpu(),
+                                "wrowdata": _wrowdata.detach().cpu(),
+                                "wrowsc": _wrowsc.detach().cpu(),
                                 "scale": self.scale,
                             },
                             os.environ["VLLM_TRITON_DIFFCAP"]

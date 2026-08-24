@@ -392,6 +392,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
         o = o_padded[:, : self.n_local_heads, :]
+        # 注意力输出 o 位级捕获 (VLLM_TRITON_DIFFCAP2) — L2 step1 前 2 请求
+        if os.environ.get("VLLM_TRITON_DIFFCAP2") and self.prefix == "model.layers.2.attn":
+            try:
+                _cn2 = getattr(self, "_diffcap2_on", 0)
+                if int(positions.view(-1)[0].item()) == 0:
+                    _fctx2 = get_forward_context()
+                    _smd2 = _fctx2.attn_metadata.get(self.swa_cache_layer.prefix) if isinstance(_fctx2.attn_metadata, dict) else None
+                    _sl2 = int(_smd2.seq_lens[0].item()) if _smd2 is not None and _smd2.seq_lens is not None else None
+                    if _sl2 == 8188:
+                        self._diffcap2_on = _cn2 + 1
+                        torch.cuda.synchronize()
+                        _slot2 = (_cn2 + 1) % 2
+                        torch.save(
+                            {"n": _cn2, "o": o.detach().contiguous().cpu()},
+                            os.environ["VLLM_TRITON_DIFFCAP2"] + f".o{_slot2}.pt",
+                        )
+            except Exception as _e3:
+                print(f"[DIFFCAP2-o] err: {_e3}", flush=True)
         # 指纹: 注意力输出 (o_proj 前) — 与 attn_r 配对判别 o_proj 分歧
         if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
             try:
@@ -463,6 +481,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             _top1 = torch.cuda.Event(enable_timing=True)
             _top0.record()
         _r = self._o_proj(o, positions)
+        # o_proj 输出 r 位级捕获 (VLLM_TRITON_DIFFCAP2) — L2 step1 环形
+        if os.environ.get("VLLM_TRITON_DIFFCAP2") and self.prefix == "model.layers.2.attn":
+            try:
+                _cn3 = getattr(self, "_diffcap2_rn", 0)
+                if int(positions.view(-1)[0].item()) == 0:
+                    _fctx3 = get_forward_context()
+                    _smd3 = _fctx3.attn_metadata.get(self.swa_cache_layer.prefix) if isinstance(_fctx3.attn_metadata, dict) else None
+                    _sl3 = int(_smd3.seq_lens[0].item()) if _smd3 is not None and _smd3.seq_lens is not None else None
+                    if _sl3 == 8188:
+                        self._diffcap2_rn = _cn3 + 1
+                        torch.cuda.synchronize()
+                        _slot3 = (_cn3 + 1) % 2
+                        torch.save(
+                            {"n": _cn3, "r": _r.detach().contiguous().cpu()},
+                            os.environ["VLLM_TRITON_DIFFCAP2"] + f".r{_slot3}.pt",
+                        )
+            except Exception as _e4:
+                print(f"[DIFFCAP2-r] err: {_e4}", flush=True)
         # 指纹: o_proj 输出 — 与 attn_o 配对判别 o_proj (wo_a/wo_b) 分歧
         if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
             try:
@@ -583,6 +619,33 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
+
+        # 位级捕获 (VLLM_TRITON_DIFFCAP2=<path>): L2 + step1 (seq_len 8188)
+        # 前 2 请求 — hidden (层输入) / qr (wq_a 输出) / kv (fused_wqa_wkv
+        # kv 列) — 定位写入分歧的源头 (附3 更新28: q 净 kv 脏)。
+        if os.environ.get("VLLM_TRITON_DIFFCAP2") and self.prefix == "model.layers.2.attn":
+            try:
+                _cn = getattr(self, "_diffcap2_n", 0)
+                if int(positions.view(-1)[0].item()) == 0:
+                    _sm_len = None
+                    if isinstance(attn_metadata, dict):
+                        _smd = attn_metadata.get(self.swa_cache_layer.prefix)
+                        _sm_len = int(_smd.seq_lens[0].item()) if _smd is not None and _smd.seq_lens is not None else None
+                    if _sm_len == 8188:
+                        self._diffcap2_n = _cn + 1
+                        torch.cuda.synchronize()
+                        _slot = (_cn + 1) % 2  # 环形: 保留最近 2 个
+                        torch.save(
+                            {
+                                "n": _cn,
+                                "hidden": hidden_states.detach().contiguous().cpu(),
+                                "qr": qr.detach().contiguous().cpu(),
+                                "kv": kv.detach().contiguous().cpu(),
+                            },
+                            os.environ["VLLM_TRITON_DIFFCAP2"] + f".ring{_slot}.pt",
+                        )
+            except Exception as _e2:
+                print(f"[DIFFCAP2] err: {_e2}", flush=True)
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (forward_mqa
