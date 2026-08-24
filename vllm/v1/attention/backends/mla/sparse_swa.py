@@ -499,6 +499,18 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # the kernel read is_valid_token / token_to_req_indices at absolute
         # prefill positions while writing output starting at index 0.
         if num_prefill_tokens > 0:
+            # 确定性修复: 清零 block_table 行尾 (超出 seq_len 覆盖的块)。
+            # GPU 表由 commit_block_table 全行拷贝, 行尾 = 前请求残留块号;
+            # SWA 窗口索引会把这些残留块号映射为"有效"槽 → 注意力读到
+            # 非本请求写入的行 (附3 更新26 根因: 读行 95.6% 残留)。
+            # 清零后窗口索引只覆盖本请求已写入的块。VLLM_C4A_BT_TAIL_CLEAR=0
+            # 关闭。
+            if __import__("os").environ.get("VLLM_C4A_BT_TAIL_CLEAR", "1") != "0":
+                _nblk_needed = (seq_lens + self.block_size - 1) // self.block_size
+                for _r in range(block_table.shape[0]):
+                    _need = int(_nblk_needed[_r].item())
+                    if _need < block_table.shape[1]:
+                        block_table[_r, _need:] = -1
             prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
             prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
             _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
