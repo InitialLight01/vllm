@@ -1016,6 +1016,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                                 "idx_max": int(_vl.max().item()) if _vl.numel() else -1,
                                 "lens_sum": int(swa_lens_chunk.sum().item()),
                                 "is_valid_sum": int(swa_metadata.is_valid_token.sum().item()) if swa_metadata.is_valid_token is not None else -1,
+                                "bt16": [int(x) for x in swa_metadata.block_table[
+                                    0, :16].tolist()],
+                                "bt_valid": int((swa_metadata.block_table[0] >= 0).sum().item()),
+                                "idx0_16": [int(x) for x in swa_indices_chunk[
+                                    0, 0, :16].tolist()],
                             }) + "\n")
                 except Exception as _ers:
                     try:
@@ -1041,6 +1046,63 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 _pk0 = torch.cuda.Event(enable_timing=True)
                 _pk1 = torch.cuda.Event(enable_timing=True)
                 _pk0.record()
+            # 双请求 kernel 边界全量捕获 (VLLM_TRITON_DIFFCAP=<path>):
+            # L2 chunk0 前 2 请求 — 保存 q/索引/lens/seq/req/sinks + 按
+            # 真布局 (576 数据 + 块尾 scale) 提取的读行, 供离线位级比对。
+            if (
+                os.environ.get("VLLM_TRITON_DIFFCAP")
+                and self.prefix == "model.layers.2.attn"
+                and chunk_idx == 0
+                and q_chunk.shape[0] > 1000
+                and bool(swa_lens_chunk.max() > 0)
+                and int(swa_metadata.seq_lens[0].item()) == 8188
+                and (torch.distributed.get_rank() if torch.distributed.is_initialized() else 0) == 0
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                try:
+                    _capn = getattr(self, "_diffcap_n", 0)
+                    if _capn < 2:
+                        self._diffcap_n = _capn + 1
+                        torch.cuda.synchronize()
+                        _sidx2 = swa_indices_chunk.contiguous().view(-1).to(torch.int64)
+                        _v2 = _sidx2[_sidx2 >= 0].unique()
+                        _f576 = swa_k_cache.as_strided(
+                            (swa_k_cache.shape[0], swa_k_cache.shape[1] * 576),
+                            (swa_k_cache.stride(0), 1),
+                        )
+                        _fs = swa_k_cache.as_strided(
+                            (swa_k_cache.shape[0], 512), (swa_k_cache.stride(0), 1)
+                        )
+                        _blk = _v2 // 64
+                        _pos = _v2 % 64
+                        _bd = _f576[_blk].view(-1, 64, 576)
+                        _rowdata = _bd[torch.arange(_v2.numel(), device=_v2.device), _pos]  # [n, 576]
+                        _sc = _fs[_blk].view(-1, 64, 8)
+                        _rowsc = _sc[torch.arange(_v2.numel(), device=_v2.device), _pos]   # [n, 8]
+                        torch.save(
+                            {
+                                "n": int(_capn),
+                                "q": q_chunk.detach().contiguous().cpu(),
+                                "swa_indices": swa_indices_chunk.detach().cpu(),
+                                "swa_lens": swa_lens_chunk.detach().cpu(),
+                                "extra_indices": None if extra_sparse_indices_chunk is None
+                                else extra_sparse_indices_chunk.detach().cpu(),
+                                "extra_lens": None if extra_sparse_lengths_chunk is None
+                                else extra_sparse_lengths_chunk.detach().cpu(),
+                                "seq_lens": swa_metadata.seq_lens.detach().cpu(),
+                                "req_idx": swa_metadata.token_to_req_indices[
+                                    num_decode_tokens + query_start :
+                                    num_decode_tokens + query_end].detach().cpu(),
+                                "sinks": self.attn_sink.detach().cpu(),
+                                "rowdata": _rowdata.detach().cpu(),
+                                "rowsc": _rowsc.detach().cpu(),
+                                "scale": self.scale,
+                            },
+                            os.environ["VLLM_TRITON_DIFFCAP"]
+                            + f".n{q_chunk.shape[0]}.{_capn}.pt",
+                        )
+                except Exception as _edc:
+                    print(f"[DIFFCAP] err: {_edc}", flush=True)
             # 确定性 Triton 替代 (VLLM_TRITON_SPARSE_PREFILL=1): 固定序
             # 流式注意力, 布局与生产者一致 (576B/token + 块尾 UE8M0
             # scales)。默认关, 原 cubin 路径不变。
