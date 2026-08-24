@@ -731,6 +731,20 @@ def sparse_attn_indexer(
                         cp_kv_cache_interleave_size,
                         row_starts=chunk.cu_seqlen_ks,
                     )
+                    # 确定性修复 (附3 更新36): topk 行内顺序 = SMEM
+                    # atomicAdd 竞态序 (sampler.cu:267, ~480/512 项),
+                    # 跨请求不确定 → 注意力累积顺序 ulp 分歧 (o 位级
+                    # 1.18%, 从 2051 = 首个 rowLen>512 的行起)。选择
+                    # 集合由分数直方图确定 (确定), 此处按逻辑索引升序
+                    # 规范化 (INT_MAX 键保持 valid-front 约定, 排序后
+                    # 还原 -1 哨兵), 覆盖全部消费者。
+                    _imax = torch.iinfo(topk_indices.dtype).max
+                    _sorted_key = torch.where(
+                        topk_indices >= 0, topk_indices, _imax
+                    )
+                    _sorted_idx = torch.sort(_sorted_key, dim=-1).values
+                    topk_indices.copy_(_sorted_idx)
+                    topk_indices.masked_fill_(topk_indices == _imax, -1)
                     if _phase_timing:
                         _te[3].record()
                         torch.cuda.synchronize()
