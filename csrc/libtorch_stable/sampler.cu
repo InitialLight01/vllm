@@ -352,9 +352,9 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   using FinalSortTempStorage =
       std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
   // 确定性并列修正 (sm80 更新50b): 整数升序排序并列组索引 — 整数全序,
-  // 选择结果确定 (最小索引并列规范)。
+  // 选择结果确定 (最小索引并列规范)。本 CUB 版本需要显式 value 类型。
   using IntSort = cub::BlockRadixSort<int, kNumThreadsPerBlock,
-                                      kNumFinalItemsPerThread>;
+                                      kNumFinalItemsPerThread, int>;
   // The class to compute the inclusive prefix-sum over the histogram.
   using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
 
@@ -582,13 +582,14 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
           int totalTies = smemFinalDstIdx[0];
           if (totalTies > needed && needed > 0) {
             int tieKeys[kNumFinalItemsPerThread];
+            int tieVals[kNumFinalItemsPerThread];
 #pragma unroll
             for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
               tieKeys[ii] =
                   smemFinal.items.indices[ii * kNumThreadsPerBlock +
                                          threadIdx.x];
             }
-            IntSort(smemFinal.intSort).SortAscendingBlockedToStriped(tieKeys);
+            IntSort(smemFinal.intSort).Sort(tieKeys, tieVals);
             // 回填: 全局升序位置 p 的最小索引 → 槽 topK - needed + p。
             for (int p = threadIdx.x; p < needed; p += kNumThreadsPerBlock) {
               int sortedKey = tieKeys[p / kNumThreadsPerBlock];
