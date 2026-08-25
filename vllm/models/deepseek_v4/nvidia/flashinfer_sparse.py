@@ -1126,9 +1126,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             # 独立计数与文件后缀 .last{N}.pt。
             _capn = None
             _cap_suffix = ""
+            _l3 = self.prefix.endswith("layers.3.attn")
+            _pfx_ok = self.prefix in ("model.layers.2.attn", "model.layers.3.attn")
             if (
                 os.environ.get("VLLM_TRITON_DIFFCAP")
-                and self.prefix == "model.layers.2.attn"
+                and _pfx_ok
                 and q_chunk.shape[0] > 1000
                 and bool(swa_lens_chunk.max() > 0)
                 and int(swa_metadata.seq_lens[0].item()) == 8188
@@ -1143,7 +1145,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             if _capn is not None:
                 try:
                     _cap_attr = "_diffcap_n" if not _cap_suffix else "_diffcap_last_n"
-                    if _capn < 2:
+                    if _capn < 4:
                         setattr(self, _cap_attr, _capn + 1)
                         torch.cuda.synchronize()
                         _sidx2 = swa_indices_chunk.contiguous().view(-1).to(torch.int64)
@@ -1242,7 +1244,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                                 "scale": self.scale,
                             },
                             os.environ["VLLM_TRITON_DIFFCAP"]
-                            + f".{_cap_suffix + '.' if _cap_suffix else ''}n{q_chunk.shape[0]}.{_capn}.pt",
+                            + f".{'l3_' if _l3 else ''}{_cap_suffix + '.' if _cap_suffix else ''}n{q_chunk.shape[0]}.{_capn}.pt",
                         )
                 except Exception as _edc:
                     print(f"[DIFFCAP] err: {_edc}", flush=True)
