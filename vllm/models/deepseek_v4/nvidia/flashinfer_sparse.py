@@ -1141,7 +1141,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             # chunk 耗尽, 末 chunk 仍无捕获。改为: 满 chunk0
             # (seq_lens==8188, 每请求一次) 或短末 chunk
             # (q_chunk<8188, 每请求一次), 各自计数。
-            _short_chunk = int(q_chunk.shape[0]) < self.PREFILL_CHUNK_SIZE
+            # 附3 更新48d: PREFILL_CHUNK_SIZE=4 是基类遗留 (num_prefills=1
+            # 时 num_chunks 恒 1, 每步一整 chunk) — 短末 chunk 判别须用
+            # 调度 chunk 尺寸 8188 (q_chunk 满 chunk = 8188 行, 末 chunk
+            # = 7845)。
+            _short_chunk = int(q_chunk.shape[0]) < 8188
             if (
                 os.environ.get("VLLM_TRITON_DIFFCAP")
                 and _pfx_ok
