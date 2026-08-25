@@ -878,6 +878,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         # T 上限: 首请求 draft 全窗口 (8192 tokens) 物化 kv 需 5GB+
         # → 大 batch 回退 cubin (首请求为已知劣化, 评测协议排除)。
         if os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1" and q.shape[0] <= 512:
+            pass
+        elif os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1":
+            print(f"[TRITON-DECODE-SM120] skip T={q.shape[0]}", flush=True)
+        if os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1" and q.shape[0] <= 512:
             from vllm.models.deepseek_v4.nvidia.ops.triton_decode_sparse_mla import (
                 triton_decode_sparse_mla_sm120,
             )
