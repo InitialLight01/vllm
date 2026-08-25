@@ -328,6 +328,31 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
 
+        # 确定性 Triton decode 替代 (VLLM_TRITON_SPARSE_DECODE=1, 附3
+        # 更新44): 实际类 = DeepseekV4FlashMLAAttention (FORCE_SM80 →
+        # is_sm80_context → 此类); 其 decode = C++ FlashMLA cubin
+        # (逐次不确定, 残余翻转噪声源)。此处接 Triton split-kv
+        # decode。大 batch (首请求 draft 全窗口) 回退 cubin 防 OOM。
+        if os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1" and num_decode_tokens <= 512:
+            from vllm.models.deepseek_v4.nvidia.ops.triton_decode_sparse_mla import (
+                triton_decode_sparse_mla_sm120,
+            )
+
+            triton_decode_sparse_mla_sm120(
+                query=q,
+                swa_kv_cache=self.swa_cache_layer.kv_cache,
+                swa_indices=swa_indices.view(num_decode_tokens, 1, -1),
+                swa_lens=swa_lens,
+                compressed_kv_cache=kv_cache,
+                extra_indices=topk_indices,
+                extra_lens=topk_lens,
+                sinks=self.attn_sink,
+                out=output,
+                bmm1_scale=self.scale,
+                num_heads=self.n_local_heads,
+            )
+            return
+
         # We treat queries in the same seq as different queries
         # and later we only attend by generated indices.
         # q arrives pre-padded to self.padded_heads by the outer wrapper.
