@@ -334,6 +334,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         # (逐次不确定, 残余翻转噪声源)。此处接 Triton split-kv
         # decode。大 batch (首请求 draft 全窗口) 回退 cubin 防 OOM。
         if os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1" and num_decode_tokens <= 512:
+            pass
+        elif os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1":
+            print(f"[TRITON-DECODE-FLASHMLA] skip T={num_decode_tokens}", flush=True)
+        if os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1" and num_decode_tokens <= 512:
             from vllm.models.deepseek_v4.nvidia.ops.triton_decode_sparse_mla import (
                 triton_decode_sparse_mla_sm120,
             )
