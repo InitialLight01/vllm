@@ -1128,12 +1128,15 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             _cap_suffix = ""
             _l3 = self.prefix.endswith("layers.3.attn")
             _pfx_ok = self.prefix in ("model.layers.2.attn", "model.layers.3.attn")
+            # 附3 更新48: seq_lens[0]==8188 只放行满 chunk, 末 chunk
+            # (8018/7845 行) 被挡 → 短 chunk 输入从未捕获。改为 >1000
+            # 放行, chunk_idx 区分 chunk0/末 chunk 计数与后缀。
             if (
                 os.environ.get("VLLM_TRITON_DIFFCAP")
                 and _pfx_ok
                 and q_chunk.shape[0] > 1000
                 and bool(swa_lens_chunk.max() > 0)
-                and int(swa_metadata.seq_lens[0].item()) == 8188
+                and int(swa_metadata.seq_lens[0].item()) > 1000
                 and (torch.distributed.get_rank() if torch.distributed.is_initialized() else 0) == 0
                 and not torch.cuda.is_current_stream_capturing()
             ):
