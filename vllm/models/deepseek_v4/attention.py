@@ -397,7 +397,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # chunk 首个分歧, 需捕获最后 chunk 的 L2/L3 o 与 chunk0 对照)。
         # L0 (draft) 捕获: draft 注意力 = cubin decode kernel — 判别
         # decode 注意力确定性 (更新41 假说 b)。
-        if os.environ.get("VLLM_TRITON_DIFFCAP2") and self.prefix in (
+        # 附3 更新48b: rank 0 门控 — TP=2 下两 rank 写同一文件名互覆盖,
+        # run 52/53 o3last/olast 对 = 跨 rank 混拼伪像 (99.63% "分歧" 实为
+        # rank0-vs-rank1 的不同头分片)
+        _rank0o = (
+            (torch.distributed.get_rank() == 0)
+            if torch.distributed.is_initialized()
+            else True
+        )
+        if os.environ.get("VLLM_TRITON_DIFFCAP2") and _rank0o and self.prefix in (
             "model.layers.0.attn",
             "model.layers.2.attn",
             "model.layers.3.attn",
@@ -680,9 +688,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # 位级捕获 (VLLM_TRITON_DIFFCAP2=<path>): L2 + step1 (seq_len 8188)
         # 前 2 请求 — hidden (层输入) / qr (wq_a 输出) / kv (fused_wqa_wkv
         # kv 列) — 定位写入分歧的源头 (附3 更新28: q 净 kv 脏)。
-        if os.environ.get("VLLM_TRITON_DIFFCAP2") and self.prefix in (
-            "model.layers.2.attn",
-            "model.layers.3.attn",
+        if (
+            os.environ.get("VLLM_TRITON_DIFFCAP2")
+            and (
+                (torch.distributed.get_rank() == 0)
+                if torch.distributed.is_initialized()
+                else True
+            )
+            and self.prefix in (
+                "model.layers.2.attn",
+                "model.layers.3.attn",
+            )
         ):
             try:
                 _l3 = self.prefix.endswith("layers.3.attn")
