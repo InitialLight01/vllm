@@ -253,6 +253,7 @@ class DeepseekV4FlashInferSM120Attention(_UpstreamSM120Attention):
     ) -> None:
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+        print(f"[TRITON-DECODE-ENTRY] packed _forward_decode T={num_decode_tokens} env={os.environ.get('VLLM_TRITON_SPARSE_DECODE','0')}", flush=True)
 
         # flashinfer >= 0.6.15 asserts num_tokens > 64 for the low-level
         # runner (it is the MTP-verify multi-query kernel). Small decode
