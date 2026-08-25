@@ -1127,7 +1127,14 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             _capn = None
             _cap_suffix = ""
             _l3 = self.prefix.endswith("layers.3.attn")
-            _pfx_ok = self.prefix in ("model.layers.2.attn", "model.layers.3.attn")
+            _l36 = self.prefix.endswith("layers.36.attn")
+            _ltag = "l3_" if _l3 else ("l36_" if _l36 else "")
+            # 附3 更新48: +L36 — run 53 暖对指纹首分歧 = L36 注意力 chunk0
+            _pfx_ok = self.prefix in (
+                "model.layers.2.attn",
+                "model.layers.3.attn",
+                "model.layers.36.attn",
+            )
             # 附3 更新48: seq_lens[0]==8188 只放行满 chunk, 末 chunk
             # (8018/7845 行) 被挡 → 短 chunk 输入从未捕获。改为 >1000
             # 放行, chunk_idx 区分 chunk0/末 chunk 计数与后缀。
@@ -1247,7 +1254,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                                 "scale": self.scale,
                             },
                             os.environ["VLLM_TRITON_DIFFCAP"]
-                            + f".{'l3_' if _l3 else ''}{_cap_suffix + '.' if _cap_suffix else ''}n{q_chunk.shape[0]}.{_capn}.pt",
+                            + f".{_ltag}{_cap_suffix + '.' if _cap_suffix else ''}n{q_chunk.shape[0]}.{_capn}.pt",
                         )
                 except Exception as _edc:
                     print(f"[DIFFCAP] err: {_edc}", flush=True)

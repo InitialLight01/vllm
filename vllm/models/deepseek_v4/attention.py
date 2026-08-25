@@ -401,11 +401,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             "model.layers.0.attn",
             "model.layers.2.attn",
             "model.layers.3.attn",
+            "model.layers.36.attn",
         ):
             try:
                 _p0 = int(positions.view(-1)[0].item())
                 _l0 = self.prefix.endswith("layers.0.attn")
                 _l3 = self.prefix.endswith("layers.3.attn")
+                _l36 = self.prefix.endswith("layers.36.attn")
                 if _l0:
                     # draft (decode 注意力): 每步局部 positions 从 0 起 —
                     # 捕获首步 (cap 2) 判别 cubin decode 确定性
@@ -423,13 +425,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     _smd2 = _fctx2.attn_metadata.get(self.swa_cache_layer.prefix) if isinstance(_fctx2.attn_metadata, dict) else None
                     _sl2 = int(_smd2.seq_lens[0].item()) if _smd2 is not None and _smd2.seq_lens is not None else None
                     if _sl2 == 8188:
-                        _cattr = "_diffcap2_o3n" if _l3 else "_diffcap2_on"
+                        _cattr = (
+                            "_diffcap2_o3n" if _l3
+                            else ("_diffcap2_o36n" if _l36 else "_diffcap2_on")
+                        )
                         _cn2 = getattr(self, _cattr, 0)
                         if _cn2 < 2:
                             setattr(self, _cattr, _cn2 + 1)
                             torch.cuda.synchronize()
                             _slot2 = (_cn2 + 1) % 2
-                            _fname = f".o3_{_slot2}.pt" if _l3 else f".o{_slot2}.pt"
+                            _fname = (
+                                f".o3_{_slot2}.pt" if _l3
+                                else (f".o36_{_slot2}.pt" if _l36 else f".o{_slot2}.pt")
+                            )
                             torch.save(
                                 {"n": _cn2, "o": o.detach().contiguous().cpu()},
                                 os.environ["VLLM_TRITON_DIFFCAP2"] + _fname,
@@ -439,13 +447,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     # decode 步为 <100 行, 均须排除) — 环形 cap 4 保留
                     # 最近 2 = 暖对 (请求 3/4) (更新46: 分歧源 = 短 chunk)
                     _l3 = self.prefix.endswith("layers.3.attn")
-                    _cattr = "_diffcap2_ol3n" if _l3 else "_diffcap2_oln"
+                    _l36 = self.prefix.endswith("layers.36.attn")
+                    _cattr = (
+                        "_diffcap2_ol3n" if _l3
+                        else ("_diffcap2_ol36n" if _l36 else "_diffcap2_oln")
+                    )
                     _cnl = getattr(self, _cattr, 0)
                     if _cnl < 4:
                         setattr(self, _cattr, _cnl + 1)
                         torch.cuda.synchronize()
                         _slotl = (_cnl + 1) % 2
-                        _fname = f".o3last{_slotl}.pt" if _l3 else f".olast{_slotl}.pt"
+                        _fname = (
+                            f".o3last{_slotl}.pt" if _l3
+                            else (f".o36last{_slotl}.pt" if _l36 else f".olast{_slotl}.pt")
+                        )
                         torch.save(
                             {"n": _cnl, "o": o.detach().contiguous().cpu()},
                             os.environ["VLLM_TRITON_DIFFCAP2"] + _fname,
