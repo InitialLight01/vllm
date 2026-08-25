@@ -830,6 +830,28 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None
         assert swa_lens is not None
+        # 确定性 Triton decode 替代 (VLLM_TRITON_SPARSE_DECODE=1, 附3
+        # 更新43): cubin decode kernel 为闭源二进制且逐次不确定 (残余
+        # 翻转噪声源 — 更新42 定论), SM80 实机亦必经此路径。布局与
+        # 生产者一致 (576B/token + 块尾 UE8M0 scale)。
+        if os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1":
+            from vllm.models.deepseek_v4.nvidia.ops.triton_decode_sparse_mla import (
+                triton_decode_sparse_mla_sm120,
+            )
+
+            triton_decode_sparse_mla_sm120(
+                query=q,
+                swa_kv_cache=self.swa_cache_layer.kv_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                compressed_kv_cache=kv_cache,
+                extra_indices=extra_sparse_indices,
+                extra_lens=extra_sparse_lengths,
+                sinks=self.attn_sink,
+                out=output,
+                bmm1_scale=self.scale,
+            )
+            return
         q = self._prepare_query(q, output)
         swa_cache = self._as_sparse_cache(self.swa_cache_layer.kv_cache)
         extra_cache = self._as_sparse_cache(kv_cache) if kv_cache is not None else None
