@@ -87,7 +87,7 @@ def _gather_decode_kv_kernel(
     k_rope = u16.to(tl.bfloat16, bitcast=True)
 
     # 输出 [K, 512]: nope [0:448), rope [448:512)
-    out_base = kv_ptr + token * K_TOTAL * (_NOPE + _ROPE_DIM) + (offs_c[None, :] + kv_off) * (_NOPE + _ROPE_DIM)
+    out_base = kv_ptr + token * K_TOTAL * (NOPE + ROPE_DIM) + (offs_c[None, :] + kv_off) * (NOPE + ROPE_DIM)
     tl.store(
         out_base + offs_n[:, None],
         k_nope,
@@ -98,7 +98,7 @@ def _gather_decode_kv_kernel(
         k_rope,
         mask=valid[None, :],
     )
-    tl.store(valid_ptr + token * K_TOTAL + kv_off + offs_c, valid.to(tl.int8), mask=mask_c)
+    tl.store(valid_ptr + token * K_TOTAL + kv_off + offs_c, valid.to(tl.int1), mask=mask_c)
 
 
 def triton_decode_sparse_mla_sm120(
@@ -121,7 +121,7 @@ def triton_decode_sparse_mla_sm120(
     K_TOTAL = K_SWA + K_EXTRA
 
     kv = torch.empty((T, K_TOTAL, _HEAD_DIM), dtype=torch.bfloat16, device=device)
-    valid = torch.empty((T, K_TOTAL), dtype=torch.int8, device=device)
+    valid = torch.empty((T, K_TOTAL), dtype=torch.bool, device=device)
     BLOCK_C = 32
 
     def _launch_part(cache, idx, lens, kv_off, k_width):
