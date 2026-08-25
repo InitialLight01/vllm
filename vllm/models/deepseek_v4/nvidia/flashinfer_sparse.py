@@ -521,21 +521,58 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
             decode_cu = query_start_loc[: num_decodes + 1]
             decode_cu_cpu = query_start_loc_cpu[: num_decodes + 1]
             decode_lens_cpu = decode_cu_cpu[1:] - decode_cu_cpu[:-1]
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-                query=query[:num_decode_tokens],
-                swa_kv_cache=swa_k_cache,
-                workspace_buffer=workspace,
-                sparse_indices=sparse_indices[:num_decode_tokens],
-                compressed_kv_cache=compressed_kv_cache,
-                sparse_topk_lens=sparse_topk_lens[:num_decode_tokens],
-                seq_lens=seq_lens[:num_decodes],
-                out=output[:num_decode_tokens],
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                sinks=self.attn_sink,
-                cum_seq_lens_q=decode_cu,
-                max_q_len=int(decode_lens_cpu.max().item()),
-            )
+            # 确定性 Triton decode 替代 (VLLM_TRITON_SPARSE_DECODE=1, 附3
+            # 更新43/44): 基础类 (FORCE_SM80 实际路径) 的 cubin decode
+            # 逐次不确定 (残余噪声源); 此处接 Triton split-kv decode。
+            # 大 batch (首请求 draft 全窗口) 回退 cubin 防 OOM。
+            if os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1" and num_decode_tokens <= 512:
+                from vllm.models.deepseek_v4.common.ops.cache_utils import (
+                    compute_global_topk_indices_and_lens,
+                )
+                from vllm.models.deepseek_v4.nvidia.ops.triton_decode_sparse_mla import (
+                    triton_decode_sparse_mla_sm120,
+                )
+
+                _block_size = attn_metadata.block_size // self.compress_ratio
+                _g_extra, _g_lens = compute_global_topk_indices_and_lens(
+                    decode_compressed_indices,
+                    swa_metadata.token_to_req_indices[:num_decode_tokens],
+                    attn_metadata.block_table[:num_decodes],
+                    _block_size,
+                    decode_is_valid_token,
+                )
+                _swa_lens = (
+                    decode_swa_indices >= 0
+                ).sum(dim=-1).to(torch.int32)
+                triton_decode_sparse_mla_sm120(
+                    query=query[:num_decode_tokens],
+                    swa_kv_cache=self.swa_cache_layer.kv_cache,
+                    swa_indices=decode_swa_indices.view(num_decode_tokens, 1, -1),
+                    swa_lens=_swa_lens,
+                    compressed_kv_cache=compressed_kv_cache,
+                    extra_indices=_g_extra.view(num_decode_tokens, 1, -1),
+                    extra_lens=_g_lens,
+                    sinks=self.attn_sink,
+                    out=output[:num_decode_tokens],
+                    bmm1_scale=bmm1_scale,
+                    num_heads=self.n_local_heads,
+                )
+            else:
+                flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                    query=query[:num_decode_tokens],
+                    swa_kv_cache=swa_k_cache,
+                    workspace_buffer=workspace,
+                    sparse_indices=sparse_indices[:num_decode_tokens],
+                    compressed_kv_cache=compressed_kv_cache,
+                    sparse_topk_lens=sparse_topk_lens[:num_decode_tokens],
+                    seq_lens=seq_lens[:num_decodes],
+                    out=output[:num_decode_tokens],
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    sinks=self.attn_sink,
+                    cum_seq_lens_q=decode_cu,
+                    max_q_len=int(decode_lens_cpu.max().item()),
+                )
 
         if num_prefill_tokens > 0:
             # The prefill query view re-anchors at offset 0, so rebase the

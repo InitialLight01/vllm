@@ -112,9 +112,13 @@ def triton_decode_sparse_mla_sm120(
     sinks: torch.Tensor,              # [H] fp32
     out: torch.Tensor,                # [T, H_pad, 512] bf16
     bmm1_scale: float,
+    num_heads: int | None = None,     # active heads (q 可能已 pad 到 64/128)
 ) -> None:
-    T, num_heads, head_dim = query.shape
+    T, q_heads, head_dim = query.shape
     assert head_dim == _HEAD_DIM
+    if num_heads is None:
+        num_heads = q_heads
+    assert num_heads <= q_heads
     device = query.device
     K_SWA = swa_indices.shape[-1]
     K_EXTRA = extra_indices.shape[-1] if extra_indices is not None else 0
