@@ -291,8 +291,17 @@ __device__ bool processHistogramStep(
         }
       } else {
         if (binIdx == thresholdBinIdx) {
-          // The elements in the threshold bin share the same 32 bits at step 3
-          int dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
+          // The elements in the threshold bin share the same 32 bits at
+          // step 3. Deterministic tiebreak (sm80 port 更新49): select the
+          // lowest row-relative indices among the exact ties instead of the
+          // atomicAdd winner order — the atomic race made the SELECTED SET
+          // nondeterministic for >kNumFinalItems tie groups (bf16 index
+          // scores make the low 16 float bits all-zero, so the step-3 group
+          // is all exact ties). The downstream producer-side sort
+          // (sparse_attn_indexer) already canonicalizes the output ORDER;
+          // this fix canonicalizes the SELECTED SET (zero cost, no atomic).
+          int relIdx = (stride1 == 1) ? idx : (idx - rowStart);
+          int dstIdx = smemFoundTopKValues[0] + relIdx;
           if (dstIdx < topK) {
             if constexpr (mergeBlocks) {
               smemOutput[dstIdx] = indices[idx];
