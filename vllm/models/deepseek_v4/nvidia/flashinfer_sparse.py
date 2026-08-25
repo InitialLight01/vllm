@@ -885,6 +885,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             from vllm.models.deepseek_v4.nvidia.ops.triton_decode_sparse_mla import (
                 triton_decode_sparse_mla_sm120,
             )
+            if not getattr(self, "_triton_decode_printed", False):
+                setattr(self, "_triton_decode_printed", True)
+                print(f"[TRITON-DECODE-RAN] T={q.shape[0]} class={type(self).__name__}", flush=True)
 
             triton_decode_sparse_mla_sm120(
                 query=q,
