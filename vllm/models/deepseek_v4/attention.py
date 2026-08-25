@@ -434,8 +434,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                                 {"n": _cn2, "o": o.detach().contiguous().cpu()},
                                 os.environ["VLLM_TRITON_DIFFCAP2"] + _fname,
                             )
-                elif _p0 > 100000:
-                    # 最后 chunk (130838 ctx: 起点 122820) — 独立环形
+                elif _p0 > 100000 and o.shape[0] < 8188:
+                    # 最后短 chunk (130838 ctx: 1961 行; chunk 15 为 8188 行
+                    # 会误入) — 独立环形 (更新46: 分歧源 = 短 chunk)
                     _l3 = self.prefix.endswith("layers.3.attn")
                     _cattr = "_diffcap2_ol3n" if _l3 else "_diffcap2_oln"
                     _cnl = getattr(self, _cattr, 0)
