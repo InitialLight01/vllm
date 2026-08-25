@@ -1135,23 +1135,30 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "model.layers.3.attn",
                 "model.layers.36.attn",
             )
-            # 附3 更新48: seq_lens[0]==8188 只放行满 chunk, 末 chunk
-            # (8018/7845 行) 被挡 → 短 chunk 输入从未捕获。改为 >1000
-            # 放行, chunk_idx 区分 chunk0/末 chunk 计数与后缀。
+            # 附3 更新48c: 此循环按调度步调用 (每步一个 chunk,
+            # chunk_idx 恒 0, seq_lens = context+chunk_len) —
+            # 48 的 >1000 放行导致每 chunk 都捕获, cap 4 被 req1 前 4
+            # chunk 耗尽, 末 chunk 仍无捕获。改为: 满 chunk0
+            # (seq_lens==8188, 每请求一次) 或短末 chunk
+            # (q_chunk<8188, 每请求一次), 各自计数。
+            _short_chunk = int(q_chunk.shape[0]) < self.PREFILL_CHUNK_SIZE
             if (
                 os.environ.get("VLLM_TRITON_DIFFCAP")
                 and _pfx_ok
                 and q_chunk.shape[0] > 1000
                 and bool(swa_lens_chunk.max() > 0)
-                and int(swa_metadata.seq_lens[0].item()) > 1000
+                and (
+                    int(swa_metadata.seq_lens[0].item()) == 8188
+                    or _short_chunk
+                )
                 and (torch.distributed.get_rank() if torch.distributed.is_initialized() else 0) == 0
                 and not torch.cuda.is_current_stream_capturing()
             ):
-                if chunk_idx == 0:
-                    _capn = getattr(self, "_diffcap_n", 0)
-                elif chunk_idx == num_chunks - 1:
+                if _short_chunk:
                     _capn = getattr(self, "_diffcap_last_n", 0)
                     _cap_suffix = "last"
+                else:
+                    _capn = getattr(self, "_diffcap_n", 0)
             if _capn is not None:
                 try:
                     _cap_attr = "_diffcap_n" if not _cap_suffix else "_diffcap_last_n"
