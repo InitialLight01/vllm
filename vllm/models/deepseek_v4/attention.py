@@ -394,19 +394,35 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         o = o_padded[:, : self.n_local_heads, :]
         # 注意力输出 o 位级捕获 (VLLM_TRITON_DIFFCAP2) — L2/L3 chunk0 前 2
         # 请求 + 最后 chunk (附3 更新39: run 35 指纹显示 L3 注意力在最后
-        # chunk 首个分歧, 需捕获最后 chunk 的 L2/L3 o 与 chunk0 对照)
+        # chunk 首个分歧, 需捕获最后 chunk 的 L2/L3 o 与 chunk0 对照)。
+        # L0 (draft) 捕获: draft 注意力 = cubin decode kernel — 判别
+        # decode 注意力确定性 (更新41 假说 b)。
         if os.environ.get("VLLM_TRITON_DIFFCAP2") and self.prefix in (
+            "model.layers.0.attn",
             "model.layers.2.attn",
             "model.layers.3.attn",
         ):
             try:
                 _p0 = int(positions.view(-1)[0].item())
-                if _p0 == 0:
+                _l0 = self.prefix.endswith("layers.0.attn")
+                _l3 = self.prefix.endswith("layers.3.attn")
+                if _l0:
+                    # draft (decode 注意力): 每步局部 positions 从 0 起 —
+                    # 捕获首步 (cap 2) 判别 cubin decode 确定性
+                    _cd = getattr(self, "_diffcap2_odn", 0)
+                    if _p0 == 0 and _cd < 2:
+                        setattr(self, "_diffcap2_odn", _cd + 1)
+                        torch.cuda.synchronize()
+                        _slotd = (_cd + 1) % 2
+                        torch.save(
+                            {"n": _cd, "o": o.detach().contiguous().cpu()},
+                            os.environ["VLLM_TRITON_DIFFCAP2"] + f".odraft{_slotd}.pt",
+                        )
+                elif _p0 == 0:
                     _fctx2 = get_forward_context()
                     _smd2 = _fctx2.attn_metadata.get(self.swa_cache_layer.prefix) if isinstance(_fctx2.attn_metadata, dict) else None
                     _sl2 = int(_smd2.seq_lens[0].item()) if _smd2 is not None and _smd2.seq_lens is not None else None
                     if _sl2 == 8188:
-                        _l3 = self.prefix.endswith("layers.3.attn")
                         _cattr = "_diffcap2_o3n" if _l3 else "_diffcap2_on"
                         _cn2 = getattr(self, _cattr, 0)
                         if _cn2 < 2:
