@@ -351,6 +351,10 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
                                         kNumFinalItemsPerThread, int>;
   using FinalSortTempStorage =
       std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
+  // 确定性并列修正 (sm80 更新50b): 整数升序排序并列组索引 — 整数全序,
+  // 选择结果确定 (最小索引并列规范)。
+  using IntSort = cub::BlockRadixSort<int, kNumThreadsPerBlock,
+                                      kNumFinalItemsPerThread>;
   // The class to compute the inclusive prefix-sum over the histogram.
   using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
 
@@ -371,6 +375,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   __shared__ union {
     FinalItems items;
     FinalSortTempStorage finalSort;
+    typename IntSort::TempStorage intSort;
     Histogram histo;
   } smemFinal;
 
@@ -507,6 +512,96 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
           }
         }
       }
+
+      // ── 确定性并列修正 (sm80 更新50b) ────────────────────────────
+      // BlockRadixSort 对并列 key 的序 = 收集序 (atomicAdd 竞态) →
+      // 边界并列槽的选择集合不确定。修正: 重扫收集所有与边界值完全
+      // 相等的元素 (bf16 得分 → fp32 精确相等), 整数升序排序取前
+      // needed 个最小索引回填边界槽 — 规范规则 = 并列取最小索引。
+      if (topK > baseIdx) {
+        int globalLastSlot = topK - 1 - baseIdx;
+        __shared__ float smemBoundaryVal;
+        __shared__ int smemTieCount;
+        if (threadIdx.x == 0) {
+          smemTieCount = 0;
+          smemBoundaryVal = finalLogits[globalLastSlot];
+        }
+        __syncthreads();
+        float boundaryVal = smemBoundaryVal;
+        if (boundaryVal != -FLT_MAX) {
+          int needed = 0;
+#pragma unroll
+          for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+            int slot = ii * kNumThreadsPerBlock + threadIdx.x;
+            if (slot < topK - baseIdx && finalLogits[ii] == boundaryVal) {
+              ++needed;
+            }
+          }
+          // 整数 atomicAdd 计数 = 精确算术, 结果确定。
+          atomicAdd(&smemTieCount, needed);
+          __syncthreads();
+          needed = smemTieCount;
+          // 预填充 INT_MAX: 未用槽排序后排到末尾, 不干扰选择。
+#pragma unroll
+          for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+            smemFinal.items.indices[ii * kNumThreadsPerBlock + threadIdx.x] =
+                2147483647;
+          }
+          __syncthreads();
+          if (threadIdx.x == 0) {
+            smemFinalDstIdx[0] = 0;
+          }
+          __syncthreads();
+          // 收集所有 boundaryVal 元素 (集合完整; 顺序无关 — 后续按
+          // 整数全序排序)。
+          auto collectTies = [&](float logit, int idx) {
+            if (logit == boundaryVal) {
+              int dst = atomicAdd(&smemFinalDstIdx[0], 1);
+              int key;
+              if constexpr (mergeBlocks) {
+                key = indices[idx];
+              } else if constexpr (multipleBlocksPerRow) {
+                key = idx + rowStart;
+              } else {
+                key = idx;
+              }
+              smemFinal.items.indices[dst] = key;
+            }
+          };
+          if (stride1 == 1) {
+            vectorized_process(threadIdx.x, kNumThreadsPerBlock,
+                               logits + rowStart, rowEnd - rowStart,
+                               collectTies);
+          } else {
+            for (int idx = rowStart + threadIdx.x; idx < rowEnd;
+                 idx += kNumThreadsPerBlock) {
+              collectTies(logits[idx * stride1], idx);
+            }
+          }
+          __syncthreads();
+          int totalTies = smemFinalDstIdx[0];
+          if (totalTies > needed && needed > 0) {
+            int tieKeys[kNumFinalItemsPerThread];
+#pragma unroll
+            for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+              tieKeys[ii] =
+                  smemFinal.items.indices[ii * kNumThreadsPerBlock +
+                                         threadIdx.x];
+            }
+            IntSort(smemFinal.intSort).SortAscendingBlockedToStriped(tieKeys);
+            // 回填: 全局升序位置 p 的最小索引 → 槽 topK - needed + p。
+            for (int p = threadIdx.x; p < needed; p += kNumThreadsPerBlock) {
+              int sortedKey = tieKeys[p / kNumThreadsPerBlock];
+              smemOutput[topK - needed + p] = sortedKey;
+              if constexpr (multipleBlocksPerRow) {
+                reinterpret_cast<float*>(smemOutput + topK)[topK - needed + p] =
+                    boundaryVal;
+              }
+            }
+          }
+          __syncthreads();
+        }
+      }
     } else {
       // Sorting with insertion sort
       auto baseIdx = smemFoundTopKValues[0];
@@ -516,7 +611,11 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
         auto logit = smemFinal.items.logits[i];
         for (int j = 0; j < smemFinalDstIdx[0]; j++) {
           auto otherLogit = smemFinal.items.logits[j];
-          if (logit < otherLogit || (logit == otherLogit && i < j)) {
+          // 确定性并列修正 (更新50b): 并列按索引序 (最小索引优先),
+          // 不再按收集位置 (atomicAdd 竞态)。
+          if (logit < otherLogit ||
+              (logit == otherLogit &&
+               smemFinal.items.indices[i] > smemFinal.items.indices[j])) {
             outIndex++;
           }
         }
