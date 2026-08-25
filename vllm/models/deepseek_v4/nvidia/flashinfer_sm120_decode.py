@@ -22,7 +22,8 @@ from vLLM's workspace manager -- so the scratch is reserved during warmup and
 reused, never reallocated per step.
 
 Gated behind ``VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE``; selected only on SM12x
-when the official packed kernel is importable (see ``_select_dsv4_attn_cls``).
+when the official packed kernel is import os
+importable (see ``_select_dsv4_attn_cls``).
 Default off; gate-off behavior is identical to the FlashMLA decode path.
 """
 
@@ -299,6 +300,30 @@ class DeepseekV4FlashInferSM120Attention(_UpstreamSM120Attention):
         assert swa_lens is not None
 
         extra_topk = topk_indices.shape[-1] if topk_indices is not None else 0
+        # 确定性 Triton decode 替代 (VLLM_TRITON_SPARSE_DECODE=1, 附3
+        # 更新45): 实际 decode 路径 = packed SM120 runner (T>64) — 闭源
+        # FlashInfer cubin (残余翻转噪声源)。此处的 topk/swa 索引已就绪,
+        # 直接接 Triton split-kv decode。超大 batch (首请求 draft 全窗口)
+        # 回退 cubin 防 OOM。
+        if os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1" and num_decode_tokens <= 512:
+            from vllm.models.deepseek_v4.nvidia.ops.triton_decode_sparse_mla import (
+                triton_decode_sparse_mla_sm120,
+            )
+
+            triton_decode_sparse_mla_sm120(
+                query=q,
+                swa_kv_cache=self.swa_cache_layer.kv_cache,
+                swa_indices=swa_indices.view(num_decode_tokens, 1, -1),
+                swa_lens=swa_lens,
+                compressed_kv_cache=kv_cache if (kv_cache is not None and not swa_only) else None,
+                extra_indices=topk_indices,
+                extra_lens=topk_lens,
+                sinks=self.attn_sink,
+                out=output,
+                bmm1_scale=self.scale,
+                num_heads=self.n_local_heads,
+            )
+            return
         mid_out, mid_lse = _get_decode_scratch(
             num_decode_tokens,
             output.shape[1],
