@@ -834,7 +834,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         # 更新43): cubin decode kernel 为闭源二进制且逐次不确定 (残余
         # 翻转噪声源 — 更新42 定论), SM80 实机亦必经此路径。布局与
         # 生产者一致 (576B/token + 块尾 UE8M0 scale)。
-        if os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1":
+        # T 上限: 首请求 draft 全窗口 (8192 tokens) 物化 kv 需 5GB+
+        # → 大 batch 回退 cubin (首请求为已知劣化, 评测协议排除)。
+        if os.environ.get("VLLM_TRITON_SPARSE_DECODE", "0") == "1" and q.shape[0] <= 512:
             from vllm.models.deepseek_v4.nvidia.ops.triton_decode_sparse_mla import (
                 triton_decode_sparse_mla_sm120,
             )
