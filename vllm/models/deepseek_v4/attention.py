@@ -434,13 +434,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                                 {"n": _cn2, "o": o.detach().contiguous().cpu()},
                                 os.environ["VLLM_TRITON_DIFFCAP2"] + _fname,
                             )
-                elif _p0 > 100000 and o.shape[0] < 8188:
-                    # 最后短 chunk (130838 ctx: 1961 行; chunk 15 为 8188 行
-                    # 会误入) — 独立环形 (更新46: 分歧源 = 短 chunk)
+                elif _p0 > 100000 and 1000 < o.shape[0] < 8188:
+                    # 最后短 chunk (130838 ctx: 1961 行; chunk 15 为 8188 行,
+                    # decode 步为 <100 行, 均须排除) — 环形 cap 4 保留
+                    # 最近 2 = 暖对 (请求 3/4) (更新46: 分歧源 = 短 chunk)
                     _l3 = self.prefix.endswith("layers.3.attn")
                     _cattr = "_diffcap2_ol3n" if _l3 else "_diffcap2_oln"
                     _cnl = getattr(self, _cattr, 0)
-                    if _cnl < 2:
+                    if _cnl < 4:
                         setattr(self, _cattr, _cnl + 1)
                         torch.cuda.synchronize()
                         _slotl = (_cnl + 1) % 2
