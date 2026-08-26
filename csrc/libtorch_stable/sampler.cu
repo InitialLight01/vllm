@@ -594,9 +594,16 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
                                          threadIdx.x];
             }
             IntSort(smemFinal.intSort).Sort(tieKeys, tieVals);
-            // 回填: 全局升序位置 p 的最小索引 → 槽 topK - needed + p。
+            // 排序结果回写 smem (blocked 布局), 供降序取用
+#pragma unroll
+            for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+              smemFinal.items.indices[ii * kNumThreadsPerBlock + threadIdx.x] =
+                  tieKeys[ii];
+            }
+            __syncthreads();
+            // 更新52h 变体: 最高索引优先 — 升序末尾 needed 个。
             for (int p = threadIdx.x; p < needed; p += kNumThreadsPerBlock) {
-              int sortedKey = tieKeys[p / kNumThreadsPerBlock];
+              int sortedKey = smemFinal.items.indices[totalTies - 1 - p];
               smemOutput[topK - needed + p] = sortedKey;
               if constexpr (multipleBlocksPerRow) {
                 reinterpret_cast<float*>(smemOutput + topK)[topK - needed + p] =
@@ -620,7 +627,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
           // 不再按收集位置 (atomicAdd 竞态)。
           if (logit < otherLogit ||
               (logit == otherLogit &&
-               smemFinal.items.indices[i] > smemFinal.items.indices[j])) {
+               smemFinal.items.indices[i] < smemFinal.items.indices[j])) {
             outIndex++;
           }
         }
