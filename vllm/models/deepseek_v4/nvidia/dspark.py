@@ -268,6 +268,24 @@ class DSparkDecoderLayer(DeepseekV4DecoderLayer):
         draft_kv = draft_kv.view(batch_size, block_size, self.attn.head_dim)
 
         cache_kv = self._main_kv_cache[:batch_size].to(draft_kv.dtype)
+        # 解码首步指纹 (VLLM_DUMP_HIDDEN_FP, 更新51): 判别草稿注意力
+        # 输入的奇偶周期状态 — x/cache_kv/draft_kv/main_positions
+        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jds
+                torch.cuda.synchronize()
+                _bs = lambda t: int(t.detach().contiguous().view(torch.int16).sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item()) if t.numel() else 0
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jds.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "dspark_attn_in",
+                        "prefix": self.attn.prefix if hasattr(self.attn, "prefix") else "dspark",
+                        "pos0": int(positions.view(-1)[0].item()),
+                        "main_pos0": int(main_positions.view(-1)[0].item()),
+                        "xsum": _bs(x), "cksum": _bs(cache_kv), "dksum": _bs(draft_kv),
+                    }) + "\n")
+            except Exception:
+                pass
         if self._triton_attn:
             # KV-shared tensor-core attention over [circular main KV + draft
             # KV] with the per-head sink folded into the online softmax.
