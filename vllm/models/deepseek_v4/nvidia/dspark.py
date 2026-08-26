@@ -616,27 +616,25 @@ class DSparkDeepseekV4Model(nn.Module):
         if (
             os.environ.get("VLLM_TRITON_DIFFCAP2")
             and input_ids.shape[0] <= 32
-            and int(positions.view(-1)[0].item()) > 100000
+            and int(positions.view(-1)[0].item()) > 130000
         ):
             try:
                 _p0 = int(positions.view(-1)[0].item())
-                _last_p0 = getattr(self, "_dspark_last_p0", None)
-                if _last_p0 is not None and _p0 <= _last_p0:
-                    # 位置回退 = 新请求首步 — 捕获草稿输入 token
-                    _cn = getattr(self, "_dspark_fwd_capn", 0)
-                    if _cn < 4:
-                        setattr(self, "_dspark_fwd_capn", _cn + 1)
-                        torch.cuda.synchronize()
-                        _slot = (_cn + 1) % 2
-                        torch.save(
-                            {
-                                "n": _cn,
-                                "input_ids": input_ids.detach().cpu(),
-                                "positions": positions.detach().cpu(),
-                            },
-                            os.environ["VLLM_TRITON_DIFFCAP2"] + f".dsparkids{_slot}.pt",
-                        )
-                setattr(self, "_dspark_last_p0", _p0)
+                # 更新52m: 仅 decode 期 (p0>130000) — prefill 期 5-token
+                # 调用曾误捕; 每请求首步 (q0=130666) 捕获输入 token
+                _cn = getattr(self, "_dspark_fwd_capn", 0)
+                if _cn < 4:
+                    setattr(self, "_dspark_fwd_capn", _cn + 1)
+                    torch.cuda.synchronize()
+                    _slot = (_cn + 1) % 2
+                    torch.save(
+                        {
+                            "n": _cn,
+                            "input_ids": input_ids.detach().cpu(),
+                            "positions": positions.detach().cpu(),
+                        },
+                        os.environ["VLLM_TRITON_DIFFCAP2"] + f".dsparkids{_slot}.pt",
+                    )
             except Exception:
                 pass
         if inputs_embeds is None:
