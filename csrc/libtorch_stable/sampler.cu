@@ -301,13 +301,10 @@ __device__ bool processHistogramStep(
           // (sparse_attn_indexer) already canonicalizes the output ORDER;
           // this fix canonicalizes the SELECTED SET (zero cost, no atomic).
           int relIdx = (stride1 == 1) ? idx : (idx - rowStart);
-          // 更新52i: 并列规则 v3 — 中间索引 (并列组中位切片, 近似
-          // 训练期 fp32 选择的均匀分布; v1 最小索引偏开头 / v2 最高
-          // 索引偏结尾, 600q 长类别 6→40% 证明方向但非终点)
-          int needed = topK - smemFoundTopKValues[0];
-          int binSize = smemFinalBinSize[0];
-          int start = (binSize - needed) / 2;
-          int dstIdx = smemFoundTopKValues[0] + (relIdx - start);
+          // 更新52j: 回退 v2 最高索引 (600q 70.17% 当前最优; v3 中间
+          // 索引 MRCR 无改善)
+          int rowLen = rowEnd - rowStart;
+          int dstIdx = smemFoundTopKValues[0] + (rowLen - 1 - relIdx);
           if (dstIdx < topK) {
             if constexpr (mergeBlocks) {
               smemOutput[dstIdx] = indices[idx];
@@ -603,11 +600,9 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
                   tieKeys[ii];
             }
             __syncthreads();
-            // 更新52i 变体 v3: 中间切片 — 升序中位 needed 个 (近似
-            // 训练期 fp32 均匀分布)。
-            int midStart = (totalTies - needed) / 2;
+            // 更新52j: 回退 v2 最高索引 — 升序末尾 needed 个。
             for (int p = threadIdx.x; p < needed; p += kNumThreadsPerBlock) {
-              int sortedKey = smemFinal.items.indices[midStart + p];
+              int sortedKey = smemFinal.items.indices[totalTies - 1 - p];
               smemOutput[topK - needed + p] = sortedKey;
               if constexpr (multipleBlocksPerRow) {
                 reinterpret_cast<float*>(smemOutput + topK)[topK - needed + p] =
