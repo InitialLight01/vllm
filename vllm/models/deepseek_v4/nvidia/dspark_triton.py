@@ -157,6 +157,7 @@ def _dspark_context_kv_store_kernel(
 
     req_idx = tl.full((), 0, dtype=tl.int64)
     should_store = tl.full((), False, dtype=tl.int1)
+    store_end = tl.full((), 0, dtype=tl.int64)
     for batch_idx in tl.static_range(0, batch_size):
         start = tl.load(query_start_loc_ptr + batch_idx).to(tl.int64)
         end = tl.load(query_start_loc_ptr + batch_idx + 1).to(tl.int64)
@@ -165,6 +166,13 @@ def _dspark_context_kv_store_kernel(
         in_request = (token_pid >= start) & (token_pid < end)
         req_idx = tl.where(in_request, batch_idx, req_idx)
         should_store = should_store | in_request
+        store_end = tl.where(in_request, end, store_end)
+
+    # 更新52k: 只写各槽的最后写入者 — 圆形缓存 slot = pos % window,
+    # 同槽多 token 并发写 = 写写竞态 (run 66 捕获 34/128 槽跨请求分歧
+    # 的机制)。仅 end-window 起的尾窗 token 写 (每槽唯一写入者) →
+    # 确定 + 与语义一致 (尾窗 = 最终状态)。
+    should_store = should_store & (token_pid >= store_end - window_size)
 
     offs = tl.arange(0, block_d)
     mask = offs < head_dim
