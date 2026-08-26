@@ -731,19 +731,28 @@ def sparse_attn_indexer(
                         cp_kv_cache_interleave_size,
                         row_starts=chunk.cu_seqlen_ks,
                     )
-                    # 确定性修复 (附3 更新36): topk 行内顺序 = SMEM
-                    # atomicAdd 竞态序 (sampler.cu:267, ~480/512 项),
-                    # 跨请求不确定 → 注意力累积顺序 ulp 分歧 (o 位级
-                    # 1.18%, 从 2051 = 首个 rowLen>512 的行起)。选择
-                    # 集合由分数直方图确定 (确定), 此处按逻辑索引升序
-                    # 规范化 (INT_MAX 键保持 valid-front 约定, 排序后
-                    # 还原 -1 哨兵), 覆盖全部消费者。
+                    # 确定性修复 v2 (附3 更新52g): 排序键改
+                    # (score desc, index asc) 字典序 — v1 的纯索引升序
+                    # = 全序重排, 与训练期 score-desc 累积序不同 →
+                    # 注意力 ulp 分歧累积 → 600q 61% 回归候选。稳定
+                    # 双重排序: 先 index asc (稳定), 再 score desc
+                    # (稳定) = (score desc, index asc) 字典序, 覆盖
+                    # 全部消费者。选择集合已由 sampler 并列修复确定。
                     _imax = torch.iinfo(topk_indices.dtype).max
-                    _sorted_key = torch.where(
-                        topk_indices >= 0, topk_indices, _imax
+                    _clamp = topk_indices.clamp(min=0)
+                    _scores = logits.gather(1, _clamp)
+                    # -1 填充 = -inf 分数 → desc 排序沉底 (valid-front)
+                    _scores = torch.where(topk_indices >= 0, _scores, float("-inf"))
+                    _order1 = torch.argsort(_clamp, dim=-1, stable=True)
+                    _idx_sorted = topk_indices.gather(1, _order1)
+                    _score_sorted = _scores.gather(1, _order1)
+                    _order2 = torch.argsort(
+                        _score_sorted, dim=-1, descending=True, stable=True
                     )
-                    _sorted_idx = torch.sort(_sorted_key, dim=-1).values
-                    topk_indices.copy_(_sorted_idx)
+                    _canonical = _idx_sorted.gather(1, _order2)
+                    topk_indices.copy_(
+                        torch.where(topk_indices >= 0, _canonical, _imax)
+                    )
                     topk_indices.masked_fill_(topk_indices == _imax, -1)
                     if _phase_timing:
                         _te[3].record()
