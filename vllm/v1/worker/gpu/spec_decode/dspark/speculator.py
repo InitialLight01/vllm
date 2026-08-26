@@ -210,3 +210,38 @@ class DSparkSpeculator(DFlashSpeculator):
             cudagraph_runtime_mode,
         )
         self._sample_sequential(num_reqs, head_hidden)
+        # 更新52m: 草稿输出捕获 — 每请求首步 (positions 回退判别) 环形
+        # 保存 draft_tokens + 输入 token (判别 decode 步内部翻转源:
+        # 输入位级同而输出分歧的最终通道)。
+        if os.environ.get("VLLM_TRITON_DIFFCAP2"):
+            try:
+                _q0 = (
+                    int(self.input_buffers.positions.view(-1)[0].item())
+                    if self.input_buffers.positions.numel()
+                    else -1
+                )
+                _last = getattr(self, "_dspk_last_q0", None)
+                if _last is not None and _q0 <= _last:
+                    _cn = getattr(self, "_dspk_capn", 0)
+                    if _cn < 4:
+                        setattr(self, "_dspk_capn", _cn + 1)
+                        torch.cuda.synchronize()
+                        _slot = (_cn + 1) % 2
+                        torch.save(
+                            {
+                                "n": _cn,
+                                "q0": _q0,
+                                "draft_tokens": self.draft_tokens[:num_reqs]
+                                .detach()
+                                .cpu(),
+                                "input_ids": self.input_buffers.input_ids[
+                                    : num_reqs * self.num_query_per_req
+                                ]
+                                .detach()
+                                .cpu(),
+                            },
+                            os.environ["VLLM_TRITON_DIFFCAP2"] + f".dspk{_slot}.pt",
+                        )
+                setattr(self, "_dspk_last_q0", _q0)
+            except Exception:
+                pass
