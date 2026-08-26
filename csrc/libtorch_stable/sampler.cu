@@ -301,11 +301,13 @@ __device__ bool processHistogramStep(
           // (sparse_attn_indexer) already canonicalizes the output ORDER;
           // this fix canonicalizes the SELECTED SET (zero cost, no atomic).
           int relIdx = (stride1 == 1) ? idx : (idx - rowStart);
-          // 更新52h: 并列规则变体 — 最高索引优先 (recent-first, 与
-          // v1 最小索引相反的偏置方向, 用于精度回归二分; 二选一后
-          // 固定为训练分布一致的规则)
-          int rowLen = rowEnd - rowStart;
-          int dstIdx = smemFoundTopKValues[0] + (rowLen - 1 - relIdx);
+          // 更新52i: 并列规则 v3 — 中间索引 (并列组中位切片, 近似
+          // 训练期 fp32 选择的均匀分布; v1 最小索引偏开头 / v2 最高
+          // 索引偏结尾, 600q 长类别 6→40% 证明方向但非终点)
+          int needed = topK - smemFoundTopKValues[0];
+          int binSize = smemFinalBinSize[0];
+          int start = (binSize - needed) / 2;
+          int dstIdx = smemFoundTopKValues[0] + (relIdx - start);
           if (dstIdx < topK) {
             if constexpr (mergeBlocks) {
               smemOutput[dstIdx] = indices[idx];
@@ -601,9 +603,11 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
                   tieKeys[ii];
             }
             __syncthreads();
-            // 更新52h 变体: 最高索引优先 — 升序末尾 needed 个。
+            // 更新52i 变体 v3: 中间切片 — 升序中位 needed 个 (近似
+            // 训练期 fp32 均匀分布)。
+            int midStart = (totalTies - needed) / 2;
             for (int p = threadIdx.x; p < needed; p += kNumThreadsPerBlock) {
-              int sortedKey = smemFinal.items.indices[totalTies - 1 - p];
+              int sortedKey = smemFinal.items.indices[midStart + p];
               smemOutput[topK - needed + p] = sortedKey;
               if constexpr (multipleBlocksPerRow) {
                 reinterpret_cast<float*>(smemOutput + topK)[topK - needed + p] =
