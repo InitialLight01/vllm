@@ -220,8 +220,9 @@ class DSparkSpeculator(DFlashSpeculator):
                     if self.input_buffers.positions.numel()
                     else -1
                 )
-                _last = getattr(self, "_dspk_last_q0", None)
-                if _last is not None and _q0 <= _last:
+                # 52m 修正: 仅 decode 期 (q0>130000) — prefill 期的
+                # _generate_draft 调用 (context-KV precompute) 曾误捕
+                if _q0 > 130000:
                     _cn = getattr(self, "_dspk_capn", 0)
                     if _cn < 4:
                         setattr(self, "_dspk_capn", _cn + 1)
@@ -242,6 +243,5 @@ class DSparkSpeculator(DFlashSpeculator):
                             },
                             os.environ["VLLM_TRITON_DIFFCAP2"] + f".dspk{_slot}.pt",
                         )
-                setattr(self, "_dspk_last_q0", _q0)
             except Exception:
                 pass
