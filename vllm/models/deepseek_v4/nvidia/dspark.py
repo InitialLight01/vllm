@@ -616,7 +616,7 @@ class DSparkDeepseekV4Model(nn.Module):
         if (
             os.environ.get("VLLM_TRITON_DIFFCAP2")
             and input_ids.shape[0] <= 32
-            and int(positions.view(-1)[0].item()) > 130000
+            and int(positions.view(-1)[0].item()) == 130666
         ):
             try:
                 _p0 = int(positions.view(-1)[0].item())
