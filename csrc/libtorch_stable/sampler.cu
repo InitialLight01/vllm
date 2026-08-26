@@ -301,7 +301,11 @@ __device__ bool processHistogramStep(
           // (sparse_attn_indexer) already canonicalizes the output ORDER;
           // this fix canonicalizes the SELECTED SET (zero cost, no atomic).
           int relIdx = (stride1 == 1) ? idx : (idx - rowStart);
-          int dstIdx = smemFoundTopKValues[0] + relIdx;
+          // 更新52h: 并列规则变体 — 最高索引优先 (recent-first, 与
+          // v1 最小索引相反的偏置方向, 用于精度回归二分; 二选一后
+          // 固定为训练分布一致的规则)
+          int rowLen = rowEnd - rowStart;
+          int dstIdx = smemFoundTopKValues[0] + (rowLen - 1 - relIdx);
           if (dstIdx < topK) {
             if constexpr (mergeBlocks) {
               smemOutput[dstIdx] = indices[idx];
