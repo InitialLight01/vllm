@@ -268,6 +268,27 @@ class DSparkDecoderLayer(DeepseekV4DecoderLayer):
         draft_kv = draft_kv.view(batch_size, block_size, self.attn.head_dim)
 
         cache_kv = self._main_kv_cache[:batch_size].to(draft_kv.dtype)
+        # 解码期逐步指纹 (VLLM_DUMP_HIDDEN_FP, 更新52b): 无 capturing
+        # 门控, 判别 decode 首步输入何者携带跨请求状态
+        if (
+            os.environ.get("VLLM_DUMP_HIDDEN_FP")
+            and int(main_positions.view(-1)[0].item()) > 130000
+        ):
+            try:
+                import json as _jds
+                torch.cuda.synchronize()
+                _bs = lambda t: int(t.detach().contiguous().view(torch.int16).sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item()) if t.numel() else 0
+                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
+                    _f.write(_jds.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "comp": "dspark_attn_in",
+                        "prefix": self.attn.prefix if hasattr(self.attn, "prefix") else "dspark",
+                        "pos0": int(positions.view(-1)[0].item()),
+                        "main_pos0": int(main_positions.view(-1)[0].item()),
+                        "xsum": _bs(x), "cksum": _bs(cache_kv), "dksum": _bs(draft_kv),
+                    }) + "\n")
+            except Exception:
+                pass
         # 解码首步输入位级捕获 (VLLM_TRITON_DIFFCAP2, 更新51): 判别草稿
         # 注意力输入的奇偶周期状态 — 每请求首次 decode 形调用 (x ≤ 32
         # 行, prefill 形 = 8188 行跳过), 环形 2 槽保留暖对。图捕获期
