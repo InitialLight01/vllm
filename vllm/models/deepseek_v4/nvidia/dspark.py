@@ -268,22 +268,31 @@ class DSparkDecoderLayer(DeepseekV4DecoderLayer):
         draft_kv = draft_kv.view(batch_size, block_size, self.attn.head_dim)
 
         cache_kv = self._main_kv_cache[:batch_size].to(draft_kv.dtype)
-        # 解码首步指纹 (VLLM_DUMP_HIDDEN_FP, 更新51): 判别草稿注意力
-        # 输入的奇偶周期状态 — x/cache_kv/draft_kv/main_positions
-        if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
+        # 解码首步输入位级捕获 (VLLM_TRITON_DIFFCAP2, 更新51): 判别草稿
+        # 注意力输入的奇偶周期状态 — 每请求首次 decode 形调用 (x ≤ 32
+        # 行, prefill 形 = 8188 行跳过), 环形 2 槽保留暖对。图捕获期
+        # 亦触发 (无 capturing 门控, 与 odraft 捕获同)。
+        if os.environ.get("VLLM_TRITON_DIFFCAP2") and x.shape[0] <= 32:
             try:
-                import json as _jds
-                torch.cuda.synchronize()
-                _bs = lambda t: int(t.detach().contiguous().view(torch.int16).sum(dim=1, dtype=torch.int32).sum(dtype=torch.int64).item()) if t.numel() else 0
-                with open(os.environ["VLLM_DUMP_HIDDEN_FP"], "a") as _f:
-                    _f.write(_jds.dumps({
-                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                        "comp": "dspark_attn_in",
-                        "prefix": self.attn.prefix if hasattr(self.attn, "prefix") else "dspark",
-                        "pos0": int(positions.view(-1)[0].item()),
-                        "main_pos0": int(main_positions.view(-1)[0].item()),
-                        "xsum": _bs(x), "cksum": _bs(cache_kv), "dksum": _bs(draft_kv),
-                    }) + "\n")
+                _mp0 = int(main_positions.view(-1)[0].item())
+                _last = getattr(self.attn, "_dspark_last_mp0", None)
+                if _last is not None and _mp0 <= _last:
+                    _cn = getattr(self.attn, "_dspark_capn", 0)
+                    if _cn < 4:
+                        setattr(self.attn, "_dspark_capn", _cn + 1)
+                        torch.cuda.synchronize()
+                        _slot = (_cn + 1) % 2
+                        torch.save(
+                            {
+                                "n": _cn,
+                                "x": x.detach().contiguous().cpu(),
+                                "cache_kv": cache_kv.detach().contiguous().cpu(),
+                                "draft_kv": draft_kv.detach().contiguous().cpu(),
+                                "main_positions": main_positions.detach().cpu(),
+                            },
+                            os.environ["VLLM_TRITON_DIFFCAP2"] + f".dspark{_slot}.pt",
+                        )
+                setattr(self.attn, "_dspark_last_mp0", _mp0)
             except Exception:
                 pass
         if self._triton_attn:
