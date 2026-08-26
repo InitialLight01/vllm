@@ -188,6 +188,26 @@ class DFlashSpeculator(DraftModelSpeculator):
                 positions=self.input_buffers.positions[:num_tokens],
                 inputs_embeds=None,
             )
+        # 更新53a (G1): first-pass 首步草稿前向输出捕获 (propose 置 flag, 默认关)
+        if os.environ.get("VLLM_DSPK_FPCAP") and getattr(
+            self, "_fpcap_flag", False
+        ):
+            self._fpcap_flag = False
+            try:
+                torch.cuda.synchronize()
+                _n = getattr(self, "_fpcap_n", 0)
+                torch.save(
+                    {
+                        "n": _n,
+                        "num_tokens": num_tokens,
+                        "last_hidden_states": last_hidden_states[:num_tokens]
+                        .detach()
+                        .cpu(),
+                    },
+                    os.environ["VLLM_DSPK_FPCAP"] + f".hs{_n}.pt",
+                )
+            except Exception:
+                pass
         return last_hidden_states
 
     def _generate_draft(
@@ -411,6 +431,19 @@ class DFlashSpeculator(DraftModelSpeculator):
             **precompute_kwargs,
         )
 
+        # 更新53a (G1): first-pass 首步捕获 flag — num_sampled==0 = 每请求
+        # 首步 (边界重置后);_run_model 在该步保存草稿前向输出, propose 尾部
+        # 保存输入侧. env 门控默认关; 捕获需 eager (cudagraph NONE).
+        self._fpcap_flag = False
+        _fpc = os.environ.get("VLLM_DSPK_FPCAP")
+        if (
+            _fpc
+            and getattr(self, "_fpcap_n", 0) < 4
+            and num_sampled is not None
+            and int(num_sampled.max().item()) == 0
+        ):
+            self._fpcap_flag = True
+
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
@@ -454,6 +487,74 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
+
+        # 更新53a (G1): first-pass 首步输出捕获 — 判别 decode 首步内部翻转源
+        # (输入位级同而输出分歧). _run_model 已同步保存草稿前向输出 (.hs{n}),
+        # 此处保存输入侧 + draft_tokens. env 门控默认关.
+        _fpc = os.environ.get("VLLM_DSPK_FPCAP")
+        if _fpc and getattr(self, "_fpcap_flag", False):
+            self._fpcap_flag = False
+            try:
+                torch.cuda.synchronize()
+                _n = getattr(self, "_fpcap_n", 0)
+                setattr(self, "_fpcap_n", _n + 1)
+                torch.save(
+                    {
+                        "n": _n,
+                        "num_reqs": num_reqs,
+                        "num_target_tokens": num_target_tokens,
+                        "num_query_tokens": num_query_tokens,
+                        "num_sampled": (
+                            num_sampled.detach().cpu()
+                            if num_sampled is not None
+                            else None
+                        ),
+                        "num_rejected": (
+                            num_rejected.detach().cpu()
+                            if num_rejected is not None
+                            else None
+                        ),
+                        "draft_tokens": self.draft_tokens[:num_reqs]
+                        .detach()
+                        .cpu(),
+                        "input_ids": self.input_buffers.input_ids[
+                            :num_query_tokens
+                        ]
+                        .detach()
+                        .cpu(),
+                        "positions": self.input_buffers.positions[
+                            :num_query_tokens
+                        ]
+                        .detach()
+                        .cpu(),
+                        "sample_indices": self.sample_indices[
+                            : num_reqs * self.num_speculative_steps
+                        ]
+                        .detach()
+                        .cpu(),
+                        "sample_pos": self.sample_pos[
+                            : num_reqs * self.num_speculative_steps
+                        ]
+                        .detach()
+                        .cpu(),
+                        "last_sampled": last_sampled[:num_reqs]
+                        .detach()
+                        .cpu(),
+                        "next_prefill_tokens": next_prefill_tokens[:num_reqs]
+                        .detach()
+                        .cpu(),
+                        "hidden_bitsum": float(
+                            self.hidden_states[:num_target_tokens]
+                            .detach()
+                            .float()
+                            .sum()
+                            .item()
+                        ),
+                    },
+                    _fpc + f".s{_n}.pt",
+                )
+            except Exception:
+                pass
 
         return self.draft_tokens[:num_reqs]
 
