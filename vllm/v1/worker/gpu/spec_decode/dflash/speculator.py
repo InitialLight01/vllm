@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import os  # sm80 更新52c: VLLM_DSPARK_BOUNDARY_RESET env 门控
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
