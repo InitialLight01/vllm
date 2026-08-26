@@ -282,8 +282,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         # num_rejected = 前一请求末步的陈旧值 — _prepare_dflash_inputs
         # 的 anchor 选择误取前一请求最后 token (num_sampled>0 分支),
         # 且 rejected 尾截断本请求 context。首见请求清零。
+        # 更新52c: VLLM_DSPARK_BOUNDARY_RESET=0 关闭 (精度二分用 —
+        # 确定性栈 smoke30 73.3% vs 基线 90%, 判别回归源)。
         _req_ids = getattr(input_batch, "req_ids", None)
-        if _req_ids is not None and num_sampled is not None:
+        if (
+            os.environ.get("VLLM_DSPARK_BOUNDARY_RESET", "1") != "0"
+            and _req_ids is not None
+            and num_sampled is not None
+        ):
             _seen = getattr(self, "_df_spark_seen_req_ids", set())
             _new_flags = [rid not in _seen for rid in _req_ids]
             if any(_new_flags):
