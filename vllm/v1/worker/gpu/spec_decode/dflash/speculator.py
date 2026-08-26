@@ -278,6 +278,28 @@ class DFlashSpeculator(DraftModelSpeculator):
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
 
+        # 请求边界重置 (sm80 更新52): 新请求首步消费的 num_sampled/
+        # num_rejected = 前一请求末步的陈旧值 — _prepare_dflash_inputs
+        # 的 anchor 选择误取前一请求最后 token (num_sampled>0 分支),
+        # 且 rejected 尾截断本请求 context。首见请求清零。
+        _req_ids = getattr(input_batch, "req_ids", None)
+        if _req_ids is not None and num_sampled is not None:
+            _seen = getattr(self, "_df_spark_seen_req_ids", set())
+            _new_flags = [rid not in _seen for rid in _req_ids]
+            if any(_new_flags):
+                _mask = torch.tensor(
+                    _new_flags, dtype=torch.bool, device=num_sampled.device
+                )
+                num_sampled = torch.where(
+                    _mask, torch.zeros_like(num_sampled), num_sampled
+                )
+                if num_rejected is not None:
+                    num_rejected = torch.where(
+                        _mask, torch.zeros_like(num_rejected), num_rejected
+                    )
+            _seen.update(_req_ids)
+            self._df_spark_seen_req_ids = _seen
+
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
