@@ -188,11 +188,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 positions=self.input_buffers.positions[:num_tokens],
                 inputs_embeds=None,
             )
-        # 更新53a (G1): first-pass 首步草稿前向输出捕获 (propose 置 flag, 默认关)
+        # 更新53a (G1): first-pass 首步草稿前向输出捕获 (propose 置 flag;
+        # flag 由 propose 尾部捕获后清除, 此处不清). env 门控默认关.
         if os.environ.get("VLLM_DSPK_FPCAP") and getattr(
             self, "_fpcap_flag", False
         ):
-            self._fpcap_flag = False
             try:
                 torch.cuda.synchronize()
                 _n = getattr(self, "_fpcap_n", 0)
@@ -431,9 +431,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             **precompute_kwargs,
         )
 
-        # 更新53a (G1): first-pass 首步捕获 flag — num_sampled==0 = 每请求
-        # 首步 (边界重置后);_run_model 在该步保存草稿前向输出, propose 尾部
-        # 保存输入侧. env 门控默认关; 捕获需 eager (cudagraph NONE).
+        # 更新53a (G1): first-pass 首步捕获 flag — num_sampled==0 且
+        # num_target_tokens 小 = 每请求真首步 (prefill chunk 期的 propose
+        # 调用 num_target_tokens≈8188, 会被排除; 52m 历史已证 prefill 期
+        # 有 _generate_draft 调用误捕). _run_model 在该步保存草稿前向输出,
+        # propose 尾部保存输入侧并清 flag. env 门控默认关.
         self._fpcap_flag = False
         _fpc = os.environ.get("VLLM_DSPK_FPCAP")
         if (
@@ -441,6 +443,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             and getattr(self, "_fpcap_n", 0) < 4
             and num_sampled is not None
             and int(num_sampled.max().item()) == 0
+            and num_target_tokens < 100
         ):
             self._fpcap_flag = True
 
