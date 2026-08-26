@@ -586,7 +586,11 @@ class DSparkDeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         # 草稿输入 token 位级捕获 (更新51b): 每请求首次 decode 形调用
         # (input_ids ≤ 32), 环形 2 槽 — 判别 anchor/noise 的跨请求状态
-        if os.environ.get("VLLM_TRITON_DIFFCAP2") and input_ids.shape[0] <= 32:
+        if (
+            os.environ.get("VLLM_TRITON_DIFFCAP2")
+            and input_ids.shape[0] <= 32
+            and int(positions.view(-1)[0].item()) > 100000
+        ):
             try:
                 _p0 = int(positions.view(-1)[0].item())
                 _last_p0 = getattr(self, "_dspark_last_p0", None)
