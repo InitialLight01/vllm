@@ -584,6 +584,30 @@ class DSparkDeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # 草稿输入 token 位级捕获 (更新51b): 每请求首次 decode 形调用
+        # (input_ids ≤ 32), 环形 2 槽 — 判别 anchor/noise 的跨请求状态
+        if os.environ.get("VLLM_TRITON_DIFFCAP2") and input_ids.shape[0] <= 32:
+            try:
+                _p0 = int(positions.view(-1)[0].item())
+                _last_p0 = getattr(self, "_dspark_last_p0", None)
+                if _last_p0 is not None and _p0 <= _last_p0:
+                    # 位置回退 = 新请求首步 — 捕获草稿输入 token
+                    _cn = getattr(self, "_dspark_fwd_capn", 0)
+                    if _cn < 4:
+                        setattr(self, "_dspark_fwd_capn", _cn + 1)
+                        torch.cuda.synchronize()
+                        _slot = (_cn + 1) % 2
+                        torch.save(
+                            {
+                                "n": _cn,
+                                "input_ids": input_ids.detach().cpu(),
+                                "positions": positions.detach().cpu(),
+                            },
+                            os.environ["VLLM_TRITON_DIFFCAP2"] + f".dsparkids{_slot}.pt",
+                        )
+                setattr(self, "_dspark_last_p0", _p0)
+            except Exception:
+                pass
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
