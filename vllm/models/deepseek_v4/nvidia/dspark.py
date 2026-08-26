@@ -298,6 +298,12 @@ class DSparkDecoderLayer(DeepseekV4DecoderLayer):
                 _mp0 = int(main_positions.view(-1)[0].item())
                 _last = getattr(self.attn, "_dspark_last_mp0", None)
                 if _last is not None and _mp0 <= _last:
+                    # 新请求: 挂起捕获至 prefill 尾调用 (更新52d — run 65
+                    # 指纹显示 cache_kv 在 prefill 尾仍跨请求分歧, 需全量
+                    # 捕获判别分歧槽)
+                    setattr(self.attn, "_dspark_newreq", True)
+                setattr(self.attn, "_dspark_last_mp0", _mp0)
+                if _mp0 == 130664 and getattr(self.attn, "_dspark_newreq", False):
                     _cn = getattr(self.attn, "_dspark_capn", 0)
                     if _cn < 4:
                         setattr(self.attn, "_dspark_capn", _cn + 1)
@@ -313,7 +319,7 @@ class DSparkDecoderLayer(DeepseekV4DecoderLayer):
                             },
                             os.environ["VLLM_TRITON_DIFFCAP2"] + f".dspark{_slot}.pt",
                         )
-                setattr(self.attn, "_dspark_last_mp0", _mp0)
+                    setattr(self.attn, "_dspark_newreq", False)
             except Exception:
                 pass
         if self._triton_attn:
