@@ -1040,22 +1040,34 @@ def sparse_attn_indexer(
             # 与 prefill 一致; 不改选择集合。
             if decode_metadata.global_seq_lens is None or dcp_world_size == 1:
                 _imax_d = torch.iinfo(topk_indices.dtype).max
-                _clamp_d = topk_indices.clamp(min=0)
-                _scores_d = logits.gather(1, _clamp_d)
-                _scores_d = torch.where(
-                    topk_indices >= 0, _scores_d, float("-inf")
-                )
-                _order1d = torch.argsort(_clamp_d, dim=-1, stable=True)
-                _idx_sorted_d = topk_indices.gather(1, _order1d)
-                _score_sorted_d = _scores_d.gather(1, _order1d)
-                _order2d = torch.argsort(
-                    _score_sorted_d, dim=-1, descending=True, stable=True
-                )
-                _canonical_d = _idx_sorted_d.gather(1, _order2d)
-                topk_indices.copy_(
-                    torch.where(topk_indices >= 0, _canonical_d, _imax_d)
-                )
-                topk_indices.masked_fill_(topk_indices == _imax_d, -1)
+                # 53k (G2 规则终选): VLLM_IDX_ORDER=index → 索引升序变体
+                # (逻辑位置序, 注意力累加序 = 缓存自然序); 默认 score =
+                # (score desc, index asc) 字典序 (53i)。
+                if os.environ.get("VLLM_IDX_ORDER", "score") == "index":
+                    _x_d = torch.where(topk_indices >= 0, topk_indices, _imax_d)
+                    _canonical_d = _x_d.sort(
+                        dim=-1, descending=False, stable=True
+                    ).values
+                    topk_indices.copy_(
+                        torch.where(_canonical_d != _imax_d, _canonical_d, -1)
+                    )
+                else:
+                    _clamp_d = topk_indices.clamp(min=0)
+                    _scores_d = logits.gather(1, _clamp_d)
+                    _scores_d = torch.where(
+                        topk_indices >= 0, _scores_d, float("-inf")
+                    )
+                    _order1d = torch.argsort(_clamp_d, dim=-1, stable=True)
+                    _idx_sorted_d = topk_indices.gather(1, _order1d)
+                    _score_sorted_d = _scores_d.gather(1, _order1d)
+                    _order2d = torch.argsort(
+                        _score_sorted_d, dim=-1, descending=True, stable=True
+                    )
+                    _canonical_d = _idx_sorted_d.gather(1, _order2d)
+                    topk_indices.copy_(
+                        torch.where(topk_indices >= 0, _canonical_d, _imax_d)
+                    )
+                    topk_indices.masked_fill_(topk_indices == _imax_d, -1)
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
