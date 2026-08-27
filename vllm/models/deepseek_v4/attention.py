@@ -475,6 +475,62 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                         )
             except Exception as _e3:
                 print(f"[DIFFCAP2-o] err: {_e3}", flush=True)
+        # 更新53d (G1): L2 verify 首步全量捕获 (VLLM_VFY_CAP) — 判别 L2
+        # 注意力分歧源 (run 72 指纹: verify 首步 pos0=130665 出生层 = L2
+        # attn_out; L0/L1 全同, 输入侧位级同已证)。捕获 hidden/qr/o +
+        # SWA 索引/长度/有效性 + block_table + topk buffer — 判别
+        # 输入张量跨请求不同 vs kernel 同输入异输出。rank0 + cap 4。
+        if (
+            os.environ.get("VLLM_VFY_CAP")
+            and _rank0o
+            and self.prefix == "model.layers.2.attn"
+        ):
+            try:
+                _p0v = int(positions.view(-1)[0].item())
+                if _p0v == 130665:
+                    _cnv = getattr(self, "_vfycap_n", 0)
+                    if _cnv < 4:
+                        setattr(self, "_vfycap_n", _cnv + 1)
+                        torch.cuda.synchronize()
+                        _fctxv = get_forward_context()
+                        _smdv = (
+                            _fctxv.attn_metadata.get(self.swa_cache_layer.prefix)
+                            if isinstance(_fctxv.attn_metadata, dict)
+                            else None
+                        )
+                        _smd2v = (
+                            _fctxv.attn_metadata.get(self.prefix)
+                            if isinstance(_fctxv.attn_metadata, dict)
+                            else None
+                        )
+                        _g = lambda t: t.detach().cpu() if t is not None else None
+                        torch.save(
+                            {
+                                "n": _cnv,
+                                "hidden": _g(hidden_states),
+                                "qr": _g(qr),
+                                "o": _g(o),
+                                "positions": _g(positions),
+                                "swa_indices": _g(
+                                    getattr(_smdv, "decode_swa_indices", None)
+                                ),
+                                "swa_lens": _g(
+                                    getattr(_smdv, "decode_swa_lens", None)
+                                ),
+                                "is_valid": _g(
+                                    getattr(_smdv, "is_valid_token", None)
+                                ),
+                                "block_table": _g(
+                                    getattr(_smd2v, "block_table", None)
+                                ),
+                                "topk_buffer": _g(
+                                    getattr(self, "topk_indices_buffer", None)
+                                ),
+                            },
+                            os.environ["VLLM_VFY_CAP"] + f".v{_cnv}.pt",
+                        )
+            except Exception as _e4:
+                print(f"[VFY-CAP] err: {_e4}", flush=True)
         # 指纹: 注意力输出 (o_proj 前) — 与 attn_r 配对判别 o_proj 分歧
         if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
             try:
