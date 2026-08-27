@@ -995,16 +995,20 @@ def sparse_attn_indexer(
                         global _IDXCAP_N
                         _IDXCAP_N = globals().get("_IDXCAP_N", 0)
                         _ni = _IDXCAP_N
-                        # 53f 门控: 每请求真首步 = seq_len 32666 (压缩长度;
-                        # warmup 2-3, 后续步 32668+ 均排除); cap 4 = 4 请求。
+                        # 53g 门控: 每请求真首步 = seq_len 32666 (压缩长度;
+                        # warmup 2-3, 后续步 32668+ 均排除) 且仅 L2 (53f
+                        # 教训: 每请求首步有 4 个 indexer 层各触发一次,
+                        # cap 4 被 REQ 1 的层耗尽); cap 4 = 4 请求 L2。
                         _sl0 = int(seq_lens.flatten()[0].item())
-                        if _ni < 4 and _sl0 == 32666:
+                        _is_l2 = str(k_cache_prefix).endswith("layers.2.attn")
+                        if _ni < 4 and _sl0 == 32666 and _is_l2:
                             _IDXCAP_N = _ni + 1
                             globals()["_IDXCAP_N"] = _IDXCAP_N
                             torch.cuda.synchronize()
                             torch.save(
                                 {
                                     "n": _ni,
+                                    "prefix": str(k_cache_prefix),
                                     "num_rows": num_rows,
                                     "logits": logits.detach().cpu(),
                                     "topk_indices": topk_indices.detach().cpu(),
