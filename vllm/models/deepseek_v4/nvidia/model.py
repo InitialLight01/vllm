@@ -1331,7 +1331,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         _prof_tok = int(os.environ.get("VLLM_TORCH_PROF_TOKENS", "7845"))
         if (
             os.environ.get("VLLM_TORCH_PROF")
-            and hidden_states.shape[0] == _prof_tok
+            and hidden_states.shape[0] >= _prof_tok
             and not torch.cuda.is_current_stream_capturing()
             and not getattr(self, "_torch_prof_done", False)
         ):
