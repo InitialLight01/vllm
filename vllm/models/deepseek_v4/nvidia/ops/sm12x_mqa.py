@@ -3,6 +3,7 @@
 """Triton fallback kernels used by the local DeepSeek V4 path."""
 
 import torch
+import os
 
 from vllm.triton_utils import tl, triton
 
