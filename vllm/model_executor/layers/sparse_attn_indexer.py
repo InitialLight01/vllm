@@ -978,6 +978,42 @@ def sparse_attn_indexer(
                     topk_tokens,
                 )
 
+            # 更新53e (G1): decode indexer logits/topk 捕获 (VLLM_IDX_CAP) —
+            # 判别 L2 分歧源 (run 72d 证据: topk_buffer 行 0-5 = decode
+            # indexer 写入区跨请求分歧; logits 全同 → topk 选择按物理列
+            # 序 tie-break 问题; logits 分歧 → paged logits kernel 或
+            # 输入分歧)。rank0 + cap 60。
+            _idx_cap = os.environ.get("VLLM_IDX_CAP")
+            if _idx_cap is not None and not torch.cuda.is_current_stream_capturing():
+                try:
+                    _rank0i = (
+                        torch.distributed.get_rank() == 0
+                        if torch.distributed.is_initialized()
+                        else True
+                    )
+                    if _rank0i:
+                        global _IDXCAP_N
+                        _IDXCAP_N = globals().get("_IDXCAP_N", 0)
+                        _ni = _IDXCAP_N
+                        if _ni < 60:
+                            _IDXCAP_N = _ni + 1
+                            globals()["_IDXCAP_N"] = _IDXCAP_N
+                            torch.cuda.synchronize()
+                            torch.save(
+                                {
+                                    "n": _ni,
+                                    "num_rows": num_rows,
+                                    "logits": logits.detach().cpu(),
+                                    "topk_indices": topk_indices.detach().cpu(),
+                                    "seq_lens": seq_lens.detach().cpu(),
+                                    "block_table": decode_metadata.block_table.detach().cpu(),
+                                    "weights": weights[:num_padded_tokens].detach().cpu(),
+                                },
+                                _idx_cap + f".i{_ni}.pt",
+                            )
+                except Exception as _e5:
+                    print(f"[IDX-CAP] err: {_e5}", flush=True)
+
             if decode_metadata.global_seq_lens is not None:
                 _merge_dcp_topk_global(
                     logits,
