@@ -851,7 +851,8 @@ def indexer_score_logits_triton(
     if num_q == 0 or seq_len_kv == 0:
         return logits
 
-    block_m, block_n = 32, 64
+    block_m = 32
+    block_n = int(os.environ.get("VLLM_IDX_BN", "64"))  # G4: BN 变体
     grid = (triton.cdiv(num_q, block_m), triton.cdiv(seq_len_kv, block_n))
     _indexer_score_logits_kernel[grid](
         q,
