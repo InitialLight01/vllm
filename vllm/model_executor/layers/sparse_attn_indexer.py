@@ -740,20 +740,31 @@ def sparse_attn_indexer(
                     # 全部消费者。选择集合已由 sampler 并列修复确定。
                     _imax = torch.iinfo(topk_indices.dtype).max
                     _clamp = topk_indices.clamp(min=0)
-                    _scores = logits.gather(1, _clamp)
-                    # -1 填充 = -inf 分数 → desc 排序沉底 (valid-front)
-                    _scores = torch.where(topk_indices >= 0, _scores, float("-inf"))
-                    _order1 = torch.argsort(_clamp, dim=-1, stable=True)
-                    _idx_sorted = topk_indices.gather(1, _order1)
-                    _score_sorted = _scores.gather(1, _order1)
-                    _order2 = torch.argsort(
-                        _score_sorted, dim=-1, descending=True, stable=True
-                    )
-                    _canonical = _idx_sorted.gather(1, _order2)
-                    topk_indices.copy_(
-                        torch.where(topk_indices >= 0, _canonical, _imax)
-                    )
-                    topk_indices.masked_fill_(topk_indices == _imax, -1)
+                    # 53l (G2 二分): VLLM_IDX_PREFILL_ORDER=index → v1 纯
+                    # 索引升序变体; 默认 score = (score desc, index asc)
+                    # 字典序 (52g)。
+                    if os.environ.get("VLLM_IDX_PREFILL_ORDER", "score") == "index":
+                        _order1 = torch.argsort(_clamp, dim=-1, stable=True)
+                        _canonical = topk_indices.gather(1, _order1)
+                        topk_indices.copy_(
+                            torch.where(topk_indices >= 0, _canonical, _imax)
+                        )
+                        topk_indices.masked_fill_(topk_indices == _imax, -1)
+                    else:
+                        _scores = logits.gather(1, _clamp)
+                        # -1 填充 = -inf 分数 → desc 排序沉底 (valid-front)
+                        _scores = torch.where(topk_indices >= 0, _scores, float("-inf"))
+                        _order1 = torch.argsort(_clamp, dim=-1, stable=True)
+                        _idx_sorted = topk_indices.gather(1, _order1)
+                        _score_sorted = _scores.gather(1, _order1)
+                        _order2 = torch.argsort(
+                            _score_sorted, dim=-1, descending=True, stable=True
+                        )
+                        _canonical = _idx_sorted.gather(1, _order2)
+                        topk_indices.copy_(
+                            torch.where(topk_indices >= 0, _canonical, _imax)
+                        )
+                        topk_indices.masked_fill_(topk_indices == _imax, -1)
                     if _phase_timing:
                         _te[3].record()
                         torch.cuda.synchronize()
