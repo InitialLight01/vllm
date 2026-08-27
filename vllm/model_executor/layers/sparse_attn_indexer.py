@@ -1000,7 +1000,8 @@ def sparse_attn_indexer(
                         # 教训: 每请求首步有 4 个 indexer 层各触发一次,
                         # cap 4 被 REQ 1 的层耗尽); cap 4 = 4 请求 L2。
                         _sl0 = int(seq_lens.flatten()[0].item())
-                        _is_l2 = str(k_cache_prefix).endswith("layers.2.attn")
+                        # 53h: LayerName 包装的 str 不以 "attn" 结尾, 用包含
+                        _is_l2 = "layers.2.attn" in str(k_cache_prefix)
                         if _ni < 4 and _sl0 == 32666 and _is_l2:
                             _IDXCAP_N = _ni + 1
                             globals()["_IDXCAP_N"] = _IDXCAP_N
