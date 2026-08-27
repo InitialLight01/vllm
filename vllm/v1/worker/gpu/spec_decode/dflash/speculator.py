@@ -431,21 +431,34 @@ class DFlashSpeculator(DraftModelSpeculator):
             **precompute_kwargs,
         )
 
-        # 更新53a (G1): first-pass 首步捕获 flag — num_sampled==0 且
-        # num_target_tokens 小 = 每请求真首步 (prefill chunk 期的 propose
-        # 调用 num_target_tokens≈8188, 会被排除; 52m 历史已证 prefill 期
-        # 有 _generate_draft 调用误捕). _run_model 在该步保存草稿前向输出,
-        # propose 尾部保存输入侧并清 flag. env 门控默认关.
+        # 更新53b (G1): first-pass 捕获 — 全量调用签名日志 + 宽松 tensor
+        # 捕获 (positions[0]>100000 = decode 期; run 72 教训: warmup dummy
+        # 请求和真首步的签名未知, 53a 的两个谓词 (num_sampled==0,
+        # n_tgt<100) 在真首步可能为假, 本轮用签名日志取实证后再定精确门).
         self._fpcap_flag = False
         _fpc = os.environ.get("VLLM_DSPK_FPCAP")
-        if (
-            _fpc
-            and getattr(self, "_fpcap_n", 0) < 4
-            and num_sampled is not None
-            and int(num_sampled.max().item()) == 0
-            and num_target_tokens < 100
-        ):
-            self._fpcap_flag = True
+        if _fpc:
+            _call = getattr(self, "_fpcap_call", 0)
+            setattr(self, "_fpcap_call", _call + 1)
+            _q0 = -1
+            try:
+                _q0 = (
+                    int(self.input_buffers.positions.view(-1)[0].item())
+                    if self.input_buffers.positions.numel()
+                    else -1
+                )
+                with open(_fpc + ".calls.jsonl", "a") as _f:
+                    _f.write(
+                        f"{{\"call\": {_call}, \"q0\": {_q0}, "
+                        f"\"num_sampled\": {int(num_sampled.max().item()) if num_sampled is not None and num_sampled.numel() else -1}, "
+                        f"\"num_rejected\": {int(num_rejected.max().item()) if num_rejected is not None and num_rejected.numel() else -1}, "
+                        f"\"n_tgt\": {num_target_tokens}, \"n_qry\": {num_query_tokens}, "
+                        f"\"n_reqs\": {num_reqs}}}\n"
+                    )
+            except Exception:
+                pass
+            if _q0 > 100000 and getattr(self, "_fpcap_n", 0) < 12:
+                self._fpcap_flag = True
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
