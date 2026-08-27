@@ -489,7 +489,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 _p0v = int(positions.view(-1)[0].item())
                 if _p0v == 130665:
                     _cnv = getattr(self, "_vfycap_n", 0)
-                    if _cnv < 4:
+                    if _cnv < 12:
                         setattr(self, "_vfycap_n", _cnv + 1)
                         torch.cuda.synchronize()
                         _fctxv = get_forward_context()

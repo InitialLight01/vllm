@@ -1002,7 +1002,7 @@ def sparse_attn_indexer(
                         _sl0 = int(seq_lens.flatten()[0].item())
                         # 53h: LayerName 包装的 str 不以 "attn" 结尾, 用包含
                         _is_l2 = "layers.2.attn" in str(k_cache_prefix)
-                        if _ni < 4 and _sl0 == 32666 and _is_l2:
+                        if _ni < 12 and _sl0 == 32666 and _is_l2:
                             _IDXCAP_N = _ni + 1
                             globals()["_IDXCAP_N"] = _IDXCAP_N
                             torch.cuda.synchronize()
