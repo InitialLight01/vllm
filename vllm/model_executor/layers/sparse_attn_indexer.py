@@ -1032,6 +1032,31 @@ def sparse_attn_indexer(
                     cp_kv_cache_interleave_size,
                 )
 
+            # 更新53i (G1 根因修复): decode topk 输出序规范化 — topKPerRowDecode
+            # 的集合确定但行内顺序 = atomicAdd 到达序 (竞态, TDD 平凡输入
+            # 复现: 步长-4 收集序模式, 每次运行不同); prefill 有 52g 同款
+            # 规范化而 decode 没有 → 注意力累加序跨请求不同 → L2 o 分歧
+            # (run 72d-72h 证据链终点)。(score desc, index asc) 字典序,
+            # 与 prefill 一致; 不改选择集合。
+            if decode_metadata.global_seq_lens is None or dcp_world_size == 1:
+                _imax_d = torch.iinfo(topk_indices.dtype).max
+                _clamp_d = topk_indices.clamp(min=0)
+                _scores_d = logits.gather(1, _clamp_d)
+                _scores_d = torch.where(
+                    topk_indices >= 0, _scores_d, float("-inf")
+                )
+                _order1d = torch.argsort(_clamp_d, dim=-1, stable=True)
+                _idx_sorted_d = topk_indices.gather(1, _order1d)
+                _score_sorted_d = _scores_d.gather(1, _order1d)
+                _order2d = torch.argsort(
+                    _score_sorted_d, dim=-1, descending=True, stable=True
+                )
+                _canonical_d = _idx_sorted_d.gather(1, _order2d)
+                topk_indices.copy_(
+                    torch.where(topk_indices >= 0, _canonical_d, _imax_d)
+                )
+                topk_indices.masked_fill_(topk_indices == _imax_d, -1)
+
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
             # the topk indices removing padded tokens
