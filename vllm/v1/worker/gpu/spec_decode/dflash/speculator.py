@@ -3,6 +3,7 @@
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import os  # sm80 更新52c: VLLM_DSPARK_BOUNDARY_RESET env 门控
 
@@ -189,9 +190,12 @@ class DFlashSpeculator(DraftModelSpeculator):
                 inputs_embeds=None,
             )
         # 更新53a (G1): first-pass 首步草稿前向输出捕获 (propose 置 flag;
-        # flag 由 propose 尾部捕获后清除, 此处不清). env 门控默认关.
-        if os.environ.get("VLLM_DSPK_FPCAP") and getattr(
-            self, "_fpcap_flag", False
+        # flag 由 propose 尾部捕获后清除, 此处不清). 53c: rank0 门控.
+        # env 门控默认关.
+        if (
+            os.environ.get("VLLM_DSPK_FPCAP")
+            and (not dist.is_initialized() or dist.get_rank() == 0)
+            and getattr(self, "_fpcap_flag", False)
         ):
             try:
                 torch.cuda.synchronize()
@@ -431,13 +435,16 @@ class DFlashSpeculator(DraftModelSpeculator):
             **precompute_kwargs,
         )
 
-        # 更新53b (G1): first-pass 捕获 — 全量调用签名日志 + 宽松 tensor
-        # 捕获 (positions[0]>100000 = decode 期; run 72 教训: warmup dummy
-        # 请求和真首步的签名未知, 53a 的两个谓词 (num_sampled==0,
-        # n_tgt<100) 在真首步可能为假, 本轮用签名日志取实证后再定精确门).
+        # 更新53c (G1): first-pass 捕获 — 精确门控 (run 72 签名取证定案):
+        # 真首步 = num_sampled==1 AND num_rejected==0 AND n_tgt>1000
+        # (实测: prefill chunk propose ns=0/n_tgt=8188; 真首步 ns=1/nr=0/
+        # n_tgt=7845; 后续步 ns≥2 或 ns=1+nr=5/n_tgt=6; warmup ns=0/1 但
+        # q0<100)。cap 4 = 每请求一次。rank0 门控防 TP 双写 (53b 签名
+        # 日志每行重复 = 双 rank 竞写实锤)。
         self._fpcap_flag = False
         _fpc = os.environ.get("VLLM_DSPK_FPCAP")
-        if _fpc:
+        _is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+        if _fpc and _is_rank0:
             _call = getattr(self, "_fpcap_call", 0)
             setattr(self, "_fpcap_call", _call + 1)
             _q0 = -1
@@ -457,7 +464,16 @@ class DFlashSpeculator(DraftModelSpeculator):
                     )
             except Exception:
                 pass
-            if _q0 > 100000 and getattr(self, "_fpcap_n", 0) < 12:
+            if (
+                num_sampled is not None
+                and num_sampled.numel()
+                and int(num_sampled.max().item()) == 1
+                and num_rejected is not None
+                and num_rejected.numel()
+                and int(num_rejected.max().item()) == 0
+                and num_target_tokens > 1000
+                and getattr(self, "_fpcap_n", 0) < 4
+            ):
                 self._fpcap_flag = True
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
