@@ -995,7 +995,10 @@ def sparse_attn_indexer(
                         global _IDXCAP_N
                         _IDXCAP_N = globals().get("_IDXCAP_N", 0)
                         _ni = _IDXCAP_N
-                        if _ni < 60:
+                        # 53f 门控: 每请求真首步 = seq_len 32666 (压缩长度;
+                        # warmup 2-3, 后续步 32668+ 均排除); cap 4 = 4 请求。
+                        _sl0 = int(seq_lens.flatten()[0].item())
+                        if _ni < 4 and _sl0 == 32666:
                             _IDXCAP_N = _ni + 1
                             globals()["_IDXCAP_N"] = _IDXCAP_N
                             torch.cuda.synchronize()
