@@ -9,7 +9,8 @@ from vllm.triton_utils import tl, triton
 
 
 def _bucketed_logits_buffer(
-    num_rows: int, row_width: int, device: torch.device
+    num_rows: int, row_width: int, device: torch.device,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """fp32 (num_rows, row_width) output, allocated in power-of-two buckets.
 
@@ -26,9 +27,9 @@ def _bucketed_logits_buffer(
     """
     numel = num_rows * row_width
     if numel == 0:
-        return torch.empty((num_rows, row_width), device=device, dtype=torch.float32)
+        return torch.empty((num_rows, row_width), device=device, dtype=dtype)
     alloc = 1 << (numel - 1).bit_length()
-    flat = torch.empty((alloc,), device=device, dtype=torch.float32)
+    flat = torch.empty((alloc,), device=device, dtype=dtype)
     return flat[:numel].view(num_rows, row_width)
 
 
@@ -765,6 +766,7 @@ def _indexer_score_logits_kernel(
     stride_on,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    OUT_BF16: tl.constexpr,
 ):
     """Indexer dense scoring: logits[m,n] = sum_h W[m,h] * relu(Q[m,h] . (K[n] * scale[n])).
 
@@ -825,6 +827,8 @@ def _indexer_score_logits_kernel(
     row_valid = (offs_n[None, :] >= ks[:, None]) & (offs_n[None, :] < ke[:, None])
     store_mask = valid_m[:, None] & valid_n[None, :]
     acc = tl.where(row_valid & store_mask, acc, float("-inf"))
+    if OUT_BF16:
+        acc = acc.to(tl.bfloat16)
     tl.store(
         out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
         acc,
@@ -848,7 +852,12 @@ def indexer_score_logits_triton(
     k_fp8, scale = kv
     num_q, num_heads, head_dim = q.shape
     seq_len_kv = k_fp8.shape[0]
-    logits = _bucketed_logits_buffer(num_q, seq_len_kv, q.device)
+    _out_dtype = (
+        torch.bfloat16 if os.environ.get("VLLM_IDX_BF16", "0") == "1"
+        else torch.float32
+    )
+    logits = _bucketed_logits_buffer(num_q, seq_len_kv, q.device,
+                                     dtype=_out_dtype)
     if num_q == 0 or seq_len_kv == 0:
         return logits
 
@@ -879,6 +888,7 @@ def indexer_score_logits_triton(
         logits.stride(1),
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        OUT_BF16=_out_dtype == torch.bfloat16,
         num_warps=num_warps,
     )
     return logits

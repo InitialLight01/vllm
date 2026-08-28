@@ -152,10 +152,11 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads,
 }
 
 template <int step, int kNumThreadsPerBlock, int kNumBins, int kNumFinalItems,
-          bool multipleBlocksPerRow, bool mergeBlocks, typename SmemFinalType,
-          typename SmemOutputType>
+          bool multipleBlocksPerRow, bool mergeBlocks, typename LogitsT = float,
+          typename SmemFinalType = void,
+          typename SmemOutputType = void>
 __device__ bool processHistogramStep(
-    const int* indices, const float* logits, int rowEnd, uint32_t& logitPattern,
+    const int* indices, const LogitsT* logits, int rowEnd, uint32_t& logitPattern,
     int& thresholdBinIdx, SmemOutputType& smemOutput, int* smemThresholdBinIdx,
     int* smemFinalDstIdx, int* smemFinalBinSize, int* smemFoundTopKValues,
     SmemFinalType& smemFinal, int stride1, int rowStart, int topK) {
@@ -340,8 +341,9 @@ __device__ bool processHistogramStep(
 
 // Follows half - 11 - 11 - 10 bit iterations
 template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort,
-          bool multipleBlocksPerRow = false, bool mergeBlocks = false>
-static __device__ void topKPerRowJob(const int* indices, const float* logits,
+          bool multipleBlocksPerRow = false, bool mergeBlocks = false,
+          typename LogitsT = float>
+static __device__ void topKPerRowJob(const int* indices, const LogitsT* logits,
                                      int rowStart, int rowEnd, int* outIndices,
                                      float* outLogits, int stride1, int topK) {
   // The number of slots for the final pass.
@@ -434,7 +436,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   // Step 0: Process first 11 bits of half representation
   bool continueToNextStep =
       processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                           multipleBlocksPerRow, mergeBlocks>(
+                           multipleBlocksPerRow, mergeBlocks, LogitsT>(
           indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
           smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
           smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -443,7 +445,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     // Step 1: Process next 11 bits
     continueToNextStep =
         processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                             multipleBlocksPerRow, mergeBlocks>(
+                             multipleBlocksPerRow, mergeBlocks, LogitsT>(
             indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
             smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
             smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -453,7 +455,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     // Step 2: Process next 11 bits
     continueToNextStep =
         processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                             multipleBlocksPerRow, mergeBlocks>(
+                             multipleBlocksPerRow, mergeBlocks, LogitsT>(
             indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
             smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
             smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -462,7 +464,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   if (continueToNextStep) {
     // Step 3: Process last 10 bits
     processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                         multipleBlocksPerRow, mergeBlocks>(
+                         multipleBlocksPerRow, mergeBlocks, LogitsT>(
         indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
         smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
         smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -660,9 +662,9 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   }
 }
 
-template <int kNumThreadsPerBlock, bool useRadixSort>
+template <int kNumThreadsPerBlock, bool useRadixSort, bool Bf16Input = false>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
-    const float* logits, const int* rowStarts, const int* rowEnds,
+    const void* logitsVoid, const int* rowStarts, const int* rowEnds,
     int* outIndices, int stride0, int stride1, const int topK,
     const int offsetIndex) {
   // The number of bins in the histogram.
@@ -677,10 +679,22 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 
   // Local pointers to this block
   outIndices += static_cast<int64_t>(rowIdx) * topK;
-  logits += static_cast<int64_t>(rowIdx) * stride0;
 
-  topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort>(
-      nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK);
+  // 53u (G4): bf16 logits 变体 — 打分物化 2GB→1GB (往返减半);
+  // 读侧隐式 bf16→fp32 转换, 直方图/选择语义不变。
+  if constexpr (Bf16Input) {
+    const __nv_bfloat16* logits =
+        reinterpret_cast<const __nv_bfloat16*>(logitsVoid) +
+        static_cast<int64_t>(rowIdx) * stride0;
+    topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, false, false,
+                  __nv_bfloat16>(
+        nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK);
+  } else {
+    const float* logits = reinterpret_cast<const float*>(logitsVoid) +
+                          static_cast<int64_t>(rowIdx) * stride0;
+    topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort>(
+        nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK);
+  }
 }
 
 template <int kNumThreadsPerBlock, bool useRadixSort,
@@ -852,24 +866,48 @@ void top_k_per_row_prefill(const torch::stable::Tensor& logits,
       logits.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
 
+  // 53u (G4): bf16 logits 变体 — 按 dtype 分发 (隐式转换在 kernel 内)。
+  const bool bf16Input =
+      logits.scalar_type() == torch::stable::ScalarType::BFloat16;
   int numInsertionBlocks =
       std::min(static_cast<int>(numRows), kSortingAlgorithmThreshold);
-  vllm::topKPerRowPrefill<kNumThreadsPerBlock, false>
-      <<<numInsertionBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
-         stream>>>(logits.const_data_ptr<float>(),
-                   rowStarts.const_data_ptr<int>(),
-                   rowEnds.const_data_ptr<int>(),
-                   indices.mutable_data_ptr<int>(), static_cast<int>(stride0),
-                   static_cast<int>(stride1), static_cast<int>(topK), 0);
+  if (bf16Input) {
+    vllm::topKPerRowPrefill<kNumThreadsPerBlock, false, true>
+        <<<numInsertionBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
+           stream>>>(logits.const_data_ptr<torch::stable::BFloat16>(),
+                     rowStarts.const_data_ptr<int>(),
+                     rowEnds.const_data_ptr<int>(),
+                     indices.mutable_data_ptr<int>(), static_cast<int>(stride0),
+                     static_cast<int>(stride1), static_cast<int>(topK), 0);
+  } else {
+    vllm::topKPerRowPrefill<kNumThreadsPerBlock, false>
+        <<<numInsertionBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
+           stream>>>(logits.const_data_ptr<float>(),
+                     rowStarts.const_data_ptr<int>(),
+                     rowEnds.const_data_ptr<int>(),
+                     indices.mutable_data_ptr<int>(), static_cast<int>(stride0),
+                     static_cast<int>(stride1), static_cast<int>(topK), 0);
+  }
 
   if (numRows > kSortingAlgorithmThreshold) {
     int numRadixBlocks = numRows - kSortingAlgorithmThreshold;
-    vllm::topKPerRowPrefill<kNumThreadsPerBlock, true>
-        <<<numRadixBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
-           stream>>>(
-            logits.const_data_ptr<float>(), rowStarts.const_data_ptr<int>(),
-            rowEnds.const_data_ptr<int>(), indices.mutable_data_ptr<int>(),
-            static_cast<int>(stride0), static_cast<int>(stride1),
-            static_cast<int>(topK), kSortingAlgorithmThreshold);
+    if (bf16Input) {
+      vllm::topKPerRowPrefill<kNumThreadsPerBlock, true, true>
+          <<<numRadixBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
+             stream>>>(
+              logits.const_data_ptr<torch::stable::BFloat16>(),
+              rowStarts.const_data_ptr<int>(), rowEnds.const_data_ptr<int>(),
+              indices.mutable_data_ptr<int>(), static_cast<int>(stride0),
+              static_cast<int>(stride1), static_cast<int>(topK),
+              kSortingAlgorithmThreshold);
+    } else {
+      vllm::topKPerRowPrefill<kNumThreadsPerBlock, true>
+          <<<numRadixBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
+             stream>>>(
+              logits.const_data_ptr<float>(), rowStarts.const_data_ptr<int>(),
+              rowEnds.const_data_ptr<int>(), indices.mutable_data_ptr<int>(),
+              static_cast<int>(stride0), static_cast<int>(stride1),
+              static_cast<int>(topK), kSortingAlgorithmThreshold);
+    }
   }
 }
