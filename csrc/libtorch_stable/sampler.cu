@@ -874,7 +874,7 @@ void top_k_per_row_prefill(const torch::stable::Tensor& logits,
   if (bf16Input) {
     vllm::topKPerRowPrefill<kNumThreadsPerBlock, false, true>
         <<<numInsertionBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
-           stream>>>(logits.const_data_ptr<torch::stable::BFloat16>(),
+           stream>>>(logits.const_data_ptr<c10::BFloat16>(),
                      rowStarts.const_data_ptr<int>(),
                      rowEnds.const_data_ptr<int>(),
                      indices.mutable_data_ptr<int>(), static_cast<int>(stride0),
@@ -895,7 +895,7 @@ void top_k_per_row_prefill(const torch::stable::Tensor& logits,
       vllm::topKPerRowPrefill<kNumThreadsPerBlock, true, true>
           <<<numRadixBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t),
              stream>>>(
-              logits.const_data_ptr<torch::stable::BFloat16>(),
+              logits.const_data_ptr<c10::BFloat16>(),
               rowStarts.const_data_ptr<int>(), rowEnds.const_data_ptr<int>(),
               indices.mutable_data_ptr<int>(), static_cast<int>(stride0),
               static_cast<int>(stride1), static_cast<int>(topK),
