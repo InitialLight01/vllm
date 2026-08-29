@@ -670,6 +670,28 @@ def sparse_attn_indexer(
                         topk_indices,
                     )
                 )
+                # [PERF] G4 ②: 融合免物化打分+topk (env 门控 VLLM_IDX_FUSED,
+                # 默认关). 数值与 _use_triton_logits 路径逐位对齐 (同 BN=64
+                # fp8 dot + h 序单累加器 + canonical topk 比较器) — 免 logits
+                # 物化 (1M 下 2GB/次往返), 见 fused_indexer_topk.py。
+                if (
+                    not _used_fused
+                    and _use_triton_logits
+                    and not current_platform.is_xpu()
+                    and os.environ.get("VLLM_IDX_FUSED", "0") == "1"
+                ):
+                    from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_topk import (
+                        fused_indexer_topk_triton,
+                    )
+
+                    _used_fused = fused_indexer_topk_triton(
+                        q_slice_cast,
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        topk_indices,
+                    )
                 if _used_fused:
                     # Direct fused top-k path (SM12x fallback): topk_indices
                     # filled in-place; no logits materialization.
