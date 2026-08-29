@@ -999,6 +999,6 @@ def fused_indexer_topk_triton(
         topk_indices.stride(0), topk_indices.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         LOG2_PAD=LOG2_PAD,
-        num_warps=4, num_stages=1,
+        num_warps=8, num_stages=1,
     )
     return True
