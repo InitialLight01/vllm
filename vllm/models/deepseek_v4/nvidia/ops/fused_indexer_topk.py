@@ -984,7 +984,7 @@ def fused_indexer_topk_triton(
         return True
     assert topk_tokens & (topk_tokens - 1) == 0, "TOPK 须为 2 的幂"
 
-    BLOCK_M = int(os.environ.get("VLLM_IDX_FUSED_BM", "2"))
+    BLOCK_M = int(os.environ.get("VLLM_IDX_FUSED_BM", "8"))
     BLOCK_N = topk_tokens
     LOG2_PAD = (2 * topk_tokens).bit_length() - 1
     assert 2 * topk_tokens == (1 << LOG2_PAD), (topk_tokens, LOG2_PAD)
