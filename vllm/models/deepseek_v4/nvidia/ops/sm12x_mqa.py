@@ -836,6 +836,401 @@ def _indexer_score_logits_kernel(
     )
 
 
+
+
+
+@triton.jit
+def _split_h(f, K: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """按 h 轴偶奇拆分: [BM, K, BN] -> 两个 [BM, K/2, BN] (h=2a 与 h=2a+1)."""
+    r = tl.reshape(f, [BLOCK_M, K // 2, 2, BLOCK_N])
+    r = tl.permute(r, (0, 1, 3, 2))       # [BM, K/2, BN, 2]
+    lo, hi = tl.split(r)
+    return lo, hi
+
+
+@triton.jit
+def _split_h_w(f, K: tl.constexpr, BLOCK_M: tl.constexpr):
+    """按 h 轴偶奇拆分 1D 权重: [BM, K] -> 两个 [BM, K/2]."""
+    r = tl.reshape(f, [BLOCK_M, K // 2, 2])   # pair 轴已在最后
+    lo, hi = tl.split(r)
+    return lo, hi
+
+
+@triton.jit
+def _indexer_score_logits_kernel_v2(
+    q_ptr, k_ptr, scale_ptr, weights_ptr,
+    cu_ks_ptr, cu_ke_ptr, out_ptr,
+    M, N,
+    H: tl.constexpr, D: tl.constexpr,
+    stride_qm, stride_qh, stride_qd,
+    stride_kn, stride_kd,
+    stride_wm, stride_wh,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """G4 ① GEMM 重排: 64 头摊平成 M 维做单一大 GEMM (消除串行小 dot 延迟界),
+    逐头 h 序提取累加 (与参考逐位同)."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_h = tl.arange(0, H)
+    offs_d = tl.arange(0, D)
+    valid_m = offs_m < M
+    valid_n = offs_n < N
+
+    ks = tl.load(cu_ks_ptr + offs_m, mask=valid_m, other=0)
+    ke = tl.load(cu_ke_ptr + offs_m, mask=valid_m, other=0)
+
+    k_f8 = tl.load(
+        k_ptr + offs_d[:, None] * stride_kd + offs_n[None, :] * stride_kn,
+        mask=valid_n[None, :], other=0.0)
+    k_sc = tl.load(scale_ptr + offs_n, mask=valid_n, other=1.0)
+
+    # 摊平 3D 加载 q [BM, H, D] -> reshape [BM*H, D] (行主序视图)
+    q3 = tl.load(
+        q_ptr + offs_m[:, None, None] * stride_qm
+        + offs_h[None, :, None] * stride_qh
+        + offs_d[None, None, :] * stride_qd,
+        mask=valid_m[:, None, None], other=0.0)
+    q_f8 = tl.reshape(q3, [BLOCK_M * H, D])
+    w3 = tl.load(
+        weights_ptr + offs_m[:, None] * stride_wm + offs_h[None, :] * stride_wh,
+        mask=valid_m[:, None], other=0.0)
+
+    s = tl.dot(q_f8, k_f8)              # [BM*H, BN] — K=128 链与参考逐位同
+    s = s * k_sc[None, :]
+    s = tl.maximum(s, 0.0)
+    # 注: w 不在树前乘入 — FMA 链做唯一一次 w 应用 (与参考 acc += s*w 同构)
+
+    s3 = tl.reshape(s, [BLOCK_M, H, BLOCK_N])
+    t0_139840926128320_lo, t0_139840926128320_hi = _split_h(s3, 64, BLOCK_M, BLOCK_N)
+    t1_139840926872624_lo, t1_139840926872624_hi = _split_h(t0_139840926128320_lo, 32, BLOCK_M, BLOCK_N)
+    t1_139840926872688_lo, t1_139840926872688_hi = _split_h(t0_139840926128320_hi, 32, BLOCK_M, BLOCK_N)
+    t2_139840927049264_lo, t2_139840927049264_hi = _split_h(t1_139840926872624_lo, 16, BLOCK_M, BLOCK_N)
+    t2_139840927048048_lo, t2_139840927048048_hi = _split_h(t1_139840926872624_hi, 16, BLOCK_M, BLOCK_N)
+    t2_139840925057072_lo, t2_139840925057072_hi = _split_h(t1_139840926872688_lo, 16, BLOCK_M, BLOCK_N)
+    t2_139840925057136_lo, t2_139840925057136_hi = _split_h(t1_139840926872688_hi, 16, BLOCK_M, BLOCK_N)
+    t3_139840926872624_lo, t3_139840926872624_hi = _split_h(t2_139840927049264_lo, 8, BLOCK_M, BLOCK_N)
+    t3_139840925057392_lo, t3_139840925057392_hi = _split_h(t2_139840927049264_hi, 8, BLOCK_M, BLOCK_N)
+    t3_139840925057456_lo, t3_139840925057456_hi = _split_h(t2_139840927048048_lo, 8, BLOCK_M, BLOCK_N)
+    t3_139840925057520_lo, t3_139840925057520_hi = _split_h(t2_139840927048048_hi, 8, BLOCK_M, BLOCK_N)
+    t3_139840925057840_lo, t3_139840925057840_hi = _split_h(t2_139840925057072_lo, 8, BLOCK_M, BLOCK_N)
+    t3_139840925057904_lo, t3_139840925057904_hi = _split_h(t2_139840925057072_hi, 8, BLOCK_M, BLOCK_N)
+    t3_139840925058224_lo, t3_139840925058224_hi = _split_h(t2_139840925057136_lo, 8, BLOCK_M, BLOCK_N)
+    t3_139840925058288_lo, t3_139840925058288_hi = _split_h(t2_139840925057136_hi, 8, BLOCK_M, BLOCK_N)
+    t4_139840927049264_lo, t4_139840927049264_hi = _split_h(t3_139840926872624_lo, 4, BLOCK_M, BLOCK_N)
+    t4_139840925057136_lo, t4_139840925057136_hi = _split_h(t3_139840926872624_hi, 4, BLOCK_M, BLOCK_N)
+    t4_139840925057072_lo, t4_139840925057072_hi = _split_h(t3_139840925057392_lo, 4, BLOCK_M, BLOCK_N)
+    t4_139840925058544_lo, t4_139840925058544_hi = _split_h(t3_139840925057392_hi, 4, BLOCK_M, BLOCK_N)
+    t4_139840927048048_lo, t4_139840927048048_hi = _split_h(t3_139840925057456_lo, 4, BLOCK_M, BLOCK_N)
+    t4_139840925058608_lo, t4_139840925058608_hi = _split_h(t3_139840925057456_hi, 4, BLOCK_M, BLOCK_N)
+    t4_139840925058672_lo, t4_139840925058672_hi = _split_h(t3_139840925057520_lo, 4, BLOCK_M, BLOCK_N)
+    t4_139840925058736_lo, t4_139840925058736_hi = _split_h(t3_139840925057520_hi, 4, BLOCK_M, BLOCK_N)
+    t4_139840925058800_lo, t4_139840925058800_hi = _split_h(t3_139840925057840_lo, 4, BLOCK_M, BLOCK_N)
+    t4_139840925058864_lo, t4_139840925058864_hi = _split_h(t3_139840925057840_hi, 4, BLOCK_M, BLOCK_N)
+    t4_139840925059056_lo, t4_139840925059056_hi = _split_h(t3_139840925057904_lo, 4, BLOCK_M, BLOCK_N)
+    t4_139840925059120_lo, t4_139840925059120_hi = _split_h(t3_139840925057904_hi, 4, BLOCK_M, BLOCK_N)
+    t4_139840925059312_lo, t4_139840925059312_hi = _split_h(t3_139840925058224_lo, 4, BLOCK_M, BLOCK_N)
+    t4_139840925059376_lo, t4_139840925059376_hi = _split_h(t3_139840925058224_hi, 4, BLOCK_M, BLOCK_N)
+    t4_139840925059568_lo, t4_139840925059568_hi = _split_h(t3_139840925058288_lo, 4, BLOCK_M, BLOCK_N)
+    t4_139840925059632_lo, t4_139840925059632_hi = _split_h(t3_139840925058288_hi, 4, BLOCK_M, BLOCK_N)
+    t5_139840925058288_lo, t5_139840925058288_hi = _split_h(t4_139840927049264_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925058224_lo, t5_139840925058224_hi = _split_h(t4_139840927049264_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925057904_lo, t5_139840925057904_hi = _split_h(t4_139840925057136_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925057840_lo, t5_139840925057840_hi = _split_h(t4_139840925057136_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925057520_lo, t5_139840925057520_hi = _split_h(t4_139840925057072_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925057456_lo, t5_139840925057456_hi = _split_h(t4_139840925057072_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925057392_lo, t5_139840925057392_hi = _split_h(t4_139840925058544_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925059760_lo, t5_139840925059760_hi = _split_h(t4_139840925058544_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925059824_lo, t5_139840925059824_hi = _split_h(t4_139840927048048_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925059888_lo, t5_139840925059888_hi = _split_h(t4_139840927048048_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925060080_lo, t5_139840925060080_hi = _split_h(t4_139840925058608_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925060144_lo, t5_139840925060144_hi = _split_h(t4_139840925058608_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925060336_lo, t5_139840925060336_hi = _split_h(t4_139840925058672_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925060400_lo, t5_139840925060400_hi = _split_h(t4_139840925058672_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925060592_lo, t5_139840925060592_hi = _split_h(t4_139840925058736_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925060656_lo, t5_139840925060656_hi = _split_h(t4_139840925058736_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925060848_lo, t5_139840925060848_hi = _split_h(t4_139840925058800_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925060912_lo, t5_139840925060912_hi = _split_h(t4_139840925058800_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925061104_lo, t5_139840925061104_hi = _split_h(t4_139840925058864_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925061168_lo, t5_139840925061168_hi = _split_h(t4_139840925058864_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925061360_lo, t5_139840925061360_hi = _split_h(t4_139840925059056_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925061424_lo, t5_139840925061424_hi = _split_h(t4_139840925059056_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925061616_lo, t5_139840925061616_hi = _split_h(t4_139840925059120_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925061680_lo, t5_139840925061680_hi = _split_h(t4_139840925059120_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925061872_lo, t5_139840925061872_hi = _split_h(t4_139840925059312_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925061936_lo, t5_139840925061936_hi = _split_h(t4_139840925059312_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925062128_lo, t5_139840925062128_hi = _split_h(t4_139840925059376_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925062192_lo, t5_139840925062192_hi = _split_h(t4_139840925059376_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925062384_lo, t5_139840925062384_hi = _split_h(t4_139840925059568_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925062448_lo, t5_139840925062448_hi = _split_h(t4_139840925059568_hi, 2, BLOCK_M, BLOCK_N)
+    t5_139840925062640_lo, t5_139840925062640_hi = _split_h(t4_139840925059632_lo, 2, BLOCK_M, BLOCK_N)
+    t5_139840925062704_lo, t5_139840925062704_hi = _split_h(t4_139840925059632_hi, 2, BLOCK_M, BLOCK_N)
+    w0_139840926720544_lo, w0_139840926720544_hi = _split_h_w(w3, 64, BLOCK_M)
+    w1_139840925062640_lo, w1_139840925062640_hi = _split_h_w(w0_139840926720544_lo, 32, BLOCK_M)
+    w1_139840925062448_lo, w1_139840925062448_hi = _split_h_w(w0_139840926720544_hi, 32, BLOCK_M)
+    w2_139840925062384_lo, w2_139840925062384_hi = _split_h_w(w1_139840925062640_lo, 16, BLOCK_M)
+    w2_139840925062192_lo, w2_139840925062192_hi = _split_h_w(w1_139840925062640_hi, 16, BLOCK_M)
+    w2_139840925062128_lo, w2_139840925062128_hi = _split_h_w(w1_139840925062448_lo, 16, BLOCK_M)
+    w2_139840925061936_lo, w2_139840925061936_hi = _split_h_w(w1_139840925062448_hi, 16, BLOCK_M)
+    w3_139840925062640_lo, w3_139840925062640_hi = _split_h_w(w2_139840925062384_lo, 8, BLOCK_M)
+    w3_139840925062704_lo, w3_139840925062704_hi = _split_h_w(w2_139840925062384_hi, 8, BLOCK_M)
+    w3_139840925061872_lo, w3_139840925061872_hi = _split_h_w(w2_139840925062192_lo, 8, BLOCK_M)
+    w3_139840925061680_lo, w3_139840925061680_hi = _split_h_w(w2_139840925062192_hi, 8, BLOCK_M)
+    w3_139840925061424_lo, w3_139840925061424_hi = _split_h_w(w2_139840925062128_lo, 8, BLOCK_M)
+    w3_139840925061360_lo, w3_139840925061360_hi = _split_h_w(w2_139840925062128_hi, 8, BLOCK_M)
+    w3_139840925061168_lo, w3_139840925061168_hi = _split_h_w(w2_139840925061936_lo, 8, BLOCK_M)
+    w3_139840925061104_lo, w3_139840925061104_hi = _split_h_w(w2_139840925061936_hi, 8, BLOCK_M)
+    w4_139840925062128_lo, w4_139840925062128_hi = _split_h_w(w3_139840925062640_lo, 4, BLOCK_M)
+    w4_139840925062192_lo, w4_139840925062192_hi = _split_h_w(w3_139840925062640_hi, 4, BLOCK_M)
+    w4_139840925062384_lo, w4_139840925062384_hi = _split_h_w(w3_139840925062704_lo, 4, BLOCK_M)
+    w4_139840925061616_lo, w4_139840925061616_hi = _split_h_w(w3_139840925062704_hi, 4, BLOCK_M)
+    w4_139840925061936_lo, w4_139840925061936_hi = _split_h_w(w3_139840925061872_lo, 4, BLOCK_M)
+    w4_139840925060912_lo, w4_139840925060912_hi = _split_h_w(w3_139840925061872_hi, 4, BLOCK_M)
+    w4_139840925060848_lo, w4_139840925060848_hi = _split_h_w(w3_139840925061680_lo, 4, BLOCK_M)
+    w4_139840925060656_lo, w4_139840925060656_hi = _split_h_w(w3_139840925061680_hi, 4, BLOCK_M)
+    w4_139840925060592_lo, w4_139840925060592_hi = _split_h_w(w3_139840925061424_lo, 4, BLOCK_M)
+    w4_139840925060400_lo, w4_139840925060400_hi = _split_h_w(w3_139840925061424_hi, 4, BLOCK_M)
+    w4_139840925060336_lo, w4_139840925060336_hi = _split_h_w(w3_139840925061360_lo, 4, BLOCK_M)
+    w4_139840925060144_lo, w4_139840925060144_hi = _split_h_w(w3_139840925061360_hi, 4, BLOCK_M)
+    w4_139840925060080_lo, w4_139840925060080_hi = _split_h_w(w3_139840925061168_lo, 4, BLOCK_M)
+    w4_139840925059888_lo, w4_139840925059888_hi = _split_h_w(w3_139840925061168_hi, 4, BLOCK_M)
+    w4_139840925059824_lo, w4_139840925059824_hi = _split_h_w(w3_139840925061104_lo, 4, BLOCK_M)
+    w4_139840925059760_lo, w4_139840925059760_hi = _split_h_w(w3_139840925061104_hi, 4, BLOCK_M)
+    w5_139840925061168_lo, w5_139840925061168_hi = _split_h_w(w4_139840925062128_lo, 2, BLOCK_M)
+    w5_139840925061360_lo, w5_139840925061360_hi = _split_h_w(w4_139840925062128_hi, 2, BLOCK_M)
+    w5_139840925061424_lo, w5_139840925061424_hi = _split_h_w(w4_139840925062192_lo, 2, BLOCK_M)
+    w5_139840925061680_lo, w5_139840925061680_hi = _split_h_w(w4_139840925062192_hi, 2, BLOCK_M)
+    w5_139840925061872_lo, w5_139840925061872_hi = _split_h_w(w4_139840925062384_lo, 2, BLOCK_M)
+    w5_139840925062704_lo, w5_139840925062704_hi = _split_h_w(w4_139840925062384_hi, 2, BLOCK_M)
+    w5_139840925062640_lo, w5_139840925062640_hi = _split_h_w(w4_139840925061616_lo, 2, BLOCK_M)
+    w5_139840925062448_lo, w5_139840925062448_hi = _split_h_w(w4_139840925061616_hi, 2, BLOCK_M)
+    w5_139840925057392_lo, w5_139840925057392_hi = _split_h_w(w4_139840925061936_lo, 2, BLOCK_M)
+    w5_139840925057456_lo, w5_139840925057456_hi = _split_h_w(w4_139840925061936_hi, 2, BLOCK_M)
+    w5_139840925057520_lo, w5_139840925057520_hi = _split_h_w(w4_139840925060912_lo, 2, BLOCK_M)
+    w5_139840925057840_lo, w5_139840925057840_hi = _split_h_w(w4_139840925060912_hi, 2, BLOCK_M)
+    w5_139840925057904_lo, w5_139840925057904_hi = _split_h_w(w4_139840925060848_lo, 2, BLOCK_M)
+    w5_139840925058224_lo, w5_139840925058224_hi = _split_h_w(w4_139840925060848_hi, 2, BLOCK_M)
+    w5_139840925058288_lo, w5_139840925058288_hi = _split_h_w(w4_139840925060656_lo, 2, BLOCK_M)
+    w5_139840925068976_lo, w5_139840925068976_hi = _split_h_w(w4_139840925060656_hi, 2, BLOCK_M)
+    w5_139840925069040_lo, w5_139840925069040_hi = _split_h_w(w4_139840925060592_lo, 2, BLOCK_M)
+    w5_139840925069104_lo, w5_139840925069104_hi = _split_h_w(w4_139840925060592_hi, 2, BLOCK_M)
+    w5_139840925069296_lo, w5_139840925069296_hi = _split_h_w(w4_139840925060400_lo, 2, BLOCK_M)
+    w5_139840925069360_lo, w5_139840925069360_hi = _split_h_w(w4_139840925060400_hi, 2, BLOCK_M)
+    w5_139840925069552_lo, w5_139840925069552_hi = _split_h_w(w4_139840925060336_lo, 2, BLOCK_M)
+    w5_139840925069616_lo, w5_139840925069616_hi = _split_h_w(w4_139840925060336_hi, 2, BLOCK_M)
+    w5_139840925069808_lo, w5_139840925069808_hi = _split_h_w(w4_139840925060144_lo, 2, BLOCK_M)
+    w5_139840925069872_lo, w5_139840925069872_hi = _split_h_w(w4_139840925060144_hi, 2, BLOCK_M)
+    w5_139840925070064_lo, w5_139840925070064_hi = _split_h_w(w4_139840925060080_lo, 2, BLOCK_M)
+    w5_139840925070128_lo, w5_139840925070128_hi = _split_h_w(w4_139840925060080_hi, 2, BLOCK_M)
+    w5_139840925070320_lo, w5_139840925070320_hi = _split_h_w(w4_139840925059888_lo, 2, BLOCK_M)
+    w5_139840925070384_lo, w5_139840925070384_hi = _split_h_w(w4_139840925059888_hi, 2, BLOCK_M)
+    w5_139840925070576_lo, w5_139840925070576_hi = _split_h_w(w4_139840925059824_lo, 2, BLOCK_M)
+    w5_139840925070640_lo, w5_139840925070640_hi = _split_h_w(w4_139840925059824_hi, 2, BLOCK_M)
+    w5_139840925070832_lo, w5_139840925070832_hi = _split_h_w(w4_139840925059760_lo, 2, BLOCK_M)
+    w5_139840925070896_lo, w5_139840925070896_hi = _split_h_w(w4_139840925059760_hi, 2, BLOCK_M)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    t5_139840925058288_lo = tl.reshape(t5_139840925058288_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925061168_lo = tl.reshape(w5_139840925061168_lo, [BLOCK_M])
+    acc += t5_139840925058288_lo * w5_139840925061168_lo[:, None]
+    t5_139840925060848_lo = tl.reshape(t5_139840925060848_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925069040_lo = tl.reshape(w5_139840925069040_lo, [BLOCK_M])
+    acc += t5_139840925060848_lo * w5_139840925069040_lo[:, None]
+    t5_139840925059824_lo = tl.reshape(t5_139840925059824_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925057392_lo = tl.reshape(w5_139840925057392_lo, [BLOCK_M])
+    acc += t5_139840925059824_lo * w5_139840925057392_lo[:, None]
+    t5_139840925061872_lo = tl.reshape(t5_139840925061872_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925070064_lo = tl.reshape(w5_139840925070064_lo, [BLOCK_M])
+    acc += t5_139840925061872_lo * w5_139840925070064_lo[:, None]
+    t5_139840925057520_lo = tl.reshape(t5_139840925057520_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925061872_lo = tl.reshape(w5_139840925061872_lo, [BLOCK_M])
+    acc += t5_139840925057520_lo * w5_139840925061872_lo[:, None]
+    t5_139840925061360_lo = tl.reshape(t5_139840925061360_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925069552_lo = tl.reshape(w5_139840925069552_lo, [BLOCK_M])
+    acc += t5_139840925061360_lo * w5_139840925069552_lo[:, None]
+    t5_139840925060336_lo = tl.reshape(t5_139840925060336_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925057904_lo = tl.reshape(w5_139840925057904_lo, [BLOCK_M])
+    acc += t5_139840925060336_lo * w5_139840925057904_lo[:, None]
+    t5_139840925062384_lo = tl.reshape(t5_139840925062384_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925070576_lo = tl.reshape(w5_139840925070576_lo, [BLOCK_M])
+    acc += t5_139840925062384_lo * w5_139840925070576_lo[:, None]
+    t5_139840925057904_lo = tl.reshape(t5_139840925057904_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925061424_lo = tl.reshape(w5_139840925061424_lo, [BLOCK_M])
+    acc += t5_139840925057904_lo * w5_139840925061424_lo[:, None]
+    t5_139840925061104_lo = tl.reshape(t5_139840925061104_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925069296_lo = tl.reshape(w5_139840925069296_lo, [BLOCK_M])
+    acc += t5_139840925061104_lo * w5_139840925069296_lo[:, None]
+    t5_139840925060080_lo = tl.reshape(t5_139840925060080_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925057520_lo = tl.reshape(w5_139840925057520_lo, [BLOCK_M])
+    acc += t5_139840925060080_lo * w5_139840925057520_lo[:, None]
+    t5_139840925062128_lo = tl.reshape(t5_139840925062128_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925070320_lo = tl.reshape(w5_139840925070320_lo, [BLOCK_M])
+    acc += t5_139840925062128_lo * w5_139840925070320_lo[:, None]
+    t5_139840925057392_lo = tl.reshape(t5_139840925057392_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925062640_lo = tl.reshape(w5_139840925062640_lo, [BLOCK_M])
+    acc += t5_139840925057392_lo * w5_139840925062640_lo[:, None]
+    t5_139840925061616_lo = tl.reshape(t5_139840925061616_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925069808_lo = tl.reshape(w5_139840925069808_lo, [BLOCK_M])
+    acc += t5_139840925061616_lo * w5_139840925069808_lo[:, None]
+    t5_139840925060592_lo = tl.reshape(t5_139840925060592_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925058288_lo = tl.reshape(w5_139840925058288_lo, [BLOCK_M])
+    acc += t5_139840925060592_lo * w5_139840925058288_lo[:, None]
+    t5_139840925062640_lo = tl.reshape(t5_139840925062640_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925070832_lo = tl.reshape(w5_139840925070832_lo, [BLOCK_M])
+    acc += t5_139840925062640_lo * w5_139840925070832_lo[:, None]
+    t5_139840925058224_lo = tl.reshape(t5_139840925058224_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925061360_lo = tl.reshape(w5_139840925061360_lo, [BLOCK_M])
+    acc += t5_139840925058224_lo * w5_139840925061360_lo[:, None]
+    t5_139840925060912_lo = tl.reshape(t5_139840925060912_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925069104_lo = tl.reshape(w5_139840925069104_lo, [BLOCK_M])
+    acc += t5_139840925060912_lo * w5_139840925069104_lo[:, None]
+    t5_139840925059888_lo = tl.reshape(t5_139840925059888_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925057456_lo = tl.reshape(w5_139840925057456_lo, [BLOCK_M])
+    acc += t5_139840925059888_lo * w5_139840925057456_lo[:, None]
+    t5_139840925061936_lo = tl.reshape(t5_139840925061936_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925070128_lo = tl.reshape(w5_139840925070128_lo, [BLOCK_M])
+    acc += t5_139840925061936_lo * w5_139840925070128_lo[:, None]
+    t5_139840925057456_lo = tl.reshape(t5_139840925057456_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925062704_lo = tl.reshape(w5_139840925062704_lo, [BLOCK_M])
+    acc += t5_139840925057456_lo * w5_139840925062704_lo[:, None]
+    t5_139840925061424_lo = tl.reshape(t5_139840925061424_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925069616_lo = tl.reshape(w5_139840925069616_lo, [BLOCK_M])
+    acc += t5_139840925061424_lo * w5_139840925069616_lo[:, None]
+    t5_139840925060400_lo = tl.reshape(t5_139840925060400_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925058224_lo = tl.reshape(w5_139840925058224_lo, [BLOCK_M])
+    acc += t5_139840925060400_lo * w5_139840925058224_lo[:, None]
+    t5_139840925062448_lo = tl.reshape(t5_139840925062448_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925070640_lo = tl.reshape(w5_139840925070640_lo, [BLOCK_M])
+    acc += t5_139840925062448_lo * w5_139840925070640_lo[:, None]
+    t5_139840925057840_lo = tl.reshape(t5_139840925057840_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925061680_lo = tl.reshape(w5_139840925061680_lo, [BLOCK_M])
+    acc += t5_139840925057840_lo * w5_139840925061680_lo[:, None]
+    t5_139840925061168_lo = tl.reshape(t5_139840925061168_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925069360_lo = tl.reshape(w5_139840925069360_lo, [BLOCK_M])
+    acc += t5_139840925061168_lo * w5_139840925069360_lo[:, None]
+    t5_139840925060144_lo = tl.reshape(t5_139840925060144_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925057840_lo = tl.reshape(w5_139840925057840_lo, [BLOCK_M])
+    acc += t5_139840925060144_lo * w5_139840925057840_lo[:, None]
+    t5_139840925062192_lo = tl.reshape(t5_139840925062192_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925070384_lo = tl.reshape(w5_139840925070384_lo, [BLOCK_M])
+    acc += t5_139840925062192_lo * w5_139840925070384_lo[:, None]
+    t5_139840925059760_lo = tl.reshape(t5_139840925059760_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925062448_lo = tl.reshape(w5_139840925062448_lo, [BLOCK_M])
+    acc += t5_139840925059760_lo * w5_139840925062448_lo[:, None]
+    t5_139840925061680_lo = tl.reshape(t5_139840925061680_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925069872_lo = tl.reshape(w5_139840925069872_lo, [BLOCK_M])
+    acc += t5_139840925061680_lo * w5_139840925069872_lo[:, None]
+    t5_139840925060656_lo = tl.reshape(t5_139840925060656_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925068976_lo = tl.reshape(w5_139840925068976_lo, [BLOCK_M])
+    acc += t5_139840925060656_lo * w5_139840925068976_lo[:, None]
+    t5_139840925062704_lo = tl.reshape(t5_139840925062704_lo, [BLOCK_M, BLOCK_N])
+    w5_139840925070896_lo = tl.reshape(w5_139840925070896_lo, [BLOCK_M])
+    acc += t5_139840925062704_lo * w5_139840925070896_lo[:, None]
+    t5_139840925058288_hi = tl.reshape(t5_139840925058288_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925061168_hi = tl.reshape(w5_139840925061168_hi, [BLOCK_M])
+    acc += t5_139840925058288_hi * w5_139840925061168_hi[:, None]
+    t5_139840925060848_hi = tl.reshape(t5_139840925060848_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925069040_hi = tl.reshape(w5_139840925069040_hi, [BLOCK_M])
+    acc += t5_139840925060848_hi * w5_139840925069040_hi[:, None]
+    t5_139840925059824_hi = tl.reshape(t5_139840925059824_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925057392_hi = tl.reshape(w5_139840925057392_hi, [BLOCK_M])
+    acc += t5_139840925059824_hi * w5_139840925057392_hi[:, None]
+    t5_139840925061872_hi = tl.reshape(t5_139840925061872_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925070064_hi = tl.reshape(w5_139840925070064_hi, [BLOCK_M])
+    acc += t5_139840925061872_hi * w5_139840925070064_hi[:, None]
+    t5_139840925057520_hi = tl.reshape(t5_139840925057520_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925061872_hi = tl.reshape(w5_139840925061872_hi, [BLOCK_M])
+    acc += t5_139840925057520_hi * w5_139840925061872_hi[:, None]
+    t5_139840925061360_hi = tl.reshape(t5_139840925061360_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925069552_hi = tl.reshape(w5_139840925069552_hi, [BLOCK_M])
+    acc += t5_139840925061360_hi * w5_139840925069552_hi[:, None]
+    t5_139840925060336_hi = tl.reshape(t5_139840925060336_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925057904_hi = tl.reshape(w5_139840925057904_hi, [BLOCK_M])
+    acc += t5_139840925060336_hi * w5_139840925057904_hi[:, None]
+    t5_139840925062384_hi = tl.reshape(t5_139840925062384_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925070576_hi = tl.reshape(w5_139840925070576_hi, [BLOCK_M])
+    acc += t5_139840925062384_hi * w5_139840925070576_hi[:, None]
+    t5_139840925057904_hi = tl.reshape(t5_139840925057904_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925061424_hi = tl.reshape(w5_139840925061424_hi, [BLOCK_M])
+    acc += t5_139840925057904_hi * w5_139840925061424_hi[:, None]
+    t5_139840925061104_hi = tl.reshape(t5_139840925061104_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925069296_hi = tl.reshape(w5_139840925069296_hi, [BLOCK_M])
+    acc += t5_139840925061104_hi * w5_139840925069296_hi[:, None]
+    t5_139840925060080_hi = tl.reshape(t5_139840925060080_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925057520_hi = tl.reshape(w5_139840925057520_hi, [BLOCK_M])
+    acc += t5_139840925060080_hi * w5_139840925057520_hi[:, None]
+    t5_139840925062128_hi = tl.reshape(t5_139840925062128_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925070320_hi = tl.reshape(w5_139840925070320_hi, [BLOCK_M])
+    acc += t5_139840925062128_hi * w5_139840925070320_hi[:, None]
+    t5_139840925057392_hi = tl.reshape(t5_139840925057392_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925062640_hi = tl.reshape(w5_139840925062640_hi, [BLOCK_M])
+    acc += t5_139840925057392_hi * w5_139840925062640_hi[:, None]
+    t5_139840925061616_hi = tl.reshape(t5_139840925061616_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925069808_hi = tl.reshape(w5_139840925069808_hi, [BLOCK_M])
+    acc += t5_139840925061616_hi * w5_139840925069808_hi[:, None]
+    t5_139840925060592_hi = tl.reshape(t5_139840925060592_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925058288_hi = tl.reshape(w5_139840925058288_hi, [BLOCK_M])
+    acc += t5_139840925060592_hi * w5_139840925058288_hi[:, None]
+    t5_139840925062640_hi = tl.reshape(t5_139840925062640_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925070832_hi = tl.reshape(w5_139840925070832_hi, [BLOCK_M])
+    acc += t5_139840925062640_hi * w5_139840925070832_hi[:, None]
+    t5_139840925058224_hi = tl.reshape(t5_139840925058224_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925061360_hi = tl.reshape(w5_139840925061360_hi, [BLOCK_M])
+    acc += t5_139840925058224_hi * w5_139840925061360_hi[:, None]
+    t5_139840925060912_hi = tl.reshape(t5_139840925060912_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925069104_hi = tl.reshape(w5_139840925069104_hi, [BLOCK_M])
+    acc += t5_139840925060912_hi * w5_139840925069104_hi[:, None]
+    t5_139840925059888_hi = tl.reshape(t5_139840925059888_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925057456_hi = tl.reshape(w5_139840925057456_hi, [BLOCK_M])
+    acc += t5_139840925059888_hi * w5_139840925057456_hi[:, None]
+    t5_139840925061936_hi = tl.reshape(t5_139840925061936_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925070128_hi = tl.reshape(w5_139840925070128_hi, [BLOCK_M])
+    acc += t5_139840925061936_hi * w5_139840925070128_hi[:, None]
+    t5_139840925057456_hi = tl.reshape(t5_139840925057456_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925062704_hi = tl.reshape(w5_139840925062704_hi, [BLOCK_M])
+    acc += t5_139840925057456_hi * w5_139840925062704_hi[:, None]
+    t5_139840925061424_hi = tl.reshape(t5_139840925061424_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925069616_hi = tl.reshape(w5_139840925069616_hi, [BLOCK_M])
+    acc += t5_139840925061424_hi * w5_139840925069616_hi[:, None]
+    t5_139840925060400_hi = tl.reshape(t5_139840925060400_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925058224_hi = tl.reshape(w5_139840925058224_hi, [BLOCK_M])
+    acc += t5_139840925060400_hi * w5_139840925058224_hi[:, None]
+    t5_139840925062448_hi = tl.reshape(t5_139840925062448_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925070640_hi = tl.reshape(w5_139840925070640_hi, [BLOCK_M])
+    acc += t5_139840925062448_hi * w5_139840925070640_hi[:, None]
+    t5_139840925057840_hi = tl.reshape(t5_139840925057840_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925061680_hi = tl.reshape(w5_139840925061680_hi, [BLOCK_M])
+    acc += t5_139840925057840_hi * w5_139840925061680_hi[:, None]
+    t5_139840925061168_hi = tl.reshape(t5_139840925061168_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925069360_hi = tl.reshape(w5_139840925069360_hi, [BLOCK_M])
+    acc += t5_139840925061168_hi * w5_139840925069360_hi[:, None]
+    t5_139840925060144_hi = tl.reshape(t5_139840925060144_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925057840_hi = tl.reshape(w5_139840925057840_hi, [BLOCK_M])
+    acc += t5_139840925060144_hi * w5_139840925057840_hi[:, None]
+    t5_139840925062192_hi = tl.reshape(t5_139840925062192_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925070384_hi = tl.reshape(w5_139840925070384_hi, [BLOCK_M])
+    acc += t5_139840925062192_hi * w5_139840925070384_hi[:, None]
+    t5_139840925059760_hi = tl.reshape(t5_139840925059760_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925062448_hi = tl.reshape(w5_139840925062448_hi, [BLOCK_M])
+    acc += t5_139840925059760_hi * w5_139840925062448_hi[:, None]
+    t5_139840925061680_hi = tl.reshape(t5_139840925061680_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925069872_hi = tl.reshape(w5_139840925069872_hi, [BLOCK_M])
+    acc += t5_139840925061680_hi * w5_139840925069872_hi[:, None]
+    t5_139840925060656_hi = tl.reshape(t5_139840925060656_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925068976_hi = tl.reshape(w5_139840925068976_hi, [BLOCK_M])
+    acc += t5_139840925060656_hi * w5_139840925068976_hi[:, None]
+    t5_139840925062704_hi = tl.reshape(t5_139840925062704_hi, [BLOCK_M, BLOCK_N])
+    w5_139840925070896_hi = tl.reshape(w5_139840925070896_hi, [BLOCK_M])
+    acc += t5_139840925062704_hi * w5_139840925070896_hi[:, None]
+
+    row_valid = (offs_n[None, :] >= ks[:, None]) & (offs_n[None, :] < ke[:, None])
+    store_mask = valid_m[:, None] & valid_n[None, :]
+    acc = tl.where(row_valid & store_mask, acc, float("-inf"))
+    tl.store(
+        out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+        acc, mask=store_mask)
+
 def indexer_score_logits_triton(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -864,6 +1259,20 @@ def indexer_score_logits_triton(
     block_m = int(os.environ.get("VLLM_IDX_BM", "32"))  # G4: BM 变体
     block_n = int(os.environ.get("VLLM_IDX_BN", "64"))  # G4: BN 变体
     num_warps = int(os.environ.get("VLLM_IDX_WARPS", "4"))  # G4: warps 变体
+    if os.environ.get("VLLM_IDX_GEMM_V2", "0") == "1":
+        # G4 ① GEMM 重排 v2: 摊平 64 头大 GEMM (位级同, env 门控)
+        block_m = int(os.environ.get("VLLM_IDX_BM_V2", "2"))
+        grid = (triton.cdiv(num_q, block_m), triton.cdiv(seq_len_kv, block_n))
+        _indexer_score_logits_kernel_v2[grid](
+            q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke, logits,
+            num_q, seq_len_kv, num_heads, head_dim,
+            q.stride(0), q.stride(1), q.stride(2),
+            k_fp8.stride(0), k_fp8.stride(1),
+            weights.stride(0), weights.stride(1),
+            logits.stride(0), logits.stride(1),
+            BLOCK_M=block_m, BLOCK_N=block_n,
+            num_warps=num_warps)
+        return logits
     grid = (triton.cdiv(num_q, block_m), triton.cdiv(seq_len_kv, block_n))
     _indexer_score_logits_kernel[grid](
         q,
