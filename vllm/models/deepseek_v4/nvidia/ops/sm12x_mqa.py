@@ -1256,6 +1256,36 @@ def indexer_score_logits_triton(
     if num_q == 0 or seq_len_kv == 0:
         return logits
 
+    if os.environ.get("VLLM_IDX_DUMP_INPUTS", "0") == "1":
+        # G4 ① 调试: rank 0 独占, 前 20 次调用 dump 真实输入 (覆盖各形状)
+        try:
+            import torch.distributed as _dist
+            _is_rank0 = (not _dist.is_initialized()
+                         or _dist.get_rank() == 0)
+        except Exception:
+            _is_rank0 = True
+        if _is_rank0:
+            _dp = os.environ.get("VLLM_IDX_DUMP_PATH", "/root/autodl-tmp/tmp/idx_inputs.pt")
+            try:
+                if not os.path.exists(_dp):
+                    idx_inputs_state = {"n": 0, "calls": []}
+                else:
+                    idx_inputs_state = torch.load(_dp, weights_only=False)
+                # 只保留 M*N 最大的 20 次调用 (bug 应在更大形状)
+                _calls = idx_inputs_state["calls"]
+                _calls.append({"q": q.cpu(), "k": k_fp8.cpu(),
+                               "scale": scale.cpu(), "w": weights.cpu(),
+                               "ks": cu_seqlen_ks.cpu(),
+                               "ke": cu_seqlen_ke.cpu()})
+                _calls.sort(key=lambda c: c["q"].shape[0] * c["k"].shape[0],
+                            reverse=True)
+                idx_inputs_state["calls"] = _calls[:20]
+                idx_inputs_state["n"] += 1
+                torch.save(idx_inputs_state, _dp)
+                print(f"VLLM_IDX_DUMP_INPUTS: call {idx_inputs_state['n']} "
+                      f"M={q.shape[0]} N={k_fp8.shape[0]}", flush=True)
+            except Exception as _e:
+                print(f"VLLM_IDX_DUMP_INPUTS: dump skip ({_e})", flush=True)
     block_m = int(os.environ.get("VLLM_IDX_BM", "32"))  # G4: BM 变体
     block_n = int(os.environ.get("VLLM_IDX_BN", "64"))  # G4: BN 变体
     num_warps = int(os.environ.get("VLLM_IDX_WARPS", "4"))  # G4: warps 变体
@@ -1272,6 +1302,24 @@ def indexer_score_logits_triton(
             logits.stride(0), logits.stride(1),
             BLOCK_M=block_m, BLOCK_N=block_n,
             num_warps=num_warps)
+        if os.environ.get("VLLM_IDX_VERIFY_REF2", "0") == "1":
+            # G4 ① 调试: 进程内对拍 v2 vs 参考(BM=2), 记录首个分歧形状
+            _ref_logits = _bucketed_logits_buffer(num_q, seq_len_kv, q.device,
+                                                  dtype=_out_dtype)
+            _g = (triton.cdiv(num_q, 2), triton.cdiv(seq_len_kv, block_n))
+            _indexer_score_logits_kernel[_g](
+                q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke,
+                _ref_logits, num_q, seq_len_kv, num_heads, head_dim,
+                q.stride(0), q.stride(1), q.stride(2),
+                k_fp8.stride(0), k_fp8.stride(1),
+                weights.stride(0), weights.stride(1),
+                _ref_logits.stride(0), _ref_logits.stride(1),
+                BLOCK_M=2, BLOCK_N=block_n, OUT_BF16=_out_dtype == torch.bfloat16,
+                num_warps=num_warps)
+            _nd = (logits != _ref_logits).sum().item()
+            if _nd:
+                print(f"VLLM_IDX_VERIFY_REF2: DIVERGE {_nd} diffs "
+                      f"M={num_q} N={seq_len_kv}", flush=True)
         return logits
     grid = (triton.cdiv(num_q, block_m), triton.cdiv(seq_len_kv, block_n))
     _indexer_score_logits_kernel[grid](
