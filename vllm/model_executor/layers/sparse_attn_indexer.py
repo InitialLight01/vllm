@@ -905,6 +905,7 @@ def sparse_attn_indexer(
                 seq_lens,
                 decode_metadata.block_table,
                 logits_width,
+                topk_indices,
             )
         if not used_direct_topk:
             if current_platform.is_xpu():
