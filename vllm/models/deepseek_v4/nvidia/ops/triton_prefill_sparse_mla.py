@@ -379,7 +379,10 @@ def triton_prefill_sparse_mla_sm120(
         extra_w = 0
         comp_block = swa_block
 
-    BLOCK_H = 4
+    # #50: BLOCK_H 旋钮 (env, 默认 4) — 每 token 的 key 加载冗余 = 64/BLOCK_H 倍。
+    # 纯 tiling 变更 (每 head 数学不变) = 逐位无损。
+    BLOCK_H = int(os.environ.get("VLLM_PREFILL_BLOCK_H", "4"))
+    assert num_heads % BLOCK_H == 0
     grid = (n * (num_heads // BLOCK_H),)
     _triton_prefill_sparse_mla_kernel[grid](
         query,
