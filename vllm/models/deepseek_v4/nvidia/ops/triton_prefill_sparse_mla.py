@@ -259,6 +259,260 @@ def _triton_prefill_sparse_mla_kernel(
     )
 
 
+@triton.jit
+def _splitkv_partial_kernel(
+    q_ptr, swa_ptr, dense_ptr,
+    swa_idx_ptr, swa_len_ptr, extra_idx_ptr, extra_len_ptr,
+    seq_lens_ptr, req_idx_ptr,
+    mid_o_ptr,       # [n, heads, SPLITS, 576] bf16 (o_partial)
+    mid_lse_ptr,     # [n, heads, SPLITS] fp32 (ln-lse)
+    stride_qt, stride_qh, stride_qd,
+    stride_sw0, stride_swt, stride_ext,
+    stride_mot, stride_moh, stride_mos, stride_mod,
+    stride_mlt, stride_mlh, stride_mls,
+    bmm1_scale,
+    swa_block, swa_sbase,
+    BLOCK_H: tl.constexpr, NUM_HEADS: tl.constexpr,
+    SWA_W: tl.constexpr, EXTRA_W: tl.constexpr,
+    BLOCK_N: tl.constexpr, DATA_BYTES: tl.constexpr,
+    NOPE_DIM: tl.constexpr, ROPE_DIM: tl.constexpr,
+    SPLITS: tl.constexpr, SPLIT_SIZE: tl.constexpr,
+):
+    """#50 split-KV partial: 每 (token, head 组, split) 独立计算分段注意力
+    (split0 = SWA + EXTRA 前半; split1 = EXTRA 后半), 存归一化 o + ln-lse。
+    与参考数学精确等价 (merge 端权重 exp(lse - M)), 与串行版非位级同。"""
+    pid = tl.program_id(0)
+    split_id = tl.program_id(1)
+    n_groups = NUM_HEADS // BLOCK_H
+    token_id = pid // n_groups
+    h_base = (pid % n_groups) * BLOCK_H
+
+    offs_h = h_base + tl.arange(0, BLOCK_H)
+    offs_nope = tl.arange(0, 512)
+    nope_mask = offs_nope < NOPE_DIM
+    offs_rope = tl.arange(0, ROPE_DIM)
+
+    q_nope = tl.load(
+        q_ptr + token_id * stride_qt + offs_h[:, None] * stride_qh
+        + offs_nope[None, :] * stride_qd,
+        mask=nope_mask[None, :],
+        other=0.0,
+    )
+    q_rope = tl.load(
+        q_ptr + token_id * stride_qt + offs_h[:, None] * stride_qh
+        + (NOPE_DIM + offs_rope)[None, :] * stride_qd
+    )
+
+    req_idx = tl.load(req_idx_ptr + token_id)
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    swa_len = tl.load(swa_len_ptr + token_id)
+    if EXTRA_W > 0:
+        extra_len = tl.load(extra_len_ptr + token_id)
+    else:
+        extra_len = 0
+
+    neg_large = -1.0e30
+    e_max = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    e_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc_nope = tl.zeros((BLOCK_H, 512), dtype=tl.float32)
+    acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
+
+    offs8 = tl.arange(0, 8)
+    rope_lo = 448 + offs_rope * 2
+    rope_hi = rope_lo + 1
+
+    if split_id == 0:
+        # ── SWA 段 (串行, 与主内核同构) ──
+        for c_start in range(0, SWA_W, BLOCK_N):
+            offs_c = c_start + tl.arange(0, BLOCK_N)
+            mask_c = offs_c < SWA_W
+            slot = tl.load(
+                swa_idx_ptr + token_id * stride_swt + offs_c, mask=mask_c, other=-1
+            )
+            valid = mask_c & (slot >= 0) & (offs_c < swa_len)
+            block = (slot // swa_block).to(tl.int64)
+            pos = (slot % swa_block).to(tl.int64)
+            base = block[None, :] * stride_sw0 + pos[None, :] * DATA_BYTES
+
+            u8_nope = tl.load(
+                swa_ptr + base + offs_nope[:, None],
+                mask=valid[None, :] & nope_mask[:, None],
+                other=0,
+            )
+            sc8 = tl.load(
+                swa_ptr + block[None, :] * stride_sw0 + swa_sbase
+                + pos[None, :] * 8 + offs8[:, None],
+                mask=valid[None, :] & (offs8[:, None] < 7),
+                other=0,
+            )
+            k_scale = tl.exp2(sc8.to(tl.float32) - 127.0)
+            k_scale_full = tl.reshape(
+                tl.broadcast_to(k_scale[:, None, :], (8, 64, BLOCK_N)),
+                (512, BLOCK_N),
+            )
+            k_nope = (
+                u8_nope.to(tl.float8e4nv, bitcast=True).to(tl.float32) * k_scale_full
+            ).to(tl.bfloat16)
+
+            lo = tl.load(
+                swa_ptr + base + rope_lo[:, None], mask=valid[None, :], other=0
+            )
+            hi = tl.load(
+                swa_ptr + base + rope_hi[:, None], mask=valid[None, :], other=0
+            )
+            u16 = (hi.to(tl.uint16) << 8) | lo.to(tl.uint16)
+            k_rope = u16.to(tl.bfloat16, bitcast=True)
+
+            qk = (
+                tl.dot(q_nope, k_nope) + tl.dot(q_rope, k_rope)
+            ).to(tl.float32) * bmm1_scale
+            qk = tl.where(valid[None, :], qk, neg_large)
+
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            acc_nope *= re_scale[:, None]
+            acc_rope *= re_scale[:, None]
+            acc_nope += tl.dot(p.to(tl.bfloat16), tl.trans(k_nope))
+            acc_rope += tl.dot(p.to(tl.bfloat16), tl.trans(k_rope))
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+    # ── EXTRA 段 (每 split 各半; 稠密工作区读取) ──
+    if EXTRA_W > 0:
+        c_lo = split_id * SPLIT_SIZE
+        c_hi = tl.minimum((split_id + 1) * SPLIT_SIZE, EXTRA_W)
+        for c_start in range(c_lo, c_hi, BLOCK_N):
+            offs_c = c_start + tl.arange(0, BLOCK_N)
+            mask_c = offs_c < c_hi
+            slot = tl.load(
+                extra_idx_ptr + token_id * stride_ext + offs_c, mask=mask_c, other=-1
+            )
+            valid = mask_c & (slot >= 0) & (offs_c < extra_len)
+            k_nope = tl.load(
+                dense_ptr + slot[None, :] * 512 + offs_nope[:, None],
+                mask=valid[None, :] & nope_mask[:, None],
+                other=0.0,
+            )
+            k_rope = tl.load(
+                dense_ptr + slot[None, :] * 512 + (NOPE_DIM + offs_rope)[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            qk = (
+                tl.dot(q_nope, k_nope) + tl.dot(q_rope, k_rope)
+            ).to(tl.float32) * bmm1_scale
+            qk = tl.where(valid[None, :], qk, neg_large)
+
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            acc_nope *= re_scale[:, None]
+            acc_rope *= re_scale[:, None]
+            acc_nope += tl.dot(p.to(tl.bfloat16), tl.trans(k_nope))
+            acc_rope += tl.dot(p.to(tl.bfloat16), tl.trans(k_rope))
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+    e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
+    lse = tl.where(e_sum > 0, e_max + tl.log(e_sum), neg_large)
+    o_nope = (acc_nope / e_sum_safe[:, None]).to(tl.bfloat16)
+    o_rope = (acc_rope / e_sum_safe[:, None]).to(tl.bfloat16)
+
+    tl.store(
+        mid_o_ptr + token_id * stride_mot + offs_h[:, None] * stride_moh
+        + split_id * stride_mos + offs_nope[None, :] * stride_mod,
+        o_nope,
+        mask=nope_mask[None, :],
+    )
+    tl.store(
+        mid_o_ptr + token_id * stride_mot + offs_h[:, None] * stride_moh
+        + split_id * stride_mos + (NOPE_DIM + offs_rope)[None, :] * stride_mod,
+        o_rope,
+    )
+    tl.store(
+        mid_lse_ptr + token_id * stride_mlt + offs_h * stride_mlh
+        + split_id * stride_mls,
+        lse,
+    )
+
+
+@triton.jit
+def _splitkv_merge_kernel(
+    mid_o_ptr, mid_lse_ptr, sinks_ptr, out_ptr,
+    stride_mot, stride_moh, stride_mos, stride_mod,
+    stride_mlt, stride_mlh, stride_mls,
+    stride_ot, stride_oh, stride_od,
+    BLOCK_H: tl.constexpr, NUM_HEADS: tl.constexpr,
+    NOPE_DIM: tl.constexpr, ROPE_DIM: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    """#50 split-KV merge: 分段 o/lse 加权合并 + sink (torch 参考同构)。"""
+    pid = tl.program_id(0)
+    n_groups = NUM_HEADS // BLOCK_H
+    token_id = pid // n_groups
+    h_base = (pid % n_groups) * BLOCK_H
+
+    offs_h = h_base + tl.arange(0, BLOCK_H)
+    offs_nope = tl.arange(0, 512)
+    nope_mask = offs_nope < NOPE_DIM
+    offs_rope = tl.arange(0, ROPE_DIM)
+
+    m = tl.full((BLOCK_H,), -1.0e30, dtype=tl.float32)
+    o_nope = tl.zeros((BLOCK_H, 512), dtype=tl.float32)
+    o_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
+
+    for s in tl.static_range(SPLITS):
+        lse = tl.load(
+            mid_lse_ptr + token_id * stride_mlt + offs_h * stride_mlh
+            + s * stride_mls
+        )
+        n_m = tl.maximum(m, lse)
+        w = tl.exp(lse - n_m)
+        res = tl.exp(m - n_m)
+        o_nope = o_nope * res[:, None]
+        o_rope = o_rope * res[:, None]
+        o_nope += w[:, None] * tl.load(
+            mid_o_ptr + token_id * stride_mot + offs_h[:, None] * stride_moh
+            + s * stride_mos + offs_nope[None, :] * stride_mod,
+            mask=nope_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        o_rope += w[:, None] * tl.load(
+            mid_o_ptr + token_id * stride_mot + offs_h[:, None] * stride_moh
+            + s * stride_mos + (NOPE_DIM + offs_rope)[None, :] * stride_mod
+        ).to(tl.float32)
+        m = n_m
+
+    sink = tl.load(sinks_ptr + offs_h).to(tl.float32)
+    n_m = tl.maximum(m, sink)
+    res = tl.exp(m - n_m)
+    o_nope = o_nope * res[:, None]
+    o_rope = o_rope * res[:, None]
+    wsum = tl.exp(sink - n_m)
+    # 分段权重之和 = Σ exp(lse_s - n_m) (lse 已含段内 e_sum)
+    for s in tl.static_range(SPLITS):
+        lse = tl.load(
+            mid_lse_ptr + token_id * stride_mlt + offs_h * stride_mlh
+            + s * stride_mls
+        )
+        wsum += tl.exp(lse - n_m)
+    o_nope = (o_nope / wsum[:, None]).to(tl.bfloat16)
+    o_rope = (o_rope / wsum[:, None]).to(tl.bfloat16)
+
+    tl.store(
+        out_ptr + token_id * stride_ot + offs_h[:, None] * stride_oh
+        + offs_nope[None, :] * stride_od,
+        o_nope,
+        mask=nope_mask[None, :],
+    )
+    tl.store(
+        out_ptr + token_id * stride_ot + offs_h[:, None] * stride_oh
+        + (NOPE_DIM + offs_rope)[None, :] * stride_od,
+        o_rope,
+    )
+
+
 def _flat_pool_view(cache: torch.Tensor) -> torch.Tensor:
     """[B, block, 584] (池块间距 stride(0), 非连续) → [B, block*584]
     as_strided 视图。kernel 通过 block*stride(0) + off 寻址。
@@ -519,12 +773,90 @@ def triton_prefill_sparse_mla_sm120(
     # #50: 稠密工作区 (VLLM_PREFILL_DENSE=1, 默认关) — 整池反量化一次,
     # 注意力压缩段读稠密 bf16 (逐位同值, 免 scale/反量化/rope 拼装)。
     _dense_on = int(os.environ.get("VLLM_PREFILL_DENSE", "0")) == 1
+    # #50: split-KV (VLLM_PREFILL_SPLITKV=1, 默认关) — EXTRA 段拆 2 路并行
+    # partial + merge (断串行软最大值链; 与参考数学精确等价, 非位级同)。
+    _splitkv_on = int(os.environ.get("VLLM_PREFILL_SPLITKV", "0")) == 1
     _dense = None
-    if _dense_on and extra_w > 0 and compressed_kv_cache is not None:
+    if (_dense_on or _splitkv_on) and extra_w > 0 and compressed_kv_cache is not None:
         _dense = _dequant_compressed_dense(
             compressed_kv_cache,
             compressed_kv_cache.shape[0] * compressed_kv_cache.shape[1],
         )
+    if _splitkv_on and _dense is not None:
+        _splits = 2
+        _split_size = extra_w // _splits
+        _mid_o = torch.empty(
+            (n, num_heads, _splits, 576),
+            dtype=torch.bfloat16,
+            device=query.device,
+        )
+        _mid_lse = torch.empty(
+            (n, num_heads, _splits), dtype=torch.float32, device=query.device
+        )
+        _hg = num_heads // BLOCK_H
+        _splitkv_partial_kernel[(n * _hg, _splits)](
+            query,
+            swa_flat,
+            _dense,
+            swa_indices,
+            swa_lens,
+            extra_indices,
+            extra_lens,
+            seq_lens,
+            req_idx,
+            _mid_o,
+            _mid_lse,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            swa_flat.stride(0),
+            swa_indices.stride(0),
+            extra_indices.stride(0),
+            _mid_o.stride(0),
+            _mid_o.stride(1),
+            _mid_o.stride(2),
+            _mid_o.stride(3),
+            _mid_lse.stride(0),
+            _mid_lse.stride(1),
+            _mid_lse.stride(2),
+            bmm1_scale,
+            swa_block,
+            swa_block * 576,
+            BLOCK_H=BLOCK_H,
+            NUM_HEADS=num_heads,
+            SWA_W=swa_indices.shape[-1],
+            EXTRA_W=extra_w,
+            BLOCK_N=_bn,
+            DATA_BYTES=576,
+            NOPE_DIM=448,
+            ROPE_DIM=64,
+            SPLITS=_splits,
+            SPLIT_SIZE=_split_size,
+            num_warps=_nw,
+        )
+        _splitkv_merge_kernel[(n * _hg,)](
+            _mid_o,
+            _mid_lse,
+            sinks,
+            out,
+            _mid_o.stride(0),
+            _mid_o.stride(1),
+            _mid_o.stride(2),
+            _mid_o.stride(3),
+            _mid_lse.stride(0),
+            _mid_lse.stride(1),
+            _mid_lse.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            BLOCK_H=BLOCK_H,
+            NUM_HEADS=num_heads,
+            NOPE_DIM=448,
+            ROPE_DIM=64,
+            SPLITS=_splits,
+            num_warps=4,
+        )
+        return
     if _dense is None:
         _dense = torch.empty((1, 1), dtype=torch.bfloat16, device=query.device)
         _dense_s = 1
