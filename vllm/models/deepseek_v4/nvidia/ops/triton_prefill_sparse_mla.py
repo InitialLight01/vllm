@@ -834,7 +834,6 @@ def triton_prefill_sparse_mla_sm120(
             SPLITS=_splits,
             SPLIT_SIZE=_split_size,
             num_warps=_nw,
-        num_stages=_ns if _ns > 0 else 3,
             num_stages=_ns if _ns > 0 else 3,
         )
         _splitkv_merge_kernel[(n * _hg,)](
@@ -906,6 +905,7 @@ def triton_prefill_sparse_mla_sm120(
         ROPE_DIM=64,
         DENSE=_dense_flag,
         num_warps=_nw,
+        num_stages=_ns if _ns > 0 else 3,
     )
 
 
