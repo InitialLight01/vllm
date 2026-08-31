@@ -1295,6 +1295,39 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     out=output[query_start:query_end],
                     bmm1_scale=self.scale,
                 )
+                # #82 进程内对拍 (VLLM_PREFILL_DIFF=1): Triton prefill vs
+                # 参考 (flashinfer_trtllm_batch_decode_sparse_mla_dsv4)
+                # 同输入双跑, 统计分歧 (cubin 参考 saga 已证确定性)。
+                if os.environ.get("VLLM_PREFILL_DIFF", "0") == "1":
+                    _ref_out = torch.empty_like(output[query_start:query_end])
+                    flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                        query=q_chunk,
+                        swa_kv_cache=swa_kv_paged,
+                        workspace_buffer=self._get_workspace(q.device),
+                        sparse_indices=swa_indices_chunk,
+                        compressed_kv_cache=extra_kv_paged,
+                        out=_ref_out,
+                        bmm1_scale=self.scale,
+                        sinks=self.attn_sink,
+                        kv_layout="NHD",
+                        swa_topk_lens=swa_lens_chunk,
+                        extra_sparse_indices=extra_sparse_indices_chunk,
+                        extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+                    )
+                    torch.cuda.synchronize()
+                    _t = output[query_start:query_end]
+                    _d = (_t.float() - _ref_out.float()).abs()
+                    _bitdiff = (
+                        _t.view(torch.int16) != _ref_out.view(torch.int16)
+                    ).sum().item()
+                    print(
+                        f"[PREFILL-DIFF] {self.prefix} n={q_chunk.shape[0]} "
+                        f"max_abs={_d.max().item():.4f} mean_abs={_d.mean().item():.6f} "
+                        f"bitdiff={_bitdiff}/{_t.numel()} "
+                        f"ref_mean={_ref_out.float().mean().item():.4f} "
+                        f"tri_mean={_t.float().mean().item():.4f}",
+                        flush=True,
+                    )
             else:
                 flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
                     query=q_chunk,
