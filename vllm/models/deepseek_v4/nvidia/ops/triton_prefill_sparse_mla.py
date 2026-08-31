@@ -53,6 +53,8 @@ def _triton_prefill_sparse_mla_kernel(
     swa_sbase,      # SWA 块内 scale 区起点 (block*576)
     comp_block,     # 压缩池块 token 数 (64 C4A / 2 C128A)
     comp_sbase,     # 压缩块内 scale 区起点
+    dense_ptr,      # [num_keys, 512] bf16 稠密工作区 (DENSE=1 时)
+    stride_dd,
     BLOCK_H: tl.constexpr,      # 每 program 头数 (4)
     NUM_HEADS: tl.constexpr,    # 总头数
     SWA_W: tl.constexpr,        # window (128)
@@ -61,6 +63,7 @@ def _triton_prefill_sparse_mla_kernel(
     DATA_BYTES: tl.constexpr,   # 每 token 数据字节 (576)
     NOPE_DIM: tl.constexpr,     # 448
     ROPE_DIM: tl.constexpr,     # 64
+    DENSE: tl.constexpr,        # 1 = 压缩段走稠密工作区
 ):
     pid = tl.program_id(0)
     n_groups = NUM_HEADS // BLOCK_H
@@ -176,38 +179,53 @@ def _triton_prefill_sparse_mla_kernel(
             extra_idx_ptr + token_id * stride_ext + offs_c, mask=mask_c, other=-1
         )
         valid = mask_c & (slot >= 0) & (offs_c < extra_len)
-        block = (slot // comp_block).to(tl.int64)
-        pos = (slot % comp_block).to(tl.int64)
-        base = block[None, :] * stride_cp0 + pos[None, :] * DATA_BYTES
+        if DENSE:
+            # #50: 稠密工作区读取 — k 已整池反量化 (逐位同值),
+            # 免 scale 加载/反量化/rope 字节拼装。
+            k_nope = tl.load(
+                dense_ptr + slot[None, :] * stride_dd + offs_nope[:, None],
+                mask=valid[None, :] & nope_mask[:, None],
+                other=0.0,
+            )
+            k_rope = tl.load(
+                dense_ptr + slot[None, :] * stride_dd
+                + (NOPE_DIM + offs_rope)[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+        else:
+            block = (slot // comp_block).to(tl.int64)
+            pos = (slot % comp_block).to(tl.int64)
+            base = block[None, :] * stride_cp0 + pos[None, :] * DATA_BYTES
 
-        u8_nope = tl.load(
-            comp_ptr + base + offs_nope[:, None],
-            mask=valid[None, :] & nope_mask[:, None],
-            other=0,
-        )
-        sc8 = tl.load(
-            comp_ptr + block[None, :] * stride_cp0 + comp_sbase
-            + pos[None, :] * 8 + offs8[:, None],
-            mask=valid[None, :] & (offs8[:, None] < 7),
-            other=0,
-        )
-        k_scale = tl.exp2(sc8.to(tl.float32) - 127.0)  # [8, BLOCK_N]
-        k_scale_full = tl.reshape(
-            tl.broadcast_to(k_scale[:, None, :], (8, 64, BLOCK_N)),
-            (512, BLOCK_N),
-        )
-        k_nope = (
-            u8_nope.to(tl.float8e4nv, bitcast=True).to(tl.float32) * k_scale_full
-        ).to(tl.bfloat16)
+            u8_nope = tl.load(
+                comp_ptr + base + offs_nope[:, None],
+                mask=valid[None, :] & nope_mask[:, None],
+                other=0,
+            )
+            sc8 = tl.load(
+                comp_ptr + block[None, :] * stride_cp0 + comp_sbase
+                + pos[None, :] * 8 + offs8[:, None],
+                mask=valid[None, :] & (offs8[:, None] < 7),
+                other=0,
+            )
+            k_scale = tl.exp2(sc8.to(tl.float32) - 127.0)  # [8, BLOCK_N]
+            k_scale_full = tl.reshape(
+                tl.broadcast_to(k_scale[:, None, :], (8, 64, BLOCK_N)),
+                (512, BLOCK_N),
+            )
+            k_nope = (
+                u8_nope.to(tl.float8e4nv, bitcast=True).to(tl.float32) * k_scale_full
+            ).to(tl.bfloat16)
 
-        lo = tl.load(
-            comp_ptr + base + rope_lo[:, None], mask=valid[None, :], other=0
-        )
-        hi = tl.load(
-            comp_ptr + base + rope_hi[:, None], mask=valid[None, :], other=0
-        )
-        u16 = (hi.to(tl.uint16) << 8) | lo.to(tl.uint16)
-        k_rope = u16.to(tl.bfloat16, bitcast=True)
+            lo = tl.load(
+                comp_ptr + base + rope_lo[:, None], mask=valid[None, :], other=0
+            )
+            hi = tl.load(
+                comp_ptr + base + rope_hi[:, None], mask=valid[None, :], other=0
+            )
+            u16 = (hi.to(tl.uint16) << 8) | lo.to(tl.uint16)
+            k_rope = u16.to(tl.bfloat16, bitcast=True)
 
         qk = (
             tl.dot(q_nope, k_nope)
@@ -252,6 +270,107 @@ def _flat_pool_view(cache: torch.Tensor) -> torch.Tensor:
     return cache.as_strided(
         (cache.shape[0], cache.shape[1] * 584), (cache.stride(0), 1)
     )
+
+
+@triton.jit
+def _dequant_compressed_dense_kernel(
+    comp_ptr,       # [B, block, 584] uint8 池
+    dense_ptr,      # [num_keys, 512] bf16
+    stride_c0,
+    stride_d0,
+    num_keys,
+    BLOCK_KEYS: tl.constexpr,
+    NOPE_DIM: tl.constexpr,      # 448
+    ROPE_DIM: tl.constexpr,      # 64
+    comp_block: tl.constexpr,    # 2
+    comp_sbase,                  # block*576
+):
+    """#50: 整池反量化 → 稠密 bf16 [num_keys, 512] (逐位同于注意力内核内联反量化)。
+
+    key-id = 槽 = block*comp_block + pos; 每 key 576B (448 fp8 + 64 bf16 rope
+    + 64 pad), UE8M0 scale 在块尾。"""
+    pid = tl.program_id(0)
+    k_start = pid * BLOCK_KEYS
+    offs_k = k_start + tl.arange(0, BLOCK_KEYS)
+    mask_k = offs_k < num_keys
+    block = (offs_k // comp_block).to(tl.int64)
+    pos = (offs_k % comp_block).to(tl.int64)
+    base = block[None, :] * stride_c0 + pos[None, :] * 576
+
+    offs_n = tl.arange(0, 512)
+    nope_mask = offs_n < NOPE_DIM
+    u8 = tl.load(
+        comp_ptr + base + offs_n[:, None],
+        mask=mask_k[None, :] & nope_mask[:, None],
+        other=0,
+    )
+    offs8 = tl.arange(0, 8)
+    sc8 = tl.load(
+        comp_ptr + block[None, :] * stride_c0 + comp_sbase
+        + pos[None, :] * 8 + offs8[:, None],
+        mask=mask_k[None, :] & (offs8[:, None] < 7),
+        other=0,
+    )
+    k_scale = tl.exp2(sc8.to(tl.float32) - 127.0)
+    k_scale_full = tl.reshape(
+        tl.broadcast_to(k_scale[:, None, :], (8, 64, BLOCK_KEYS)),
+        (512, BLOCK_KEYS),
+    )
+    k_nope = (
+        u8.to(tl.float8e4nv, bitcast=True).to(tl.float32) * k_scale_full
+    ).to(tl.bfloat16)
+
+    offs_r = tl.arange(0, ROPE_DIM)
+    lo = tl.load(
+        comp_ptr + base + 448 + offs_r[:, None] * 2,
+        mask=mask_k[None, :],
+        other=0,
+    )
+    hi = tl.load(
+        comp_ptr + base + 448 + 1 + offs_r[:, None] * 2,
+        mask=mask_k[None, :],
+        other=0,
+    )
+    u16 = (hi.to(tl.uint16) << 8) | lo.to(tl.uint16)
+    k_rope = u16.to(tl.bfloat16, bitcast=True)
+
+    offs_k2 = offs_k[:, None]
+    tl.store(
+        dense_ptr + offs_k2 * stride_d0 + offs_n[None, :],
+        tl.trans(k_nope),
+        mask=mask_k[:, None] & nope_mask[None, :],
+    )
+    tl.store(
+        dense_ptr + offs_k2 * stride_d0 + (448 + offs_r)[None, :],
+        tl.trans(k_rope),
+        mask=mask_k[:, None],
+    )
+
+
+def _dequant_compressed_dense(
+    compressed_kv_cache: torch.Tensor, num_keys: int
+) -> torch.Tensor:
+    """整池反量化 → [num_keys, 512] bf16 (调用方管理生命周期)。"""
+    dense = torch.empty(
+        (num_keys, 512), dtype=torch.bfloat16, device=compressed_kv_cache.device
+    )
+    comp_flat = _flat_pool_view(compressed_kv_cache)
+    _cb = compressed_kv_cache.shape[1]
+    BLOCK_KEYS = 64
+    _dequant_compressed_dense_kernel[(triton.cdiv(num_keys, BLOCK_KEYS),)](
+        comp_flat,
+        dense,
+        comp_flat.stride(0),
+        dense.stride(0),
+        num_keys,
+        BLOCK_KEYS=BLOCK_KEYS,
+        NOPE_DIM=448,
+        ROPE_DIM=64,
+        comp_block=_cb,
+        comp_sbase=_cb * 576,
+        num_warps=4,
+    )
+    return dense
 
 
 def triton_prefill_sparse_mla_sm120(
@@ -397,6 +516,22 @@ def triton_prefill_sparse_mla_sm120(
     grid = (n * (num_heads // BLOCK_H),)
     _bn = int(os.environ.get("VLLM_PREFILL_BLOCK_N", "16"))
     _nw = int(os.environ.get("VLLM_PREFILL_WARPS", "4"))
+    # #50: 稠密工作区 (VLLM_PREFILL_DENSE=1, 默认关) — 整池反量化一次,
+    # 注意力压缩段读稠密 bf16 (逐位同值, 免 scale/反量化/rope 拼装)。
+    _dense_on = int(os.environ.get("VLLM_PREFILL_DENSE", "0")) == 1
+    _dense = None
+    if _dense_on and extra_w > 0 and compressed_kv_cache is not None:
+        _dense = _dequant_compressed_dense(
+            compressed_kv_cache,
+            compressed_kv_cache.shape[0] * compressed_kv_cache.shape[1],
+        )
+    if _dense is None:
+        _dense = torch.empty((1, 1), dtype=torch.bfloat16, device=query.device)
+        _dense_s = 1
+        _dense_flag = 0
+    else:
+        _dense_s = _dense.stride(0)
+        _dense_flag = 1
     _triton_prefill_sparse_mla_kernel[grid](
         query,
         swa_flat,
@@ -424,6 +559,8 @@ def triton_prefill_sparse_mla_sm120(
         swa_block * 576,
         comp_block,
         comp_block * 576,
+        _dense,
+        _dense_s,
         BLOCK_H=BLOCK_H,
         NUM_HEADS=num_heads,
         SWA_W=swa_indices.shape[-1],
@@ -432,6 +569,7 @@ def triton_prefill_sparse_mla_sm120(
         DATA_BYTES=576,
         NOPE_DIM=448,
         ROPE_DIM=64,
+        DENSE=_dense_flag,
         num_warps=_nw,
     )
 
