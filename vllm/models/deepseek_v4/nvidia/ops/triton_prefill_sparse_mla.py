@@ -770,6 +770,7 @@ def triton_prefill_sparse_mla_sm120(
     grid = (n * (num_heads // BLOCK_H),)
     _bn = int(os.environ.get("VLLM_PREFILL_BLOCK_N", "16"))
     _nw = int(os.environ.get("VLLM_PREFILL_WARPS", "4"))
+    _ns = int(os.environ.get("VLLM_PREFILL_STAGES", "0"))  # 0 = Triton 默认
     # #50: 稠密工作区 (VLLM_PREFILL_DENSE=1, 默认关) — 整池反量化一次,
     # 注意力压缩段读稠密 bf16 (逐位同值, 免 scale/反量化/rope 拼装)。
     _dense_on = int(os.environ.get("VLLM_PREFILL_DENSE", "0")) == 1
@@ -833,6 +834,8 @@ def triton_prefill_sparse_mla_sm120(
             SPLITS=_splits,
             SPLIT_SIZE=_split_size,
             num_warps=_nw,
+        num_stages=_ns if _ns > 0 else 3,
+            num_stages=_ns if _ns > 0 else 3,
         )
         _splitkv_merge_kernel[(n * _hg,)](
             _mid_o,
