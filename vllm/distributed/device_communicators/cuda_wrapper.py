@@ -104,11 +104,14 @@ class CudaRTLibrary:
 
     def __init__(self, so_file: str | None = None):
         if so_file is None:
+            # 显式路径优先: find_loaded_library 的 /proc/maps 子串匹配会误拾
+            # tilelang 的 libcudart_stub.so (soname 含 "libcudart" 子串但无
+            # cudaDeviceReset 等符号, 图捕获时 CudaRTLibrary 崩溃 — #76)。
             so_file = (
-                find_loaded_library(
+                envs.VLLM_CUDART_SO_PATH
+                or find_loaded_library(
                     "libamdhip64" if current_platform.is_rocm() else "libcudart"
                 )
-                or envs.VLLM_CUDART_SO_PATH  # fallback to env var
             )
             assert so_file is not None, (
                 "libcudart is not loaded in the current process, "
