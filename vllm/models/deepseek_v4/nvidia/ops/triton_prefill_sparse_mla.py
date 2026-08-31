@@ -210,10 +210,10 @@ def _triton_prefill_sparse_mla_kernel(
                 mask=valid[None, :] & (offs8[:, None] < 7),
                 other=0,
             )
-            k_scale = tl.exp2(sc8.to(tl.float32) - 127.0)  # [8, SWA_BN]
+            k_scale = tl.exp2(sc8.to(tl.float32) - 127.0)  # [8, BLOCK_N]
             k_scale_full = tl.reshape(
                 tl.broadcast_to(k_scale[:, None, :], (8, 64, BLOCK_N)),
-                (512, SWA_BN),
+                (512, BLOCK_N),
             )
             k_nope = (
                 u8_nope.to(tl.float8e4nv, bitcast=True).to(tl.float32) * k_scale_full
