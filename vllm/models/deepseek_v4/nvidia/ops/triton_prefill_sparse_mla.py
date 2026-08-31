@@ -152,8 +152,8 @@ def _triton_prefill_sparse_mla_kernel(
         qk = tl.where(valid[None, :], qk, neg_large)
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-        re_scale = tl.exp2(e_max - n_e_max)
-        p = tl.exp2(qk - n_e_max[:, None])
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
         acc_nope *= re_scale[:, None]
         acc_rope *= re_scale[:, None]
         acc_nope += tl.dot(p.to(tl.bfloat16), tl.trans(k_nope))
@@ -205,8 +205,8 @@ def _triton_prefill_sparse_mla_kernel(
         qk = tl.where(valid[None, :], qk, neg_large)
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-        re_scale = tl.exp2(e_max - n_e_max)
-        p = tl.exp2(qk - n_e_max[:, None])
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
         acc_nope *= re_scale[:, None]
         acc_rope *= re_scale[:, None]
         acc_nope += tl.dot(p.to(tl.bfloat16), tl.trans(k_nope))
