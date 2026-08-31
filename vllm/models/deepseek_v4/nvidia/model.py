@@ -868,6 +868,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        skip_topk: bool = False,
     ):
         super().__init__()
 
@@ -880,6 +881,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
+            skip_topk=skip_topk,
         )
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
@@ -1222,6 +1224,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # #71 IndexCache (上游 PR #49085 移植): env 门控, 默认关。
+        # 跳过的 C4A 层不复算 prefill topk (复用前 F 层共享缓冲)。
+        _idx_cache_on = int(os.environ.get("VLLM_DSV4_INDEX_CACHE", "0")) == 1
+        _skip_flags: tuple = ()
+        if _idx_cache_on:
+            from vllm.models.deepseek_v4.attention import (
+                compute_dsv4_index_cache_skip_flags,
+            )
+            _skip_flags = compute_dsv4_index_cache_skip_flags(
+                config.compress_ratios,
+                config.num_hidden_layers,
+                index_topk_freq=int(os.environ.get("VLLM_DSV4_INDEX_CACHE_FREQ", "4")),
+                index_skip_topk_offset=int(
+                    os.environ.get("VLLM_DSV4_INDEX_CACHE_OFFSET", "2")
+                ),
+                local_start_layer=start_layer if "start_layer" in dir() else 0,
+                local_end_layer=end_layer if "end_layer" in dir() else None,
+            )
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
@@ -1229,6 +1250,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                skip_topk=(
+                    _skip_flags[extract_layer_index(prefix)]
+                    if _skip_flags
+                    else False
+                ),
             ),
             prefix=f"{prefix}.layers",
         )

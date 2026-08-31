@@ -41,6 +41,48 @@ from vllm.config import (
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+def compute_dsv4_index_cache_skip_flags(
+    compress_ratios,
+    num_hidden_layers,
+    *,
+    index_topk_freq: int = 1,
+    index_topk_pattern=None,
+    index_skip_topk_offset: int = 2,
+    local_start_layer: int = 0,
+    local_end_layer=None,
+) -> tuple:
+    """DSv4 C4 层 IndexCache 跳过决策 (上游 PR #49085 移植, #71).
+
+    仅 C4A (compress_ratio==4) 层可跳过; 跳过的层不复算 topk, 复用前一个
+    F 层的共享 topk 缓冲 (同步序内 F 层先执行)。freq=4/offset=2 默认
+    F,F,S,S,S 循环 (43→11 PFLOP)。首层本地 C4 强制 F。
+    """
+    if local_end_layer is None:
+        local_end_layer = num_hidden_layers
+    ratios = list(compress_ratios[:num_hidden_layers])
+    skip_flags = [False] * num_hidden_layers
+    c4_ids = [i for i, r in enumerate(ratios) if r == 4]
+    if not c4_ids:
+        return tuple(skip_flags)
+    if index_topk_pattern is not None:
+        pattern = list(index_topk_pattern)
+        assert set(pattern) <= {"F", "S"}, pattern
+        assert len(pattern) == len(c4_ids), (len(pattern), len(c4_ids))
+        assert pattern[0] == "F"
+        for rank, lid in enumerate(c4_ids):
+            skip_flags[lid] = pattern[rank] == "S"
+    else:
+        assert index_topk_freq > 0
+        assert index_skip_topk_offset >= 1
+        for rank, lid in enumerate(c4_ids):
+            skip_flags[lid] = (
+                max(rank - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+            )
+    local_c4 = [lid for lid in c4_ids if local_start_layer <= lid < local_end_layer]
+    if local_c4:
+        skip_flags[local_c4[0]] = False
+    return tuple(skip_flags)
+
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -161,8 +203,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        skip_topk: bool = False,
     ) -> None:
         super().__init__()
+        self.skip_topk = skip_topk
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
@@ -868,14 +912,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 _pp0 = torch.cuda.Event(enable_timing=True)
                 _pp1 = torch.cuda.Event(enable_timing=True)
                 _pp0.record()
-            _indexer_fn = lambda: indexer(
-                hidden_states,
-                qr,
-                indexer_kv_score,
-                indexer_weights,
-                positions,
-                self.indexer_rotary_emb,
-            )
+            if self.skip_topk:
+                # #71 IndexCache: 跳过本层 topk 重算, 复用前 F 层的共享缓冲
+                _indexer_fn = lambda: None
+            else:
+                _indexer_fn = lambda: indexer(
+                    hidden_states,
+                    qr,
+                    indexer_kv_score,
+                    indexer_weights,
+                    positions,
+                    self.indexer_rotary_emb,
+                )
             q, _ = execute_in_parallel(
                 wq_b_kv_insert,
                 [
