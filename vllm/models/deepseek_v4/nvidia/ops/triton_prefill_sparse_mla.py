@@ -59,7 +59,8 @@ def _triton_prefill_sparse_mla_kernel(
     NUM_HEADS: tl.constexpr,    # 总头数
     SWA_W: tl.constexpr,        # window (128)
     EXTRA_W: tl.constexpr,      # topk 宽度 (0 = 无压缩段)
-    BLOCK_N: tl.constexpr,      # 候选分块 (16)
+    SWA_BN: tl.constexpr,       # SWA 段分块 (u8 staging SMEM 敏感, 上限 32)
+    BLOCK_N: tl.constexpr,      # EXTRA 段候选分块 (16; 稠密路径可 64)
     DATA_BYTES: tl.constexpr,   # 每 token 数据字节 (576)
     NOPE_DIM: tl.constexpr,     # 448
     ROPE_DIM: tl.constexpr,     # 64
@@ -112,8 +113,8 @@ def _triton_prefill_sparse_mla_kernel(
     neg_large = -1.0e30
 
     # ── SWA 段 ──
-    for c_start in range(0, SWA_W, BLOCK_N):
-        offs_c = c_start + tl.arange(0, BLOCK_N)
+    for c_start in range(0, SWA_W, SWA_BN):
+        offs_c = c_start + tl.arange(0, SWA_BN)
         mask_c = offs_c < SWA_W
         slot = tl.load(
             swa_idx_ptr + token_id * stride_swt + offs_c, mask=mask_c, other=-1
@@ -209,10 +210,10 @@ def _triton_prefill_sparse_mla_kernel(
                 mask=valid[None, :] & (offs8[:, None] < 7),
                 other=0,
             )
-            k_scale = tl.exp2(sc8.to(tl.float32) - 127.0)  # [8, BLOCK_N]
+            k_scale = tl.exp2(sc8.to(tl.float32) - 127.0)  # [8, SWA_BN]
             k_scale_full = tl.reshape(
-                tl.broadcast_to(k_scale[:, None, :], (8, 64, BLOCK_N)),
-                (512, BLOCK_N),
+                tl.broadcast_to(k_scale[:, None, :], (8, 64, SWA_BN)),
+                (512, SWA_BN),
             )
             k_nope = (
                 u8_nope.to(tl.float8e4nv, bitcast=True).to(tl.float32) * k_scale_full
@@ -769,6 +770,7 @@ def triton_prefill_sparse_mla_sm120(
     assert num_heads % BLOCK_H == 0
     grid = (n * (num_heads // BLOCK_H),)
     _bn = int(os.environ.get("VLLM_PREFILL_BLOCK_N", "16"))
+    _swa_bn = int(os.environ.get("VLLM_PREFILL_SWA_BN", "16"))
     _nw = int(os.environ.get("VLLM_PREFILL_WARPS", "4"))
     _ns = int(os.environ.get("VLLM_PREFILL_STAGES", "0"))  # 0 = Triton 默认
     # #50: 稠密工作区 (VLLM_PREFILL_DENSE=1, 默认关) — 整池反量化一次,
@@ -899,6 +901,7 @@ def triton_prefill_sparse_mla_sm120(
         NUM_HEADS=num_heads,
         SWA_W=swa_indices.shape[-1],
         EXTRA_W=extra_w,
+        SWA_BN=_swa_bn,
         BLOCK_N=_bn,
         DATA_BYTES=576,
         NOPE_DIM=448,
