@@ -395,6 +395,8 @@ def triton_prefill_sparse_mla_sm120(
     BLOCK_H = int(os.environ.get("VLLM_PREFILL_BLOCK_H", "4"))
     assert num_heads % BLOCK_H == 0
     grid = (n * (num_heads // BLOCK_H),)
+    _bn = int(os.environ.get("VLLM_PREFILL_BLOCK_N", "16"))
+    _nw = int(os.environ.get("VLLM_PREFILL_WARPS", "4"))
     _triton_prefill_sparse_mla_kernel[grid](
         query,
         swa_flat,
@@ -426,11 +428,11 @@ def triton_prefill_sparse_mla_sm120(
         NUM_HEADS=num_heads,
         SWA_W=swa_indices.shape[-1],
         EXTRA_W=extra_w,
-        BLOCK_N=16,
+        BLOCK_N=_bn,
         DATA_BYTES=576,
         NOPE_DIM=448,
         ROPE_DIM=64,
-        num_warps=4,
+        num_warps=_nw,
     )
 
 
