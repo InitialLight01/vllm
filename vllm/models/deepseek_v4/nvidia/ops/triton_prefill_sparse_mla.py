@@ -101,6 +101,9 @@ def _triton_prefill_sparse_mla_kernel(
     acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
 
     scale_offs = offs_nope // 64  # [512] 每 64 块一个 scale (块 7 = pad)
+    # #50: scale 读放大修复 — [8,BLOCK_N] 加载后广播, 取代 [512,BLOCK_N]
+    # (8KB 读 112B 有效 ≈ 70× 放大)。逐位无损 (同值广播)。
+    offs8 = tl.arange(0, 8)
     rope_lo = 448 + offs_rope * 2  # rope bf16 字节位置 (数据行内 [448,576))
     rope_hi = rope_lo + 1
     neg_large = -1.0e30
@@ -125,15 +128,19 @@ def _triton_prefill_sparse_mla_kernel(
             mask=valid[None, :] & nope_mask[:, None],
             other=0,
         )
-        sc = tl.load(
+        sc8 = tl.load(
             swa_ptr + block[None, :] * stride_sw0 + swa_sbase
-            + pos[None, :] * 8 + scale_offs[:, None],
-            mask=valid[None, :] & nope_mask[:, None],
+            + pos[None, :] * 8 + offs8[:, None],
+            mask=valid[None, :] & (offs8[:, None] < 7),
             other=0,
         )
-        k_scale = tl.exp2(sc.to(tl.float32) - 127.0)
+        k_scale = tl.exp2(sc8.to(tl.float32) - 127.0)  # [8, BLOCK_N]
+        k_scale_full = tl.reshape(
+            tl.broadcast_to(k_scale[:, None, :], (8, 64, BLOCK_N)),
+            (512, BLOCK_N),
+        )
         k_nope = (
-            u8_nope.to(tl.float8e4nv, bitcast=True).to(tl.float32) * k_scale
+            u8_nope.to(tl.float8e4nv, bitcast=True).to(tl.float32) * k_scale_full
         ).to(tl.bfloat16)
 
         lo = tl.load(
@@ -178,15 +185,19 @@ def _triton_prefill_sparse_mla_kernel(
             mask=valid[None, :] & nope_mask[:, None],
             other=0,
         )
-        sc = tl.load(
+        sc8 = tl.load(
             comp_ptr + block[None, :] * stride_cp0 + comp_sbase
-            + pos[None, :] * 8 + scale_offs[:, None],
-            mask=valid[None, :] & nope_mask[:, None],
+            + pos[None, :] * 8 + offs8[:, None],
+            mask=valid[None, :] & (offs8[:, None] < 7),
             other=0,
         )
-        k_scale = tl.exp2(sc.to(tl.float32) - 127.0)
+        k_scale = tl.exp2(sc8.to(tl.float32) - 127.0)  # [8, BLOCK_N]
+        k_scale_full = tl.reshape(
+            tl.broadcast_to(k_scale[:, None, :], (8, 64, BLOCK_N)),
+            (512, BLOCK_N),
+        )
         k_nope = (
-            u8_nope.to(tl.float8e4nv, bitcast=True).to(tl.float32) * k_scale
+            u8_nope.to(tl.float8e4nv, bitcast=True).to(tl.float32) * k_scale_full
         ).to(tl.bfloat16)
 
         lo = tl.load(
