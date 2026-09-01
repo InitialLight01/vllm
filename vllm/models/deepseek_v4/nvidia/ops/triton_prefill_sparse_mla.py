@@ -554,6 +554,33 @@ def _l2_stream_window(buf: torch.Tensor, stream) -> None:
         print(f"[L2STREAM] err: {_e}", flush=True)
 
 
+def _l2_unpin(stream) -> None:
+    """清除 L2 访问策略窗口 (按 launch 快照, 已 launch 的内核仍受益)。"""
+    import ctypes as _ct
+    try:
+        if int(os.environ.get("VLLM_PREFILL_L2PIN", "0")) != 1:
+            return
+        _cudart = _ct.CDLL("libcudart.so.13")
+
+        class _Win(_ct.Structure):
+            _fields_ = [
+                ("base_ptr", _ct.c_void_p),
+                ("num_bytes", _ct.c_size_t),
+                ("hitRatio", _ct.c_float),
+                ("hitProp", _ct.c_int),
+                ("missProp", _ct.c_int),
+            ]
+
+        class _Attr(_ct.Union):
+            _fields_ = [("accessPolicyWindow", _Win), ("pad", _ct.c_byte * 256)]
+
+        _a = _Attr()
+        _a.accessPolicyWindow = _Win(None, 0, 0.0, 0, 0)
+        _cudart.cudaStreamSetAttribute(_ct.c_void_p(stream), 1, _ct.byref(_a))
+    except Exception as _e:
+        print(f"[L2UNPIN] err: {_e}", flush=True)
+
+
 def _flat_pool_view(cache: torch.Tensor) -> torch.Tensor:
     """[B, block, 584] (池块间距 stride(0), 非连续) → [B, block*584]
     as_strided 视图。kernel 通过 block*stride(0) + off 寻址。
