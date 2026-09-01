@@ -515,25 +515,18 @@ def _splitkv_merge_kernel(
 
 
 
-def _l2_pin_buffer(buf: torch.Tensor, stream) -> None:
-    """#89: L2 持久化窗口钉住稠密缓冲 (env VLLM_PREFILL_L2PIN=1 时启用)。
+def _l2_stream_window(buf: torch.Tensor, stream) -> None:
+    """#89b: SWA 缓冲流式标记 (missProp=Streaming, 无 persisting carve-out)。
 
-    SWA 顺序流持续驱逐 L2 → 压缩缓冲的散射读落 DRAM (1M 超线性根源)。
-    cudaAccessPolicyWindow: hitProp=Persisting(2), missProp=Streaming(1)。
+    免 cudaDeviceSetLimit (persisting 划拨与 tilelang 内核分配冲突 = #89 负
+    结果的疑似根因)。SWA 顺序流绕开 L2 → 稠密缓冲 (7.8MB/层) 自然常驻,
+    散射读命中 L2。策略按 launch 快照, 注意力内核启动后即清除。
     """
     import ctypes as _ct
     try:
         if int(os.environ.get("VLLM_PREFILL_L2PIN", "0")) != 1:
             return
         _cudart = _ct.CDLL("libcudart.so.13")
-        # 一次性: persisting L2 划拨
-        _state = getattr(_l2_pin_buffer, "_state", None)
-        if _state is None:
-            _max = _ct.c_int(0)
-            _cudart.cudaDeviceGetAttribute(_ct.byref(_max), 108, 0)
-            _cudart.cudaDeviceSetLimit(0x05, _max.value)
-            _state = _max.value
-            _l2_pin_buffer._state = _state
 
         class _Win(_ct.Structure):
             _fields_ = [
@@ -549,43 +542,16 @@ def _l2_pin_buffer(buf: torch.Tensor, stream) -> None:
 
         _w = _Win(
             _ct.c_void_p(buf.data_ptr()),
-            min(buf.numel() * buf.element_size(), _state),
-            0.9,
-            2,  # cudaAccessPropertyPersisting
+            buf.numel() * buf.element_size(),
+            0.0,
+            0,  # cudaAccessPropertyNormal
             1,  # cudaAccessPropertyStreaming
         )
         _a = _Attr()
         _a.accessPolicyWindow = _w
-        # cudaStreamAttributeAccessPolicyWindow = 1
         _cudart.cudaStreamSetAttribute(_ct.c_void_p(stream), 1, _ct.byref(_a))
     except Exception as _e:
-        print(f"[L2PIN] err: {_e}", flush=True)
-
-def _l2_unpin(stream) -> None:
-    """清除 L2 持久化窗口 (策略按 launch 快照, 已 launch 的内核仍受益)。"""
-    import ctypes as _ct
-    try:
-        if int(os.environ.get("VLLM_PREFILL_L2PIN", "0")) != 1:
-            return
-        _cudart = _ct.CDLL("libcudart.so.13")
-
-        class _Win(_ct.Structure):
-            _fields_ = [
-                ("base_ptr", _ct.c_void_p),
-                ("num_bytes", _ct.c_size_t),
-                ("hitRatio", _ct.c_float),
-                ("hitProp", _ct.c_int),
-                ("missProp", _ct.c_int),
-            ]
-
-        class _Attr(_ct.Union):
-            _fields_ = [("accessPolicyWindow", _Win), ("pad", _ct.c_byte * 256)]
-
-        _a = _Attr()
-        _a.accessPolicyWindow = _Win(None, 0, 0.0, 0, 0)  # 清空窗口
-        _cudart.cudaStreamSetAttribute(_ct.c_void_p(stream), 1, _ct.byref(_a))
-    except Exception as _e:
-        print(f"[L2UNPIN] err: {_e}", flush=True)
+        print(f"[L2STREAM] err: {_e}", flush=True)
 
 
 def _flat_pool_view(cache: torch.Tensor) -> torch.Tensor:
@@ -859,7 +825,7 @@ def triton_prefill_sparse_mla_sm120(
             compressed_kv_cache,
             compressed_kv_cache.shape[0] * compressed_kv_cache.shape[1],
         )
-        _l2_pin_buffer(_dense, torch.cuda.current_stream().cuda_stream)
+        _l2_stream_window(swa_flat, torch.cuda.current_stream().cuda_stream)
     if _splitkv_on and _dense is not None:
         _splits = 2
         _split_size = extra_w // _splits
