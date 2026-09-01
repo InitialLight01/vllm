@@ -514,6 +514,53 @@ def _splitkv_merge_kernel(
     )
 
 
+
+def _l2_pin_buffer(buf: torch.Tensor, stream) -> None:
+    """#89: L2 持久化窗口钉住稠密缓冲 (env VLLM_PREFILL_L2PIN=1 时启用)。
+
+    SWA 顺序流持续驱逐 L2 → 压缩缓冲的散射读落 DRAM (1M 超线性根源)。
+    cudaAccessPolicyWindow: hitProp=Persisting(2), missProp=Streaming(1)。
+    """
+    import ctypes as _ct
+    try:
+        if int(os.environ.get("VLLM_PREFILL_L2PIN", "0")) != 1:
+            return
+        _cudart = _ct.CDLL("libcudart.so.13")
+        # 一次性: persisting L2 划拨
+        _state = getattr(_l2_pin_buffer, "_state", None)
+        if _state is None:
+            _max = _ct.c_int(0)
+            _cudart.cudaDeviceGetAttribute(_ct.byref(_max), 108, 0)
+            _cudart.cudaDeviceSetLimit(0x05, _max.value)
+            _state = _max.value
+            _l2_pin_buffer._state = _state
+
+        class _Win(_ct.Structure):
+            _fields_ = [
+                ("base_ptr", _ct.c_void_p),
+                ("num_bytes", _ct.c_size_t),
+                ("hitRatio", _ct.c_float),
+                ("hitProp", _ct.c_int),
+                ("missProp", _ct.c_int),
+            ]
+
+        class _Attr(_ct.Union):
+            _fields_ = [("accessPolicyWindow", _Win), ("pad", _ct.c_byte * 256)]
+
+        _w = _Win(
+            _ct.c_void_p(buf.data_ptr()),
+            min(buf.numel() * buf.element_size(), _state),
+            0.9,
+            2,  # cudaAccessPropertyPersisting
+            1,  # cudaAccessPropertyStreaming
+        )
+        _a = _Attr()
+        _a.accessPolicyWindow = _w
+        # cudaStreamAttributeAccessPolicyWindow = 1
+        _cudart.cudaStreamSetAttribute(_ct.c_void_p(stream), 1, _ct.byref(_a))
+    except Exception as _e:
+        print(f"[L2PIN] err: {_e}", flush=True)
+
 def _flat_pool_view(cache: torch.Tensor) -> torch.Tensor:
     """[B, block, 584] (池块间距 stride(0), 非连续) → [B, block*584]
     as_strided 视图。kernel 通过 block*stride(0) + off 寻址。
@@ -785,6 +832,7 @@ def triton_prefill_sparse_mla_sm120(
             compressed_kv_cache,
             compressed_kv_cache.shape[0] * compressed_kv_cache.shape[1],
         )
+        _l2_pin_buffer(_dense, torch.cuda.current_stream().cuda_stream)
     if _splitkv_on and _dense is not None:
         _splits = 2
         _split_size = extra_w // _splits
