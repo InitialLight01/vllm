@@ -1226,7 +1226,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         # #71 IndexCache (上游 PR #49085 移植): env 门控, 默认关。
         # 跳过的 C4A 层不复算 prefill topk (复用前 F 层共享缓冲)。
-        _idx_cache_on = int(os.environ.get("VLLM_DSV4_INDEX_CACHE", "0")) == 1
+        # 用户定调 (2026-09-01): freq=2 为生产默认 (精度安全, 1M -24%)
+        _idx_cache_on = int(os.environ.get("VLLM_DSV4_INDEX_CACHE", "1")) == 1
         _skip_flags: tuple = ()
         if _idx_cache_on:
             from vllm.models.deepseek_v4.attention import (
@@ -1235,9 +1236,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             _skip_flags = compute_dsv4_index_cache_skip_flags(
                 config.compress_ratios,
                 config.num_hidden_layers,
-                index_topk_freq=int(os.environ.get("VLLM_DSV4_INDEX_CACHE_FREQ", "4")),
+                index_topk_freq=int(os.environ.get("VLLM_DSV4_INDEX_CACHE_FREQ", "2")),
                 index_skip_topk_offset=int(
-                    os.environ.get("VLLM_DSV4_INDEX_CACHE_OFFSET", "2")
+                    os.environ.get("VLLM_DSV4_INDEX_CACHE_OFFSET", "1")
                 ),
                 local_start_layer=start_layer if "start_layer" in dir() else 0,
                 local_end_layer=end_layer if "end_layer" in dir() else None,
