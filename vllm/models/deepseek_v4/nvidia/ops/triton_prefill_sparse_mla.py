@@ -262,10 +262,10 @@ def _triton_prefill_sparse_mla_kernel(
 
 @triton.jit
 def _triton_prefill_pair_kernel(
-    # #90 v2: token 对 (TPAIR=2) × 16 头共享 gather。
-    # program = (token 对 × BLOCK_H=16 头); 键循环按对共享: 逐 token 遍历其
-    # SWA/EXTRA 段, 对侧 token 的行掩码 qk=-1e30 → p=0 且 re_scale=exp(0)=1
-    # 数值透明 → 每 token 行的有效键序列与单内核同序 = 位级同 (golden 门适用)。
+    # #90 v2c: token 对 (TPAIR=2) × 16 头, 按 token 拆 q/acc/dot —
+    # 每 chunk 只算所属 token 的 16 行 (无掩码行废功, dot 功 = 单内核水平),
+    # 键载入按对共享 (L2 天然为重复槽去重 → DRAM 读 ~1.85× 减@1M)。
+    # 每 token 的有效键序列与单内核同序 = 位级同 (golden 门适用)。
     q_ptr,
     swa_ptr,
     comp_ptr,
@@ -311,34 +311,35 @@ def _triton_prefill_pair_kernel(
     n_groups = NUM_HEADS // BLOCK_H
     pair = pid // n_groups
     h_base = (pid % n_groups) * BLOCK_H
-    ROWS: tl.constexpr = TPAIR * BLOCK_H  # 32
     t0 = pair * TPAIR
 
     offs_h = h_base + tl.arange(0, BLOCK_H)
-    offs_t = t0 + tl.arange(0, TPAIR)
     offs_nope = tl.arange(0, 512)
     nope_mask = offs_nope < NOPE_DIM
     offs_rope = tl.arange(0, ROPE_DIM)
 
-    # q [TPAIR, BLOCK_H, 512] → [ROWS, 512]
-    q_nope = tl.load(
-        q_ptr + offs_t[:, None, None] * stride_qt
-        + offs_h[None, :, None] * stride_qh
-        + offs_nope[None, None, :] * stride_qd,
-        mask=(offs_t[:, None, None] < n_total) & nope_mask[None, None, :],
+    # 逐 token q [BLOCK_H, 512] / [BLOCK_H, 64]
+    q_nope0 = tl.load(
+        q_ptr + t0 * stride_qt + offs_h[:, None] * stride_qh + offs_nope[None, :] * stride_qd,
+        mask=(t0 < n_total) & nope_mask[None, :],
         other=0.0,
     )
-    q_nope = tl.reshape(q_nope, (ROWS, 512))
-    q_rope = tl.load(
-        q_ptr + offs_t[:, None, None] * stride_qt
-        + offs_h[None, :, None] * stride_qh
-        + (NOPE_DIM + offs_rope)[None, None, :] * stride_qd,
-        mask=(offs_t[:, None, None] < n_total),
+    q_nope1 = tl.load(
+        q_ptr + (t0 + 1) * stride_qt + offs_h[:, None] * stride_qh + offs_nope[None, :] * stride_qd,
+        mask=(t0 + 1 < n_total) & nope_mask[None, :],
         other=0.0,
     )
-    q_rope = tl.reshape(q_rope, (ROWS, ROPE_DIM))
+    q_rope0 = tl.load(
+        q_ptr + t0 * stride_qt + offs_h[:, None] * stride_qh + (NOPE_DIM + offs_rope)[None, :] * stride_qd,
+        mask=(t0 < n_total),
+        other=0.0,
+    )
+    q_rope1 = tl.load(
+        q_ptr + (t0 + 1) * stride_qt + offs_h[:, None] * stride_qh + (NOPE_DIM + offs_rope)[None, :] * stride_qd,
+        mask=(t0 + 1 < n_total),
+        other=0.0,
+    )
 
-    # 逐 token 标量元数据 (Python 选择, static_range 展开)
     swa_len0 = tl.load(swa_len_ptr + t0, mask=t0 < n_total, other=0)
     swa_len1 = tl.load(swa_len_ptr + t0 + 1, mask=t0 + 1 < n_total, other=0)
     if EXTRA_W > 0:
@@ -348,19 +349,22 @@ def _triton_prefill_pair_kernel(
         extra_len0 = 0
         extra_len1 = 0
     sink = tl.load(sinks_ptr + offs_h)
-    # 行 → 对内 token 索引
-    row_tok = tl.arange(0, ROWS) // BLOCK_H  # [ROWS] ∈ {0,1}
-    e_max = tl.reshape(tl.broadcast_to(sink[None, :], (TPAIR, BLOCK_H)), (ROWS,)).to(tl.float32)
-    e_sum = tl.full((ROWS,), 1.0, dtype=tl.float32)
-    acc_nope = tl.zeros((ROWS, 512), dtype=tl.float32)
-    acc_rope = tl.zeros((ROWS, ROPE_DIM), dtype=tl.float32)
+
+    e_max0 = sink.to(tl.float32)
+    e_max1 = sink.to(tl.float32)
+    e_sum0 = tl.full((BLOCK_H,), 1.0, dtype=tl.float32)
+    e_sum1 = tl.full((BLOCK_H,), 1.0, dtype=tl.float32)
+    acc_nope0 = tl.zeros((BLOCK_H, 512), dtype=tl.float32)
+    acc_nope1 = tl.zeros((BLOCK_H, 512), dtype=tl.float32)
+    acc_rope0 = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
+    acc_rope1 = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
 
     offs8 = tl.arange(0, 8)
     rope_lo = 448 + offs_rope * 2
     rope_hi = rope_lo + 1
     neg_large = -1.0e30
 
-    # ── SWA 段: 逐 token, 对侧行掩码透明 ──
+    # ── SWA 段: 逐 token (chunk 即所属 token 的键, 无跨 token 掩码) ──
     for tt in tl.static_range(TPAIR):
         swa_len_t = swa_len0 if tt == 0 else swa_len1
         for c_start in range(0, SWA_W, SWA_BN):
@@ -398,23 +402,32 @@ def _triton_prefill_pair_kernel(
             u16 = (hi.to(tl.uint16) << 8) | lo.to(tl.uint16)
             k_rope = u16.to(tl.bfloat16, bitcast=True)
 
-            qk = (
-                tl.dot(q_nope, k_nope) + tl.dot(q_rope, k_rope)
-            ).to(tl.float32) * bmm1_scale
-            valid = (row_tok == tt)[:, None] & valid_key[None, :]
-            qk = tl.where(valid, qk, neg_large)
+            if tt == 0:
+                qk = (tl.dot(q_nope0, k_nope) + tl.dot(q_rope0, k_rope)).to(tl.float32) * bmm1_scale
+                qk = tl.where(valid_key[None, :], qk, neg_large)
+                n_e_max = tl.maximum(tl.max(qk, 1), e_max0)
+                re_scale = tl.exp(e_max0 - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                acc_nope0 *= re_scale[:, None]
+                acc_rope0 *= re_scale[:, None]
+                acc_nope0 += tl.dot(p.to(tl.bfloat16), tl.trans(k_nope))
+                acc_rope0 += tl.dot(p.to(tl.bfloat16), tl.trans(k_rope))
+                e_sum0 = e_sum0 * re_scale + tl.sum(p, 1)
+                e_max0 = n_e_max
+            else:
+                qk = (tl.dot(q_nope1, k_nope) + tl.dot(q_rope1, k_rope)).to(tl.float32) * bmm1_scale
+                qk = tl.where(valid_key[None, :], qk, neg_large)
+                n_e_max = tl.maximum(tl.max(qk, 1), e_max1)
+                re_scale = tl.exp(e_max1 - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                acc_nope1 *= re_scale[:, None]
+                acc_rope1 *= re_scale[:, None]
+                acc_nope1 += tl.dot(p.to(tl.bfloat16), tl.trans(k_nope))
+                acc_rope1 += tl.dot(p.to(tl.bfloat16), tl.trans(k_rope))
+                e_sum1 = e_sum1 * re_scale + tl.sum(p, 1)
+                e_max1 = n_e_max
 
-            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
-            acc_nope *= re_scale[:, None]
-            acc_rope *= re_scale[:, None]
-            acc_nope += tl.dot(p.to(tl.bfloat16), tl.trans(k_nope))
-            acc_rope += tl.dot(p.to(tl.bfloat16), tl.trans(k_rope))
-            e_sum = e_sum * re_scale + tl.sum(p, 1)
-            e_max = n_e_max
-
-    # ── EXTRA 段: 逐 token, 对侧行掩码透明 ──
+    # ── EXTRA 段: 逐 token ──
     if EXTRA_W > 0:
         for tt in tl.static_range(TPAIR):
             extra_len_t = extra_len0 if tt == 0 else extra_len1
@@ -466,40 +479,60 @@ def _triton_prefill_pair_kernel(
                     u16 = (hi.to(tl.uint16) << 8) | lo.to(tl.uint16)
                     k_rope = u16.to(tl.bfloat16, bitcast=True)
 
-                qk = (
-                    tl.dot(q_nope, k_nope) + tl.dot(q_rope, k_rope)
-                ).to(tl.float32) * bmm1_scale
-                valid = (row_tok == tt)[:, None] & valid_key[None, :]
-                qk = tl.where(valid, qk, neg_large)
+                if tt == 0:
+                    qk = (tl.dot(q_nope0, k_nope) + tl.dot(q_rope0, k_rope)).to(tl.float32) * bmm1_scale
+                    qk = tl.where(valid_key[None, :], qk, neg_large)
+                    n_e_max = tl.maximum(tl.max(qk, 1), e_max0)
+                    re_scale = tl.exp(e_max0 - n_e_max)
+                    p = tl.exp(qk - n_e_max[:, None])
+                    acc_nope0 *= re_scale[:, None]
+                    acc_rope0 *= re_scale[:, None]
+                    acc_nope0 += tl.dot(p.to(tl.bfloat16), tl.trans(k_nope))
+                    acc_rope0 += tl.dot(p.to(tl.bfloat16), tl.trans(k_rope))
+                    e_sum0 = e_sum0 * re_scale + tl.sum(p, 1)
+                    e_max0 = n_e_max
+                else:
+                    qk = (tl.dot(q_nope1, k_nope) + tl.dot(q_rope1, k_rope)).to(tl.float32) * bmm1_scale
+                    qk = tl.where(valid_key[None, :], qk, neg_large)
+                    n_e_max = tl.maximum(tl.max(qk, 1), e_max1)
+                    re_scale = tl.exp(e_max1 - n_e_max)
+                    p = tl.exp(qk - n_e_max[:, None])
+                    acc_nope1 *= re_scale[:, None]
+                    acc_rope1 *= re_scale[:, None]
+                    acc_nope1 += tl.dot(p.to(tl.bfloat16), tl.trans(k_nope))
+                    acc_rope1 += tl.dot(p.to(tl.bfloat16), tl.trans(k_rope))
+                    e_sum1 = e_sum1 * re_scale + tl.sum(p, 1)
+                    e_max1 = n_e_max
 
-                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-                re_scale = tl.exp(e_max - n_e_max)
-                p = tl.exp(qk - n_e_max[:, None])
-                acc_nope *= re_scale[:, None]
-                acc_rope *= re_scale[:, None]
-                acc_nope += tl.dot(p.to(tl.bfloat16), tl.trans(k_nope))
-                acc_rope += tl.dot(p.to(tl.bfloat16), tl.trans(k_rope))
-                e_sum = e_sum * re_scale + tl.sum(p, 1)
-                e_max = n_e_max
-
-    e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
-    o_nope = (acc_nope / e_sum_safe[:, None]).to(tl.bfloat16)
-    o_rope = (acc_rope / e_sum_safe[:, None]).to(tl.bfloat16)
-    o_nope = tl.reshape(o_nope, (TPAIR, BLOCK_H, 512))
-    o_rope = tl.reshape(o_rope, (TPAIR, BLOCK_H, ROPE_DIM))
+    e_sum_safe0 = tl.where(e_sum0 > 0, e_sum0, 1.0)
+    e_sum_safe1 = tl.where(e_sum1 > 0, e_sum1, 1.0)
+    o_nope0 = (acc_nope0 / e_sum_safe0[:, None]).to(tl.bfloat16)
+    o_nope1 = (acc_nope1 / e_sum_safe1[:, None]).to(tl.bfloat16)
+    o_rope0 = (acc_rope0 / e_sum_safe0[:, None]).to(tl.bfloat16)
+    o_rope1 = (acc_rope1 / e_sum_safe1[:, None]).to(tl.bfloat16)
     tl.store(
-        out_ptr + offs_t[:, None, None] * stride_ot
-        + offs_h[None, :, None] * stride_oh
-        + offs_nope[None, None, :] * stride_od,
-        o_nope,
-        mask=(offs_t[:, None, None] < n_total) & nope_mask[None, None, :],
+        out_ptr + t0 * stride_ot + offs_h[:, None] * stride_oh
+        + offs_nope[None, :] * stride_od,
+        o_nope0,
+        mask=(t0 < n_total) & nope_mask[None, :],
     )
     tl.store(
-        out_ptr + offs_t[:, None, None] * stride_ot
-        + offs_h[None, :, None] * stride_oh
-        + (NOPE_DIM + offs_rope)[None, None, :] * stride_od,
-        o_rope,
-        mask=(offs_t[:, None, None] < n_total),
+        out_ptr + (t0 + 1) * stride_ot + offs_h[:, None] * stride_oh
+        + offs_nope[None, :] * stride_od,
+        o_nope1,
+        mask=(t0 + 1 < n_total) & nope_mask[None, :],
+    )
+    tl.store(
+        out_ptr + t0 * stride_ot + offs_h[:, None] * stride_oh
+        + (NOPE_DIM + offs_rope)[None, :] * stride_od,
+        o_rope0,
+        mask=(t0 < n_total),
+    )
+    tl.store(
+        out_ptr + (t0 + 1) * stride_ot + offs_h[:, None] * stride_oh
+        + (NOPE_DIM + offs_rope)[None, :] * stride_od,
+        o_rope1,
+        mask=(t0 + 1 < n_total),
     )
 
 
