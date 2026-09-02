@@ -1109,14 +1109,16 @@ def triton_prefill_sparse_mla_sm120(
         extra_w = 0
         comp_block = swa_block
 
-    # #50: BLOCK_H 旋钮 (env, 默认 4) — 每 token 的 key 加载冗余 = 64/BLOCK_H 倍。
-    # 纯 tiling 变更 (每 head 数学不变) = 逐位无损。
-    BLOCK_H = int(os.environ.get("VLLM_PREFILL_BLOCK_H", "16"))
+    # #50: BLOCK_H 旋钮 (env) — 每 token 的 key 加载冗余 = 64/BLOCK_H 倍。
+    # BH32/BN32/W8 (2026-09-03 夜): 1M r128 1.38× / r4 1.28× (串行链延迟界,
+    # 链步数减半); L2 24/30 + L3 600q 485/600 双门 PASS 后设为默认。
+    # 数值: BN32 改 rescale 分块序 (0.0125% 位差, 语义同); BH/WARPS 位级透明。
+    BLOCK_H = int(os.environ.get("VLLM_PREFILL_BLOCK_H", "32"))
     assert num_heads % BLOCK_H == 0
     grid = (n * (num_heads // BLOCK_H),)
-    _bn = int(os.environ.get("VLLM_PREFILL_BLOCK_N", "16"))
+    _bn = int(os.environ.get("VLLM_PREFILL_BLOCK_N", "32"))
     _swa_bn = int(os.environ.get("VLLM_PREFILL_SWA_BN", "16"))
-    _nw = int(os.environ.get("VLLM_PREFILL_WARPS", "4"))
+    _nw = int(os.environ.get("VLLM_PREFILL_WARPS", "8"))
     _ns = int(os.environ.get("VLLM_PREFILL_STAGES", "0"))  # 0 = Triton 默认
     # #50: 稠密工作区 (VLLM_PREFILL_DENSE=1, 默认关) — 整池反量化一次,
     # 注意力压缩段读稠密 bf16 (逐位同值, 免 scale/反量化/rope 拼装)。
