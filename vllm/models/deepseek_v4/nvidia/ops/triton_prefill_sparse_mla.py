@@ -91,9 +91,9 @@ def _triton_prefill_sparse_mla_kernel(
 
     req_idx = tl.load(req_idx_ptr + token_id)
     seq_len = tl.load(seq_lens_ptr + req_idx)
-    swa_len = tl.load(swa_len_ptr + token_id)
+    swa_len = tl.minimum(tl.load(swa_len_ptr + token_id), SWA_W)  # #90 v3: 夹取防 warmup 垃圾数据
     if EXTRA_W > 0:
-        extra_len = tl.load(extra_len_ptr + token_id)
+        extra_len = tl.minimum(tl.load(extra_len_ptr + token_id), EXTRA_W)  # #90 v3: 夹取
     else:
         extra_len = 0
 
@@ -113,7 +113,8 @@ def _triton_prefill_sparse_mla_kernel(
     neg_large = -1.0e30
 
     # ── SWA 段 ──
-    for c_start in range(0, SWA_W, SWA_BN):
+    # #90 v3: 运行时上界 (swa_len 已在 load 处夹取; 跳过掩码 chunk 位级同)
+    for c_start in range(0, swa_len, SWA_BN):
         offs_c = c_start + tl.arange(0, SWA_BN)
         mask_c = offs_c < SWA_W
         slot = tl.load(
@@ -173,7 +174,8 @@ def _triton_prefill_sparse_mla_kernel(
         e_max = n_e_max
 
     # ── 压缩段 (EXTRA_W=0 时循环为空) ──
-    for c_start in range(0, EXTRA_W, BLOCK_N):
+    # #90 v3: 运行时上界 (extra_len 已在 load 处夹取; C128A 512→2 chunk)
+    for c_start in range(0, extra_len, BLOCK_N):
         offs_c = c_start + tl.arange(0, BLOCK_N)
         mask_c = offs_c < EXTRA_W
         slot = tl.load(
