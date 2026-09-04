@@ -176,6 +176,20 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         self._off_host_w2 = {
             e: w2[e].detach().to("cpu") for e in cold_ids
         }
+        _dbg = os.environ.get("VLLM_MOE_OFF_DEBUG")
+        if _dbg:
+            try:
+                with open(_dbg, "a") as _f:
+                    for _e in cold_ids[:2]:
+                        _h = self._off_host_w1[_e].view(torch.int8)
+                        _g = w1[_e].detach().to("cpu").view(torch.int8)
+                        _f.write(
+                            f"SETUP-CHECK e={_e} match={bool((_h == _g).all())} "
+                            f"hsum={int(_h.sum())} gsum={int(_g.sum())}\n"
+                        )
+                    _f.flush()
+            except Exception:
+                pass
 
         # GPU: 收缩张量 [k_hot + m_slots, ...]
         dev = w1.device
@@ -228,10 +242,10 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             self._off_slot_of = {
                 e: s for e, s in self._off_slot_of.items() if s != slot
             }
-        row = slot  # 物理行 = K + slot
-        # 同步 H2D (正确性先行; 预取优化后置)
-        w1[row].copy_(self._off_host_w1[eid], non_blocking=True)
-        w2[row].copy_(self._off_host_w2[eid], non_blocking=True)
+        row = self._off_k_hot_actual + slot
+        # 同步 H2D (正确性先行; pageable 源同步 copy 消 staging 疑点; 预取优化后置)
+        w1[row].copy_(self._off_host_w1[eid], non_blocking=False)
+        w2[row].copy_(self._off_host_w2[eid], non_blocking=False)
         self._off_slot_of[eid] = slot
         self._off_slot_lru.append(slot)
         return self._off_k_hot_actual + slot
