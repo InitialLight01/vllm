@@ -157,12 +157,13 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                 self._off_hot_k, k_hot, len(cold_ids), m_slots,
             )
 
-        # host: pinned 冷专家权重拷贝 (逐专家, 惰性也行; 一次做完)
+        # host: pinned 冷专家权重拷贝 (逐专家; 必须同步 D2H 后再 pin —
+        # non_blocking D2H 与 pin_memory 并发会读到未落地数据, 2026-09-05 实测竞态)
         self._off_host_w1 = {
-            e: w1[e].to("cpu", non_blocking=True).pin_memory() for e in cold_ids
+            e: w1[e].detach().to("cpu").pin_memory() for e in cold_ids
         }
         self._off_host_w2 = {
-            e: w2[e].to("cpu", non_blocking=True).pin_memory() for e in cold_ids
+            e: w2[e].detach().to("cpu").pin_memory() for e in cold_ids
         }
 
         # GPU: 收缩张量 [k_hot + m_slots, ...]
