@@ -99,6 +99,7 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         # 逻辑 id -> 物理行 (hot_pos 或 K+slot)
         self._off_phys: dict[int, int] | None = None
         self._off_k_hot_actual: int = 0
+        self._off_n_local: int = 0
 
         if self.ocp_mx_scheme in {
             OCP_MX_Scheme.w_mxfp4_a_mxfp4,
@@ -210,6 +211,7 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
 
         self._off_phys = {e: pos for pos, e in enumerate(hot_ids)}
         self._off_k_hot_actual = k_hot
+        self._off_n_local = n_local
         self._off_slot_of = {}
         self._off_slot_free = list(range(m_slots))
         self._off_slot_lru = []
@@ -410,7 +412,13 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         # Chunk size bounds the dequant peak: dq_mxfp4_pytorch allocates
         # several int32 intermediates ≈ 6× the BF16 output.
         MAX_CHUNK = 16
-        num_experts = w1.shape[0]  # static Python int (from shape)
+        # 夜4 Phase2: 卸载开启时 chunk 空间按逻辑专家数划分 (收缩张量行数
+        # 为 K+M < 逻辑数; 冷 id 的 chunk 从 LRU 槽取行, 见 _off_phys_rows)
+        num_experts = (
+            self._off_n_local
+            if self._off_enabled and getattr(self, "_off_n_local", 0) > 0
+            else w1.shape[0]
+        )  # static Python int
         n_chunks = (num_experts + MAX_CHUNK - 1) // MAX_CHUNK
 
         # Non-FP4/FP6 path: full dequant (rare)
