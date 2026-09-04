@@ -138,6 +138,16 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         if self._off_ready:
             return
         self._off_ready = True
+        _dbg = os.environ.get("VLLM_MOE_OFF_DEBUG")
+        if _dbg:
+            try:
+                with open(_dbg, "a") as _f:
+                    _f.write(f"SETUP-BEGIN layer={getattr(self, '_dbg_layer_idx', -1)} "
+                             f"rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else -1} "
+                             f"n_local={int(w1.shape[0])}\n")
+                    _f.flush()
+            except Exception:
+                pass
         n_local = int(w1.shape[0])
         # 热表: 默认 = 本地 id 前缀 K (占位); 画像后经 VLLM_MOE_HOT_TABLE
         # (<path> JSON: {"local_hot": [ids]}) 覆盖
@@ -157,13 +167,14 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                 self._off_hot_k, k_hot, len(cold_ids), m_slots,
             )
 
-        # host: pinned 冷专家权重拷贝 (逐专家; 必须同步 D2H 后再 pin —
-        # non_blocking D2H 与 pin_memory 并发会读到未落地数据, 2026-09-05 实测竞态)
+        # host: 冷专家权重拷贝 (pageable, 不 pin — TP2 专家全复制 (n_local=256),
+        # 大冷集 pin 会耗尽 pinned 内存导致 worker 静默崩, 2026-09-05 实测;
+        # 同步 .to("cpu") 防 D2H 竞态; H2D 从 pageable 走驱动 bounce 缓冲, 可接受)
         self._off_host_w1 = {
-            e: w1[e].detach().to("cpu").pin_memory() for e in cold_ids
+            e: w1[e].detach().to("cpu") for e in cold_ids
         }
         self._off_host_w2 = {
-            e: w2[e].detach().to("cpu").pin_memory() for e in cold_ids
+            e: w2[e].detach().to("cpu") for e in cold_ids
         }
 
         # GPU: 收缩张量 [k_hot + m_slots, ...]
@@ -188,6 +199,15 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         self._off_slot_of = {}
         self._off_slot_free = list(range(m_slots))
         self._off_slot_lru = []
+        _dbg = os.environ.get("VLLM_MOE_OFF_DEBUG")
+        if _dbg:
+            try:
+                with open(_dbg, "a") as _f:
+                    _f.write(f"SETUP-DONE layer={getattr(self, '_dbg_layer_idx', -1)} "
+                             f"hot={k_hot} cold={len(cold_ids)} slots={m_slots}\n")
+                    _f.flush()
+            except Exception:
+                pass
 
     def _off_ensure(self, eid: int, w1: torch.Tensor, w2: torch.Tensor) -> int:
         """确保冷专家 eid 常驻, 返回其物理槽行; 热专家返回 hot_pos。"""
