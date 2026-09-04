@@ -70,7 +70,7 @@ def _fused_indexer_topk_kernel(
     stride_wm, stride_wh,
     stride_om, stride_on,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    LOG2_PAD: tl.constexpr,
+    LOG2_PAD: tl.constexpr, EPI: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -98,17 +98,38 @@ def _fused_indexer_topk_kernel(
         k_sc = tl.load(scale_ptr + n0 + offs_n, mask=valid_n, other=1.0)
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        # EPI: 0=base(位级同参考) 1=hoist(k_sc 提出 h 循环, 语义同)
+        #      2=multiacc(2 累加器, h 链减半) 3=hoist+multiacc
+        if EPI >= 2:
+            acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for h in tl.static_range(H):
             q_f8 = tl.load(
                 q_ptr + offs_m[:, None] * stride_qm + h * stride_qh
                 + offs_d[None, :] * stride_qd,
                 mask=valid_m[:, None], other=0.0)
             s = tl.dot(q_f8, k_f8)          # fp8 x fp8 → fp32 acc (与参考同链)
-            s = s * k_sc[None, :]
-            s = tl.maximum(s, 0.0)          # per-head ReLU
-            w = tl.load(weights_ptr + offs_m * stride_wm + h * stride_wh,
-                        mask=valid_m, other=0.0)
-            acc += s * w[:, None]           # 单累加器 h 序 (硬约束)
+            if EPI % 2 == 1:                # hoist: sc>0 ⇒ relu(s·sc)=sc·relu(s)
+                s = tl.maximum(s, 0.0)      # per-head ReLU
+                w = tl.load(weights_ptr + offs_m * stride_wm + h * stride_wh,
+                            mask=valid_m, other=0.0)
+                sw = s * w[:, None]
+            else:
+                s = s * k_sc[None, :]
+                s = tl.maximum(s, 0.0)      # per-head ReLU
+                w = tl.load(weights_ptr + offs_m * stride_wm + h * stride_wh,
+                            mask=valid_m, other=0.0)
+                sw = s * w[:, None]
+            if EPI >= 2:
+                if h % 2 == 0:
+                    acc += sw
+                else:
+                    acc1 += sw
+            else:
+                acc += sw
+        if EPI >= 2:
+            acc = acc + acc1
+        if EPI % 2 == 1:
+            acc = acc * k_sc[None, :]       # 提出循环的 k_sc 一次性乘回
 
         # 全局列偏移 (n0 + offs_n) — 多块 + 截断 ke 时块内偏移会误掩
         row_valid = ((n0 + offs_n)[None, :] >= ks[:, None]) & (
@@ -988,6 +1009,8 @@ def fused_indexer_topk_triton(
     BLOCK_N = topk_tokens
     LOG2_PAD = (2 * topk_tokens).bit_length() - 1
     assert 2 * topk_tokens == (1 << LOG2_PAD), (topk_tokens, LOG2_PAD)
+    EPI = int(os.environ.get("VLLM_IDX_EPILOGUE", "0"))
+    _istages = int(os.environ.get("VLLM_IDX_STAGES", "1"))
 
     grid = (triton.cdiv(M, BLOCK_M),)
     _fused_indexer_topk_kernel[grid](
@@ -998,7 +1021,7 @@ def fused_indexer_topk_triton(
         weights.stride(0), weights.stride(1),
         topk_indices.stride(0), topk_indices.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        LOG2_PAD=LOG2_PAD,
-        num_warps=8, num_stages=1,
+        LOG2_PAD=LOG2_PAD, EPI=EPI,
+        num_warps=8, num_stages=_istages,
     )
     return True
