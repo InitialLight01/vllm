@@ -520,6 +520,27 @@ DeepseekV4MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: igno
 
 
 class DeepseekV4MoE(nn.Module):
+    def process_weights_after_loading(self):
+        # 夜4 Phase2: 冷专家卸载 setup 前置到 KV 分配之前 —
+        # 权重加载完成钩子 (engine 在 _initialize_kv_caches 前调用),
+        # 收缩 w1/w2 后 empty_cache 让 mem_get_info 看见释放空间
+        if os.environ.get("VLLM_MOE_COLD_OFFLOAD") != "1":
+            return
+        try:
+            ocp = None
+            layer = None
+            for m in self.experts.modules():
+                if type(m).__name__ == "OCP_MXQuantizationEmulationTritonExperts":
+                    ocp = m
+                if hasattr(m, "w13_weight") and hasattr(m, "w2_weight"):
+                    layer = m
+            if ocp is not None and layer is not None and not ocp._off_ready:
+                ocp._offload_setup(layer.w13_weight, layer.w2_weight)
+        except Exception as e:  # 卸载失败不影响默认路径 (lazy apply 会再试)
+            try:
+                print(f"[COLD_OFFLOAD] setup at load-time failed: {e}", flush=True)
+            except Exception:
+                pass
     def __init__(
         self,
         vllm_config: VllmConfig,

@@ -213,6 +213,8 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         self._off_slot_of = {}
         self._off_slot_free = list(range(m_slots))
         self._off_slot_lru = []
+        # 释放旧存储归还驱动 (empty_cache) — KV 预算在 mem_get_info 上计算
+        torch.cuda.empty_cache()
         _dbg = os.environ.get("VLLM_MOE_OFF_DEBUG")
         if _dbg:
             try:
