@@ -725,6 +725,22 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             routed_scaling_factor=self.routed_scaling_factor,
         )
+        # 夜4 Phase0: 专家激活分布画像 (VLLM_DUMP_EXPERT_IDS=<path> 逐 token dump topk_ids)
+        if os.environ.get("VLLM_DUMP_EXPERT_IDS") and not torch.cuda.is_current_stream_capturing():
+            try:
+                import json as _jseid
+                torch.cuda.synchronize()
+                _ids = topk_ids.detach().reshape(-1).tolist()
+                with open(os.environ["VLLM_DUMP_EXPERT_IDS"], "a") as _f:
+                    _f.write(_jseid.dumps({
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        "layer": getattr(self, "_active_idx", -1),
+                        "T": int(topk_ids.shape[0]),
+                        "K": int(topk_ids.shape[1]),
+                        "ids": _ids,
+                    }) + "\n")
+            except Exception:
+                pass
         if os.environ.get("VLLM_DUMP_HIDDEN_FP") and not torch.cuda.is_current_stream_capturing():
             try:
                 import json as _jsonfp4

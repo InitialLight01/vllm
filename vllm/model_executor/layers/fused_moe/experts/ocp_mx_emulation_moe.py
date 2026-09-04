@@ -11,6 +11,7 @@ Weights are dequantized on the fly during each forward, we fall back to calling
 is applied on activations via `moe_kernel_quantize_input`.
 """
 
+import json as _json_mod
 import os
 
 import torch
@@ -78,6 +79,116 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         self.quant_config._w2.scale = None
 
         self.quantization_emulation = True
+
+        # ---- 夜4 Phase2: 冷专家卸载状态 (VLLM_MOE_COLD_OFFLOAD=1 开启) ----------
+        # 设计见 docs/A800_MEMORY_OFFLOAD_SURVEY_PLAN_2026-09-04.md 附录。
+        # 权重只读 → LRU 无写回; w1/w2 收缩为 [hot_K + M] (热表重排 0..K-1,
+        # 冷槽 K..K+M-1); scales 不收缩 (按逻辑 id 索引, 仅 ~3GB 总量)。
+        # H2D 为精确复制 → 与全 GPU 位级一致。
+        self._off_enabled = os.environ.get("VLLM_MOE_COLD_OFFLOAD", "0") == "1"
+        self._off_ready = False
+        self._off_hot_k = int(os.environ.get("VLLM_MOE_HOT_K", "128"))
+        self._off_slots = int(os.environ.get("VLLM_MOE_LRU_SLOTS", "32"))
+        # host 侧冷专家权重 (pinned), key = 逻辑本地 id
+        self._off_host_w1: dict[int, torch.Tensor] | None = None
+        self._off_host_w2: dict[int, torch.Tensor] | None = None
+        # GPU 槽位状态
+        self._off_slot_of: dict[int, int] | None = None  # 逻辑 id -> 槽
+        self._off_slot_free: list[int] | None = None
+        self._off_slot_lru: list[int] | None = None      # 槽 (最近使用在尾)
+        # 逻辑 id -> 物理行 (hot_pos 或 K+slot)
+        self._off_phys: dict[int, int] | None = None
+
+    def _offload_setup(self, w1: torch.Tensor, w2: torch.Tensor) -> None:
+        """首次 apply 时执行: 热/冷分区 + 收缩 GPU 张量 + host pinned 拷贝。
+
+        要求调用环境无 CUDA graph 捕获 (本类在 cudagraph NONE 配置下运行)。
+        """
+        if self._off_ready:
+            return
+        self._off_ready = True
+        n_local = int(w1.shape[0])
+        # 热表: 默认 = 本地 id 前缀 K (占位); 画像后经 VLLM_MOE_HOT_TABLE
+        # (<path> JSON: {"local_hot": [ids]}) 覆盖
+        hot_ids = list(range(min(self._off_hot_k, n_local)))
+        hot_table = os.environ.get("VLLM_MOE_HOT_TABLE")
+        if hot_table:
+            with open(hot_table) as _f:
+                hot_ids = [int(e) for e in _json_mod.load(_f).get("local_hot", [])]
+        hot_ids = [e for e in hot_ids if 0 <= e < n_local]
+        hot_set = set(hot_ids)
+        cold_ids = [e for e in range(n_local) if e not in hot_set]
+        k_hot = len(hot_ids)
+        m_slots = min(self._off_slots, len(cold_ids))
+        if self._off_hot_k != k_hot:
+            logger.warning(
+                "COLD_OFFLOAD: hot_K=%d (table=%d cold=%d slots=%d)",
+                self._off_hot_k, k_hot, len(cold_ids), m_slots,
+            )
+
+        # host: pinned 冷专家权重拷贝 (逐专家, 惰性也行; 一次做完)
+        self._off_host_w1 = {
+            e: w1[e].to("cpu", non_blocking=True).pin_memory() for e in cold_ids
+        }
+        self._off_host_w2 = {
+            e: w2[e].to("cpu", non_blocking=True).pin_memory() for e in cold_ids
+        }
+
+        # GPU: 收缩张量 [k_hot + m_slots, ...]
+        dev = w1.device
+        new_w1 = torch.empty(
+            (k_hot + m_slots, *w1.shape[1:]), dtype=w1.dtype, device=dev
+        )
+        new_w2 = torch.empty(
+            (k_hot + m_slots, *w2.shape[1:]), dtype=w2.dtype, device=dev
+        )
+        for pos, e in enumerate(hot_ids):
+            new_w1[pos].copy_(w1[e], non_blocking=True)
+            new_w2[pos].copy_(w2[e], non_blocking=True)
+        # 槽位行初始置零 (未加载状态由 LRU dict 判定, 内容无意义)
+        # 重绑定 Parameter.data — 调用方 (fused_moe_modular_method) 每步传
+        # layer.w13_weight 本对象, data 重绑定后自动生效
+        w1.data = new_w1
+        w2.data = new_w2
+
+        self._off_phys = {e: pos for pos, e in enumerate(hot_ids)}
+        self._off_slot_of = {}
+        self._off_slot_free = list(range(m_slots))
+        self._off_slot_lru = []
+
+    def _off_ensure(self, eid: int, w1: torch.Tensor, w2: torch.Tensor) -> int:
+        """确保冷专家 eid 常驻, 返回其物理槽行; 热专家返回 hot_pos。"""
+        phys = self._off_phys.get(eid)
+        if phys is not None:
+            return phys
+        slot = self._off_slot_of.get(eid)
+        if slot is not None:
+            # LRU touch
+            self._off_slot_lru.remove(slot)
+            self._off_slot_lru.append(slot)
+            return slot
+        # 分配槽 (空闲或淘汰 LRU)
+        if self._off_slot_free:
+            slot = self._off_slot_free.pop()
+        else:
+            slot = self._off_slot_lru.pop(0)
+            self._off_slot_of = {
+                e: s for e, s in self._off_slot_of.items() if s != slot
+            }
+        row = slot  # 物理行 = K + slot
+        # 同步 H2D (正确性先行; 预取优化后置)
+        w1[row].copy_(self._off_host_w1[eid], non_blocking=True)
+        w2[row].copy_(self._off_host_w2[eid], non_blocking=True)
+        self._off_slot_of[eid] = slot
+        self._off_slot_lru.append(slot)
+        return row
+
+    def _off_phys_rows(self, chunk_ids, w1: torch.Tensor, w2: torch.Tensor):
+        """chunk 逻辑 id 列表 → 物理行索引列表 (含 ensure-resident)。"""
+        return [
+            self._off_ensure(int(eid), w1, w2)
+            for eid in chunk_ids
+        ]
 
         if self.ocp_mx_scheme in {
             OCP_MX_Scheme.w_mxfp4_a_mxfp4,
@@ -175,6 +286,16 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         """
         assert w1.dtype == torch.uint8
         assert w2.dtype == torch.uint8
+
+        # 夜4 Phase2: 冷专家卸载 (仅 w_mxfp4 方案; setup 在首次 apply)
+        if self._off_enabled and not self.ocp_mx_scheme.startswith("w_mxfp4"):
+            logger.warning(
+                "COLD_OFFLOAD: scheme=%s 不支持, 关闭卸载",
+                self.ocp_mx_scheme,
+            )
+            self._off_enabled = False
+        if self._off_enabled and not self._off_ready:
+            self._offload_setup(w1, w2)
 
         if os.environ.get("VLLM_PROFILE"):
             _t0 = torch.cuda.Event(enable_timing=True)
@@ -290,12 +411,22 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                     for eid in chunk_clamped.tolist()
                 ], dim=0)
             else:
-                w1_chunk = dq_mxfp4_triton(
-                    w1[chunk_clamped], self.w1_scale_val[chunk_clamped],
-                )
-                w2_chunk = dq_mxfp4_triton(
-                    w2[chunk_clamped], self.w2_scale_val[chunk_clamped],
-                )
+                if self._off_enabled:
+                    # 物理行重映射 (热=hot_pos, 冷=槽; miss 触发 H2D)
+                    _phys = self._off_phys_rows(chunk_clamped.tolist(), w1, w2)
+                    w1_chunk = dq_mxfp4_triton(
+                        w1[_phys], self.w1_scale_val[chunk_clamped],
+                    )
+                    w2_chunk = dq_mxfp4_triton(
+                        w2[_phys], self.w2_scale_val[chunk_clamped],
+                    )
+                else:
+                    w1_chunk = dq_mxfp4_triton(
+                        w1[chunk_clamped], self.w1_scale_val[chunk_clamped],
+                    )
+                    w2_chunk = dq_mxfp4_triton(
+                        w2[chunk_clamped], self.w2_scale_val[chunk_clamped],
+                    )
             # positional local ids: slot j → row j of the chunk
             local_ids = (
                 torch.arange(num_slots, device=topk_ids.device, dtype=torch.int64)
@@ -357,12 +488,22 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                     _td0 = torch.cuda.Event(enable_timing=True)
                     _td1 = torch.cuda.Event(enable_timing=True)
                     _td0.record()
-                w1_chunk = dq_mxfp4_triton(
-                    w1[c0:c1], self.w1_scale_val[c0:c1],
-                )
-                w2_chunk = dq_mxfp4_triton(
-                    w2[c0:c1], self.w2_scale_val[c0:c1],
-                )
+                if self._off_enabled:
+                    # 物理行重映射 (热=hot_pos, 冷=槽; miss 触发 H2D)
+                    _phys = self._off_phys_rows(list(chunk_ids), w1, w2)
+                    w1_chunk = dq_mxfp4_triton(
+                        w1[_phys], self.w1_scale_val[c0:c1],
+                    )
+                    w2_chunk = dq_mxfp4_triton(
+                        w2[_phys], self.w2_scale_val[c0:c1],
+                    )
+                else:
+                    w1_chunk = dq_mxfp4_triton(
+                        w1[c0:c1], self.w1_scale_val[c0:c1],
+                    )
+                    w2_chunk = dq_mxfp4_triton(
+                        w2[c0:c1], self.w2_scale_val[c0:c1],
+                    )
                 if os.environ.get("VLLM_PROFILE"):
                     _td1.record()
                     torch.cuda.synchronize()
