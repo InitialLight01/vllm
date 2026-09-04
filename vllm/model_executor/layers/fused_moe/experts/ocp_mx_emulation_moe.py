@@ -89,9 +89,10 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         self._off_ready = False
         self._off_hot_k = int(os.environ.get("VLLM_MOE_HOT_K", "128"))
         self._off_slots = int(os.environ.get("VLLM_MOE_LRU_SLOTS", "32"))
-        # host 侧冷专家权重 (pinned), key = 逻辑本地 id
-        self._off_host_w1: dict[int, torch.Tensor] | None = None
-        self._off_host_w2: dict[int, torch.Tensor] | None = None
+        # host 侧冷专家权重 (堆叠张量, pageable — 大冷集 pin 会耗尽 pinned 内存)
+        self._off_host_w1: torch.Tensor | None = None
+        self._off_host_w2: torch.Tensor | None = None
+        self._off_cold_idx: dict[int, int] | None = None  # 逻辑 id -> 冷索引
         # GPU 槽位状态
         self._off_slot_of: dict[int, int] | None = None  # 逻辑 id -> 槽
         self._off_slot_free: list[int] | None = None
@@ -168,21 +169,24 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                 self._off_hot_k, k_hot, len(cold_ids), m_slots,
             )
 
-        # host: 冷专家权重拷贝 (pageable, 不 pin — TP2 专家全复制 (n_local=256),
-        # 大冷集 pin 会耗尽 pinned 内存导致 worker 静默崩, 2026-09-05 实测;
-        # 同步 .to("cpu") 防 D2H 竞态; H2D 从 pageable 走驱动 bounce 缓冲, 可接受)
-        self._off_host_w1 = {
-            e: w1[e].detach().to("cpu") for e in cold_ids
-        }
-        self._off_host_w2 = {
-            e: w2[e].detach().to("cpu") for e in cold_ids
-        }
+        # host: 冷专家权重批量拷贝 (pageable; 单次大拷贝 = 带宽界, 逐专家小拷贝
+        # 是延迟界 — 深 K 下加载期 setup 超引擎 RPC 超时, 2026-09-05 实测)
+        if cold_ids:
+            _cold_t = torch.tensor(cold_ids, dtype=torch.int64, device=w1.device)
+            self._off_host_w1 = w1[_cold_t].detach().to("cpu")
+            self._off_host_w2 = w2[_cold_t].detach().to("cpu")
+            self._off_cold_idx = {e: i for i, e in enumerate(cold_ids)}
+        else:
+            self._off_host_w1 = torch.empty(0)
+            self._off_host_w2 = torch.empty(0)
+            self._off_cold_idx = {}
         _dbg = os.environ.get("VLLM_MOE_OFF_DEBUG")
         if _dbg:
             try:
                 with open(_dbg, "a") as _f:
                     for _e in cold_ids[:2]:
-                        _h = self._off_host_w1[_e].view(torch.int8)
+                        _i = self._off_cold_idx[_e]
+                        _h = self._off_host_w1[_i].view(torch.int8)
                         _g = w1[_e].detach().to("cpu").view(torch.int8)
                         _f.write(
                             f"SETUP-CHECK e={_e} match={bool((_h == _g).all())} "
@@ -247,9 +251,10 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                 e: s for e, s in self._off_slot_of.items() if s != slot
             }
         row = self._off_k_hot_actual + slot
+        _ci = self._off_cold_idx[eid]
         # 同步 H2D (正确性先行; pageable 源同步 copy 消 staging 疑点; 预取优化后置)
-        w1[row].copy_(self._off_host_w1[eid], non_blocking=False)
-        w2[row].copy_(self._off_host_w2[eid], non_blocking=False)
+        w1[row].copy_(self._off_host_w1[_ci], non_blocking=False)
+        w2[row].copy_(self._off_host_w2[_ci], non_blocking=False)
         self._off_slot_of[eid] = slot
         self._off_slot_lru.append(slot)
         return self._off_k_hot_actual + slot
