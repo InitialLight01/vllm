@@ -343,8 +343,8 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
                 [self._off_cold_idx[e] for e, _ in cold_need],
                 dtype=torch.int64, device="cpu",
             )
-            w1.index_copy_(0, _rows, self._off_host_w1[_idxs])
-            w2.index_copy_(0, _rows, self._off_host_w2[_idxs])
+            w1.index_copy_(0, _rows, self._off_host_w1[_idxs].to(w1.device))
+            w2.index_copy_(0, _rows, self._off_host_w2[_idxs].to(w1.device))
         return out
 
     @property
