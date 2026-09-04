@@ -98,6 +98,37 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         self._off_slot_lru: list[int] | None = None      # 槽 (最近使用在尾)
         # 逻辑 id -> 物理行 (hot_pos 或 K+slot)
         self._off_phys: dict[int, int] | None = None
+        self._off_k_hot_actual: int = 0
+
+        if self.ocp_mx_scheme in {
+            OCP_MX_Scheme.w_mxfp4_a_mxfp4,
+        }:
+            # Weight has to be dequantized for mxfp4 emulation.
+            if os.environ.get("VLLM_EMU_FP8_ACT"):
+                # Experiment: emulate DeepGEMM's FP8 activation QDQ instead
+                # of MXFP4 (which is ~2x coarser: FP4 1-bit mantissa vs FP8
+                # E4M3 3-bit).  Tests the "training-distribution alignment"
+                # hypothesis — if FP8-act matches DeepGEMM results, the
+                # accuracy gap is activation-quantization format, not BF16.
+                logger.warning_once(
+                    "VLLM_EMU_FP8_ACT=1: activation QDQ switched to FP8 "
+                    "(DeepGEMM-compatible) instead of MXFP4."
+                )
+                self._quant_dtype = current_platform.fp8_dtype()
+            else:
+                self._quant_dtype = "mxfp4"
+        elif self.ocp_mx_scheme in [
+            OCP_MX_Scheme.w_mxfp4_a_mxfp6_e3m2,
+            OCP_MX_Scheme.w_mxfp4_a_mxfp6_e2m3,
+            OCP_MX_Scheme.w_mxfp6_e3m2_a_mxfp6_e3m2,
+            OCP_MX_Scheme.w_mxfp6_e2m3_a_mxfp6_e2m3,
+        ]:
+            self._quant_dtype = "mxfp6"
+        elif self.ocp_mx_scheme in [
+            OCP_MX_Scheme.w_mxfp4_a_fp8,
+            OCP_MX_Scheme.w_mxfp6_e3m2_a_fp8,
+        ]:
+            self._quant_dtype = current_platform.fp8_dtype()
 
     def _offload_setup(self, w1: torch.Tensor, w2: torch.Tensor) -> None:
         """首次 apply 时执行: 热/冷分区 + 收缩 GPU 张量 + host pinned 拷贝。
@@ -152,6 +183,7 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         w2.data = new_w2
 
         self._off_phys = {e: pos for pos, e in enumerate(hot_ids)}
+        self._off_k_hot_actual = k_hot
         self._off_slot_of = {}
         self._off_slot_free = list(range(m_slots))
         self._off_slot_lru = []
@@ -166,7 +198,7 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             # LRU touch
             self._off_slot_lru.remove(slot)
             self._off_slot_lru.append(slot)
-            return slot
+            return self._off_k_hot_actual + slot
         # 分配槽 (空闲或淘汰 LRU)
         if self._off_slot_free:
             slot = self._off_slot_free.pop()
@@ -181,7 +213,7 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         w2[row].copy_(self._off_host_w2[eid], non_blocking=True)
         self._off_slot_of[eid] = slot
         self._off_slot_lru.append(slot)
-        return row
+        return self._off_k_hot_actual + slot
 
     def _off_phys_rows(self, chunk_ids, w1: torch.Tensor, w2: torch.Tensor):
         """chunk 逻辑 id 列表 → 物理行索引列表 (含 ensure-resident)。"""
@@ -189,36 +221,6 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             self._off_ensure(int(eid), w1, w2)
             for eid in chunk_ids
         ]
-
-        if self.ocp_mx_scheme in {
-            OCP_MX_Scheme.w_mxfp4_a_mxfp4,
-        }:
-            # Weight has to be dequantized for mxfp4 emulation.
-            if os.environ.get("VLLM_EMU_FP8_ACT"):
-                # Experiment: emulate DeepGEMM's FP8 activation QDQ instead
-                # of MXFP4 (which is ~2x coarser: FP4 1-bit mantissa vs FP8
-                # E4M3 3-bit).  Tests the "training-distribution alignment"
-                # hypothesis — if FP8-act matches DeepGEMM results, the
-                # accuracy gap is activation-quantization format, not BF16.
-                logger.warning_once(
-                    "VLLM_EMU_FP8_ACT=1: activation QDQ switched to FP8 "
-                    "(DeepGEMM-compatible) instead of MXFP4."
-                )
-                self._quant_dtype = current_platform.fp8_dtype()
-            else:
-                self._quant_dtype = "mxfp4"
-        elif self.ocp_mx_scheme in [
-            OCP_MX_Scheme.w_mxfp4_a_mxfp6_e3m2,
-            OCP_MX_Scheme.w_mxfp4_a_mxfp6_e2m3,
-            OCP_MX_Scheme.w_mxfp6_e3m2_a_mxfp6_e3m2,
-            OCP_MX_Scheme.w_mxfp6_e2m3_a_mxfp6_e2m3,
-        ]:
-            self._quant_dtype = "mxfp6"
-        elif self.ocp_mx_scheme in [
-            OCP_MX_Scheme.w_mxfp4_a_fp8,
-            OCP_MX_Scheme.w_mxfp6_e3m2_a_fp8,
-        ]:
-            self._quant_dtype = current_platform.fp8_dtype()
 
     @property
     def quant_dtype(self) -> torch.dtype | str | None:
