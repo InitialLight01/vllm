@@ -210,8 +210,41 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         # 槽位行初始置零 (未加载状态由 LRU dict 判定, 内容无意义)
         # 重绑定 Parameter.data — 调用方 (fused_moe_modular_method) 每步传
         # layer.w13_weight 本对象, data 重绑定后自动生效
+        _old_w1 = w1.data
+        _old_w2 = w2.data
+        _dbg = os.environ.get("VLLM_MOE_OFF_DEBUG")
+        if _dbg:
+            try:
+                with open(_dbg, "a") as _f:
+                    _f.write(
+                        f"SIZES old_w1={_old_w1.numel() * _old_w1.element_size() / 1e9:.3f}GB "
+                        f"old_w2={_old_w2.numel() * _old_w2.element_size() / 1e9:.3f}GB "
+                        f"new_w1={new_w1.numel() * new_w1.element_size() / 1e9:.3f}GB "
+                        f"alloc_before={torch.cuda.memory_allocated() / 1e9:.3f}GB "
+                        f"reserved_before={torch.cuda.memory_reserved() / 1e9:.3f}GB\n"
+                    )
+                    _f.flush()
+            except Exception:
+                pass
         w1.data = new_w1
         w2.data = new_w2
+        _dbg = os.environ.get("VLLM_MOE_OFF_DEBUG")
+        if _dbg:
+            try:
+                import gc as _gc
+                with open(_dbg, "a") as _f:
+                    for _tag, _old in (("w1", _old_w1), ("w2", _old_w2)):
+                        _refs = _gc.get_referrers(_old)
+                        _kinds = {}
+                        for _r in _refs:
+                            _k = type(_r).__name__
+                            if _k in ("frame", "dict", "list"):
+                                continue
+                            _kinds[_k] = _kinds.get(_k, 0) + 1
+                        _f.write(f"REFERRERS {_tag}: {_kinds}\n")
+                    _f.flush()
+            except Exception:
+                pass
 
         self._off_phys = {e: pos for pos, e in enumerate(hot_ids)}
         self._off_k_hot_actual = k_hot
@@ -221,6 +254,17 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         self._off_slot_lru = []
         # 释放旧存储归还驱动 (empty_cache) — KV 预算在 mem_get_info 上计算
         torch.cuda.empty_cache()
+        _dbg = os.environ.get("VLLM_MOE_OFF_DEBUG")
+        if _dbg:
+            try:
+                with open(_dbg, "a") as _f:
+                    _f.write(
+                        f"AFTER-EC alloc={torch.cuda.memory_allocated() / 1e9:.3f}GB "
+                        f"reserved={torch.cuda.memory_reserved() / 1e9:.3f}GB\n"
+                    )
+                    _f.flush()
+            except Exception:
+                pass
         _dbg = os.environ.get("VLLM_MOE_OFF_DEBUG")
         if _dbg:
             try:
@@ -260,11 +304,48 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         return self._off_k_hot_actual + slot
 
     def _off_phys_rows(self, chunk_ids, w1: torch.Tensor, w2: torch.Tensor):
-        """chunk 逻辑 id 列表 → 物理行索引列表 (含 ensure-resident)。"""
-        return [
-            self._off_ensure(int(eid), w1, w2)
-            for eid in chunk_ids
-        ]
+        """chunk 逻辑 id 列表 → 物理行索引列表 (含 ensure-resident)。
+
+        冷 miss 用 index_copy_ 批量 H2D (每 chunk 一次带宽界拷贝,
+        逐专家同步小拷贝是延迟界 — 深 K 画像期 H2D 风暴的根因)。"""
+        out = []
+        cold_need = []  # (eid, slot)
+        for eid in chunk_ids:
+            eid = int(eid)
+            phys = self._off_phys.get(eid)
+            if phys is not None:
+                out.append(phys)
+                continue
+            slot = self._off_slot_of.get(eid)
+            if slot is not None:
+                # LRU touch
+                self._off_slot_lru.remove(slot)
+                self._off_slot_lru.append(slot)
+                out.append(self._off_k_hot_actual + slot)
+                continue
+            if self._off_slot_free:
+                slot = self._off_slot_free.pop()
+            else:
+                slot = self._off_slot_lru.pop(0)
+                self._off_slot_of = {
+                    e: s for e, s in self._off_slot_of.items() if s != slot
+                }
+            self._off_slot_of[eid] = slot
+            self._off_slot_lru.append(slot)
+            out.append(self._off_k_hot_actual + slot)
+            cold_need.append((eid, slot))
+        if cold_need:
+            _rows = torch.tensor(
+                [self._off_k_hot_actual + sl for _, sl in cold_need],
+                dtype=torch.int64, device=w1.device,
+            )
+            _idxs = torch.tensor(
+                [self._off_cold_idx[e] for e, _ in cold_need],
+                dtype=torch.int64, device="cpu",
+            )
+            w1.index_copy_(0, _rows, self._off_host_w1[_idxs])
+            w2.index_copy_(0, _rows, self._off_host_w2[_idxs])
+        return out
 
     @property
     def quant_dtype(self) -> torch.dtype | str | None:
