@@ -1170,6 +1170,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
+        # backlog ③ 实验旋钮: 稀疏注意力 topk 宽度覆写 (VLLM_DSV4_INDEX_TOPK,
+        # 默认 0 = 透明; 支持 512/1024/2048 = cutedsl selector 档位)
+        _xtk = int(os.environ.get("VLLM_DSV4_INDEX_TOPK", "0") or "0")
+        if _xtk > 0:
+            vllm_config.model_config.hf_config.index_topk = _xtk
+
         # SM80 (Ampere/A800): override sparse MLA backend to pure-Triton
         # path.  FlashMLA (SM90+) and FlashInfer (SM120) backends are not
         # available on SM80.
