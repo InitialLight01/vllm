@@ -287,6 +287,23 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         assert w1.dtype == torch.uint8
         assert w2.dtype == torch.uint8
 
+        # 夜4 Phase0: 专家激活分布画像 — 本地 id 逐 token dump (VLLM_DUMP_EXPERT_IDS)
+        if os.environ.get("VLLM_DUMP_EXPERT_IDS") and not torch.cuda.is_current_stream_capturing():
+            try:
+                torch.cuda.synchronize()
+                _ids = topk_ids.detach().reshape(-1).tolist()
+                with open(os.environ["VLLM_DUMP_EXPERT_IDS"], "a") as _f:
+                    _f.write(_json_mod.dumps({
+                        "rank": torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else -1,
+                        "layer": getattr(self, "_dbg_layer_idx", -1),
+                        "T": int(topk_ids.shape[0]),
+                        "K": int(topk_ids.shape[1]),
+                        "ids": _ids,
+                    }) + "\n")
+            except Exception:
+                pass
+
         # 夜4 Phase2: 冷专家卸载 (仅 w_mxfp4 方案; setup 在首次 apply)
         if self._off_enabled and not self.ocp_mx_scheme.startswith("w_mxfp4"):
             logger.warning(

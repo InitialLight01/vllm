@@ -699,6 +699,11 @@ class DeepseekV4MoE(nn.Module):
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
         )
+        # 夜4 Phase0: 专家激活分布画像 — 层索引注入 experts (apply 内 dump 用)
+        try:
+            self.experts._dbg_layer_idx = extract_layer_index(prefix)
+        except Exception:
+            self.experts._dbg_layer_idx = -1
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
