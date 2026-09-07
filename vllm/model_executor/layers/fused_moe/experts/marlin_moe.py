@@ -805,7 +805,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             if t is not None and isinstance(t, torch.Tensor) and t.shape[0] == E:
                 tensors[name] = t
         self._off_dev_tensors = {}
-        _dbg = os.environ.get("VLLM_MOE_OFF_DEBUG")
+        _dbg = _os.environ.get("VLLM_MOE_OFF_DEBUG")
         for name, t in tensors.items():
             host = t[K + M :].detach().to("cpu", non_blocking=False).clone()
             self._off_host[name] = host

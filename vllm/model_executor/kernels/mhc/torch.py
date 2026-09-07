@@ -62,7 +62,14 @@ def mhc_pre_torch(
     fn_flat = fn
 
     x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
-    mixes = torch.matmul(x, fn_flat.t())
+    import os
+    if os.environ.get("VLLM_SM80_MHC_BF16") == "1":
+        mixes = torch.matmul(
+            x.to(torch.bfloat16),
+            fn_flat.t().to(torch.bfloat16),
+        ).to(torch.float32)
+    else:
+        mixes = torch.matmul(x, fn_flat.t())
     sqrsum = x.square().sum(dim=-1, keepdim=True)
     mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
 
@@ -106,11 +113,20 @@ def mhc_post_torch(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    mixed_residual = torch.einsum(
-        "...ij,...ih->...jh",
-        comb_res_mix.to(torch.float32),
-        residual.to(torch.float32),
-    )
+    import os
+    if os.environ.get("VLLM_SM80_MHC_BF16") == "1":
+        # bf16 tensor-core matmul with fp32 accumulation/output — replaces
+        # the fp32 einsum that lands on magma_sgemmEx (SM80 sim path).
+        mixed_residual = torch.matmul(
+            comb_res_mix.to(torch.bfloat16),
+            residual.to(torch.bfloat16),
+        ).to(torch.float32)
+    else:
+        mixed_residual = torch.einsum(
+            "...ij,...ih->...jh",
+            comb_res_mix.to(torch.float32),
+            residual.to(torch.float32),
+        )
     post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
     return (mixed_residual + post_term).to(residual.dtype)
 

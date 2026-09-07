@@ -1222,6 +1222,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        # [DIAG] VLLM_TORCH_PROF=<file>: torch CUDA profiler over this single
+        # forward (fires when token count == VLLM_TORCH_PROF_TOKENS, default
+        # 1 = any step; skipped during CUDA graph capture). Dumps kernel table.
+        _prof = None
+        _prof_tok = int(os.environ.get("VLLM_TORCH_PROF_TOKENS", "1"))
+        if (
+            os.environ.get("VLLM_TORCH_PROF")
+            and hidden_states.shape[0] <= _prof_tok
+            and not torch.cuda.is_current_stream_capturing()
+            and not getattr(self, "_torch_prof_done", False)
+        ):
+            self._torch_prof_done = True
+            import torch.profiler as _tp
+
+            _prof = _tp.profile(activities=[_tp.ProfilerActivity.CUDA])
+            _prof.__enter__()
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1259,6 +1275,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
+        if _prof is not None:
+            _prof.__exit__(None, None, None)
+            torch.cuda.synchronize()
+            _table = _prof.key_averages().table(
+                sort_by="cuda_time_total", row_limit=60
+            )
+            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            _path = os.environ["VLLM_TORCH_PROF"]
+            if _rank >= 0:
+                _path = _path.replace(".json", f".r{_rank}.json")
+            try:
+                with open(_path, "w") as _pf:
+                    _pf.write(_table)
+                print(f"[TORCHPROF] dumped {len(_table)}B to {_path}", flush=True)
+            except Exception as _pe:
+                print(f"[TORCHPROF] dump failed: {_pe}", flush=True)
+            # Always echo to stdout as a fallback (captured in server log).
+            print(f"[TORCHPROF-TABLE rank={_rank}]\n{_table}", flush=True)
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
