@@ -53,6 +53,10 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
 
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 def _fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -709,6 +713,141 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
 class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
     """Marlin-based fused MoE expert implementation."""
 
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        # ---- 夜8 T3: 冷专家卸载 (VLLM_MOE_COLD_OFFLOAD=1 开启, 默认关) ----
+        # 设计镜像 EMU 卸载 (ocp_mx_emulation_moe.py 夜4-6): 专家维收缩
+        # [hot_K + M] (热表重排 0..K-1, 冷槽 K..K+M-1); w1/w2/scale/zp/
+        # g_idx/sort_indices/bias 全部按专家维同步收缩; host 侧 pageable
+        # 冷权重; H2D 同步精确复制 (位级一致)。apply 侧仅重映射 topk_ids
+        # 到物理行 — fused_marlin_moe 调用路径不变。
+        import os as _os
+
+        self._off_enabled = _os.environ.get("VLLM_MOE_COLD_OFFLOAD", "0") == "1"
+        self._off_ready = False
+        self._off_hot_k = int(_os.environ.get("VLLM_MOE_HOT_K", "128"))
+        self._off_slots = int(_os.environ.get("VLLM_MOE_LRU_SLOTS", "32"))
+        self._off_host: dict[str, torch.Tensor] = {}   # 冷专家 host 副本 (按张量名)
+        self._off_cold_idx: torch.Tensor | None = None  # 逻辑冷 id -> 冷索引 (GPU)
+        self._off_slot_of: dict[int, int] = {}          # 逻辑 id -> 槽
+        self._off_slot_lru: list[int] = []              # 槽 LRU (最近在尾)
+        self._off_n_local: int = 0
+
+    def _off_phys_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """逻辑专家 id -> 物理行 (hot_pos 或 K+slot); 冷专家按需同步 H2D。"""
+        ids = topk_ids.contiguous()
+        cold = torch.full((self._off_n_local,), -1, dtype=torch.int32, device=ids.device)
+        # 本批需要的冷逻辑 id (CPU 侧)
+        uniq = ids.flatten().unique().tolist()
+        for eid in uniq:
+            if eid < 0 or eid < self._off_hot_k or eid >= self._off_n_local:
+                continue
+            slot = self._off_slot_of.get(eid)
+            if slot is None:
+                slot = self._off_acquire_slot(eid)
+            else:
+                self._off_touch_slot(slot)
+            cold[eid] = self._off_hot_k + slot
+        phys = torch.where(
+            (ids >= self._off_hot_k) & (ids < self._off_n_local), cold[ids], ids)
+        return phys
+
+    def _off_acquire_slot(self, eid: int) -> int:
+        used = set(self._off_slot_lru)
+        free = set(range(self._off_slots)) - used
+        if free:
+            slot = min(free)
+        else:
+            slot = self._off_slot_lru.pop(0)  # 淘汰最久未用
+            victim = next(k for k, v in self._off_slot_of.items() if v == slot)
+            del self._off_slot_of[victim]
+        self._off_slot_of[eid] = slot
+        self._off_slot_lru.append(slot)
+        # 同步 H2D (pageable 源, 精确复制; 冷行 = eid - (K+M))
+        cold_row = eid - (self._off_hot_k + self._off_slots)
+        row = self._off_hot_k + slot
+        for name, dev in self._off_dev_tensors.items():
+            if dev.shape[0] == self._off_hot_k + self._off_slots:  # 收缩后专家维
+                dev[row].copy_(self._off_host[name][cold_row], non_blocking=False)
+        return slot
+
+    def _off_touch_slot(self, slot: int) -> None:
+        if slot in self._off_slot_lru:
+            self._off_slot_lru.remove(slot)
+        self._off_slot_lru.append(slot)
+
+    def _off_setup(self, w1: torch.Tensor, w2: torch.Tensor) -> None:
+        """首 apply 时收缩专家维 (画像期, 与 EMU 首 apply setup 同机制)。"""
+        if self._off_ready:
+            return
+        E = w1.shape[0]
+        self._off_n_local = E
+        K = self._off_hot_k
+        M = self._off_slots
+        if K + M >= E:
+            logger.warning("VLLM_MOE_COLD_OFFLOAD: hot_K+slots >= n_local, 卸载关闭")
+            self._off_enabled = False
+            self._off_ready = True
+            return
+        n_cold = E - K - M
+        cold_ids = torch.arange(K + M, E)
+        self._off_cold_idx = cold_ids
+        tensors: dict[str, torch.Tensor] = {}
+        for name in ("w1", "w2"):
+            tensors[name] = w1 if name == "w1" else w2
+        for name in ("w1_scale", "w2_scale"):
+            t = getattr(self, name, None)
+            if t is not None and t.ndim >= 1:
+                tensors[name] = t
+        for name in ("w1_zp", "w2_zp", "w1_bias", "w2_bias", "w13_g_idx",
+                     "w2_g_idx", "w13_g_idx_sort_indices", "w2_g_idx_sort_indices"):
+            t = getattr(self, name, None)
+            if t is not None and isinstance(t, torch.Tensor) and t.shape[0] == E:
+                tensors[name] = t
+        self._off_dev_tensors = {}
+        _dbg = os.environ.get("VLLM_MOE_OFF_DEBUG")
+        for name, t in tensors.items():
+            host = t[K + M :].detach().to("cpu", non_blocking=False).clone()
+            self._off_host[name] = host
+            keep = t[: K + M].clone()
+            _old_storage = t.untyped_storage() if _dbg else None
+            t.data = keep  # 换绑原对象 (EMU 模式: 换副本无效 — 原 arg 仍持存储)
+            # view 父张量同步收缩 (reshape/stack 父持有完整存储, 只换 view 不释放)
+            base = getattr(t, "_base", None)
+            if base is not None and isinstance(base, torch.Tensor) and base.shape[0] >= E:
+                base.data = base[: K + M].clone()
+            self._off_dev_tensors[name] = t
+            if _dbg:
+                try:
+                    import gc as _gc
+                    refs = _gc.get_referrers(_old_storage)
+                    kinds: dict[str, int] = {}
+                    for _r in refs:
+                        _k = type(_r).__name__
+                        if _k in ("frame", "dict", "list"):
+                            continue
+                        kinds[_k] = kinds.get(_k, 0) + 1
+                    with open(_dbg, "a") as _f:
+                        _f.write(
+                            f"REFS {name} old_n={_old_storage.nbytes()/1e9:.3f}GB "
+                            f"kinds={kinds} alloc={torch.cuda.memory_allocated()/1e9:.2f}GB\n")
+                        _f.flush()
+                except Exception:
+                    pass
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()  # 逐张量归还 (分配器大块不复用的实证对策)
+        # w1/w2 是 apply 入参 — 同样收缩 (modular kernel 持有的即此对象)
+        w1.data = tensors["w1"].data
+        w2.data = tensors["w2"].data
+        if self.w1_scale is not None:
+            self.w1_scale.data = tensors["w1_scale"].data
+        if self.w2_scale is not None:
+            self.w2_scale.data = tensors["w2_scale"].data
+        self._off_ready = True
+        logger.warning("marlin offload setup: n_local=%d hot=%d slots=%d cold=%d",
+                       E, K, M, n_cold)
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
@@ -771,6 +910,10 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
 
         ctx = self._lora_context
         if ctx is None:
+            if self._off_enabled and not self._off_ready:
+                self._off_setup(w1, w2)
+            if self._off_enabled and self._off_ready:
+                topk_ids = self._off_phys_ids(topk_ids)
             fused_marlin_moe(
                 hidden_states=hidden_states,
                 w1=w1,
