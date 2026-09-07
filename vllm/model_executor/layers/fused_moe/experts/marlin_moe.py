@@ -778,6 +778,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
 
     def _off_setup(self, w1: torch.Tensor, w2: torch.Tensor) -> None:
         """首 apply 时收缩专家维 (画像期, 与 EMU 首 apply setup 同机制)。"""
+        import os as _os
         if self._off_ready:
             return
         E = w1.shape[0]
