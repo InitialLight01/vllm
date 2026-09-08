@@ -920,7 +920,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         from vllm.platforms import current_platform
-        _sm80 = current_platform.is_sm80_context() or not _has_tilelang_kernels
+        _force_tl = os.environ.get("VLLM_FORCE_TILELANG_MHC") == "1"
+        _sm80 = (not _force_tl) and (
+            current_platform.is_sm80_context() or not _has_tilelang_kernels
+        )
         _pre = mhc_pre_torch if _sm80 else mhc_pre_tilelang
         _fused = mhc_fused_post_pre_torch if _sm80 else mhc_fused_post_pre_tilelang
         _post = mhc_post_torch if _sm80 else mhc_post_tilelang
@@ -1204,7 +1207,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         from vllm.platforms import current_platform
-        _sm80_m = current_platform.is_sm80_context() or not _has_tilelang_kernels
+        _force_tl_m = os.environ.get("VLLM_FORCE_TILELANG_MHC") == "1"
+        _sm80_m = (not _force_tl_m) and (
+            current_platform.is_sm80_context() or not _has_tilelang_kernels
+        )
         _post_m = mhc_post_torch if _sm80_m else mhc_post_tilelang
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -1238,6 +1244,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
             _prof = _tp.profile(activities=[_tp.ProfilerActivity.CUDA])
             _prof.__enter__()
+        _timing_evts = None
+        if os.environ.get("VLLM_DUMP_TIMING"):
+            _timing_evts = []  # (start_evt, end_evt, idx)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1260,6 +1269,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         _f.write(_json.dumps(_stats) + "\n")
                 except Exception:
                     pass
+            if _timing_evts is not None and not torch.cuda.is_current_stream_capturing():
+                _e0 = torch.cuda.Event(enable_timing=True)
+                _e1 = torch.cuda.Event(enable_timing=True)
+                _e0.record()
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1268,6 +1281,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 res_mix,
                 residual,
             )
+            if _timing_evts is not None and not torch.cuda.is_current_stream_capturing():
+                _e1.record()
+                _timing_evts.append((_e0, _e1, idx))
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
                 aux_recon = _post_m(
@@ -1275,6 +1291,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
+        if _timing_evts is not None and _timing_evts and not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()
+            _cum: dict[str, float] = {}
+            for _e0, _e1, _idx in _timing_evts:
+                _ly = self.layers[_idx] if hasattr(self.layers, "__getitem__") else None
+                try:
+                    _ratio = getattr(_ly.attn, "compress_ratio", 0)
+                except Exception:
+                    _ratio = 0
+                _cat = "swa" if _ratio <= 1 else ("c4a" if _ratio == 4 else "c128a")
+                _cum[_cat] = _cum.get(_cat, 0.0) + _e0.elapsed_time(_e1)
+            _parts = " ".join(f"{k}={v:.1f}ms" for k, v in sorted(_cum.items()))
+            print(
+                f"[TIMING] rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else -1} "
+                f"tokens={hidden_states.shape[0]} {_parts}",
+                flush=True,
+            )
         if _prof is not None:
             _prof.__exit__(None, None, None)
             torch.cuda.synchronize()
@@ -1309,7 +1342,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        _hc_head = hc_head_fused_torch if (current_platform.is_sm80_context() or not _has_tilelang_kernels) else hc_head_fused_kernel_tilelang
+        _force_tl_h = os.environ.get("VLLM_FORCE_TILELANG_MHC") == "1"
+        _hc_head = hc_head_fused_torch if (
+            (not _force_tl_h)
+            and (current_platform.is_sm80_context() or not _has_tilelang_kernels)
+        ) else hc_head_fused_kernel_tilelang
         hidden_states = _hc_head(
             hidden_states,
             self.hc_head_fn,
