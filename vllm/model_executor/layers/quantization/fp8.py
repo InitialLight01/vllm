@@ -476,30 +476,41 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
             M, K = weight_fp8.shape
-            if scale_inv.dtype in (torch.float8_e8m0fnu, torch.uint8):
-                scale = _upcast_e8m0_to_fp32(scale_inv)
-            else:
-                scale = scale_inv.to(torch.float32)
-            # Broadcast from [M/blk_M, K/blk_K] → [M, K]
-            blk_M = self.weight_block_size[0] if self.weight_block_size else 128
-            blk_K = self.weight_block_size[1] if self.weight_block_size else 128
-            scale = scale.repeat_interleave(blk_M, dim=0).repeat_interleave(blk_K, dim=1)
-            scale = scale[:M, :K]
+
+            def _bcast_scale():
+                if scale_inv.dtype in (torch.float8_e8m0fnu, torch.uint8):
+                    s = _upcast_e8m0_to_fp32(scale_inv)
+                else:
+                    s = scale_inv.to(torch.float32)
+                # Broadcast from [M/blk_M, K/blk_K] → [M, K]
+                blk_M = self.weight_block_size[0] if self.weight_block_size else 128
+                blk_K = self.weight_block_size[1] if self.weight_block_size else 128
+                return s.repeat_interleave(blk_M, dim=0).repeat_interleave(
+                    blk_K, dim=1
+                )[:M, :K]
+
             # w_bf16 = w_fp8 * scale  (w_fp8 is stored as w_bf16 / scale,
             #  scale is the actual block multiplier, not its inverse despite
             #  the "weight_scale_inv" parameter name).
             # [PERF] VLLM_SM80_CACHE_WBF16=1: 权重反量化结果缓存 (仅依赖权重,
             #  不依赖 x) — 消除每层每 GEMM 的 ~5 个 elementwise (601/步 洪流)。
+            # v2 (2026-09-09 夜 T1): scale 广播 (repeat_interleave ~558 calls/
+            #  步 + upcast + slice) 原在缓存检查之前 — 移入计算分支, 缓存
+            #  命中路径零 scale 工作 (T1 实测 ~7.7ms/步, 占 decode CUDA 36%)。
             _wcache = None
             if os.environ.get("VLLM_SM80_CACHE_WBF16") == "1":
                 _wcache = getattr(layer, "_sm80_wbf16_cache", None)
                 if _wcache is not None and _wcache[0] is weight_fp8:
                     w_bf16 = _wcache[1]
                 else:
-                    w_bf16 = (weight_fp8.to(torch.float32) * scale).to(x.dtype)
+                    w_bf16 = (
+                        weight_fp8.to(torch.float32) * _bcast_scale()
+                    ).to(x.dtype)
                     layer._sm80_wbf16_cache = (weight_fp8, w_bf16)
             else:
-                w_bf16 = (weight_fp8.to(torch.float32) * scale).to(x.dtype)
+                w_bf16 = (
+                    weight_fp8.to(torch.float32) * _bcast_scale()
+                ).to(x.dtype)
         else:
             # Per-tensor FP8 (no block scales).
             weight_scale = getattr(layer, "weight_scale", None)
