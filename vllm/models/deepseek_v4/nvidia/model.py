@@ -1243,8 +1243,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             import torch.profiler as _tp
 
             _prof = _tp.profile(
-                activities=[_tp.ProfilerActivity.CUDA],
+                activities=[_tp.ProfilerActivity.CUDA, _tp.ProfilerActivity.CPU],
                 with_stack=True,
+                record_shapes=True,
                 experimental_config=_tp._ExperimentalConfig(verbose=True),
             )
             _prof.__enter__()
@@ -1326,6 +1327,26 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 with open(_path, "w") as _pf:
                     _pf.write(_table)
                 print(f"[TORCHPROF] dumped {len(_table)}B to {_path}", flush=True)
+                # [DIAG] CPU 侧算子表 (record_shapes): 用调用次数指纹归位 CUDA 洪流
+                _ka = _prof.key_averages()
+                _table_cpu = _ka.table(sort_by="cpu_time_total", row_limit=90)
+                with open(_path + ".cpu", "w") as _cf:
+                    _cf.write(_table_cpu)
+                print(f"[TORCHPROF] cpu table dumped to {_path}.cpu", flush=True)
+                # [DIAG] clone/repeat_interleave 的调用栈拆分 (key_averages
+                # 带 stack, 与 function_events 不同)
+                _cs = []
+                for _e in _ka:
+                    if "clone" in _e.key or "repeat_interleave" in _e.key:
+                        _fr = [
+                            f"{f.filename.split('/')[-1]}:{f.line}"
+                            for f in (_e.stack or [])
+                        ]
+                        _cs.append(
+                            f"{_e.key[:34]} cuda={_e.self_device_time_total/1000:.2f}ms "
+                            f"x{_e.count} @ {'|'.join(_fr[:3])}"
+                        )
+                print("[CLONESTACK]\n" + "\n".join(_cs[:10]), flush=True)
             except Exception as _pe:
                 print(f"[TORCHPROF] dump failed: {_pe}", flush=True)
             try:
