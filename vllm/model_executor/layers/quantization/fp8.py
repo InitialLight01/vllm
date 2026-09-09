@@ -488,7 +488,18 @@ class Fp8LinearMethod(LinearMethodBase):
             # w_bf16 = w_fp8 * scale  (w_fp8 is stored as w_bf16 / scale,
             #  scale is the actual block multiplier, not its inverse despite
             #  the "weight_scale_inv" parameter name).
-            w_bf16 = (weight_fp8.to(torch.float32) * scale).to(x.dtype)
+            # [PERF] VLLM_SM80_CACHE_WBF16=1: 权重反量化结果缓存 (仅依赖权重,
+            #  不依赖 x) — 消除每层每 GEMM 的 ~5 个 elementwise (601/步 洪流)。
+            _wcache = None
+            if os.environ.get("VLLM_SM80_CACHE_WBF16") == "1":
+                _wcache = getattr(layer, "_sm80_wbf16_cache", None)
+                if _wcache is not None and _wcache[0] is weight_fp8:
+                    w_bf16 = _wcache[1]
+                else:
+                    w_bf16 = (weight_fp8.to(torch.float32) * scale).to(x.dtype)
+                    layer._sm80_wbf16_cache = (weight_fp8, w_bf16)
+            else:
+                w_bf16 = (weight_fp8.to(torch.float32) * scale).to(x.dtype)
         else:
             # Per-tensor FP8 (no block scales).
             weight_scale = getattr(layer, "weight_scale", None)

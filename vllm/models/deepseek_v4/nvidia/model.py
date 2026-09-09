@@ -1242,7 +1242,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self._torch_prof_done = True
             import torch.profiler as _tp
 
-            _prof = _tp.profile(activities=[_tp.ProfilerActivity.CUDA])
+            _prof = _tp.profile(
+                activities=[_tp.ProfilerActivity.CUDA],
+                with_stack=True,
+                experimental_config=_tp._ExperimentalConfig(verbose=True),
+            )
             _prof.__enter__()
         _timing_evts = None
         if os.environ.get("VLLM_DUMP_TIMING"):
@@ -1322,6 +1326,33 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 with open(_path, "w") as _pf:
                     _pf.write(_table)
                 print(f"[TORCHPROF] dumped {len(_table)}B to {_path}", flush=True)
+            except Exception as _pe:
+                print(f"[TORCHPROF] dump failed: {_pe}", flush=True)
+            try:
+                # 洪流归位: 用 function_events 获取每个 kernel 的调用栈
+                _events = _prof.profiler.function_events
+                _agg = {}
+                for _e in _events:
+                    _n = _e.name
+                    if not any(k in _n for k in
+                               ("elementwise", "vectorized", "unrolled",
+                                "reduce_kernel")):
+                        continue
+                    _frames = []
+                    for _f in getattr(_e, "stack", []) or []:
+                        _frames.append(f"{_f.filename.split('/')[-1]}:{_f.line}")
+                    _key = f"{_n[:30]}@{'|'.join(_frames[:2])}"
+                    _a = _agg.setdefault(_key, [0.0, 0])
+                    _a[0] += _e.device_time
+                    _a[1] += 1
+                _stack_out = sorted(
+                    (f"{t/1000:.2f}ms x{c} {k}" for k, (t, c) in _agg.items()),
+                    key=lambda x: -float(x.split("ms")[0]),
+                )
+                print("[FLOODSTACK]\n" + "\n".join(_stack_out[:14]), flush=True)
+            except Exception as _pe:
+                import traceback
+                print(f"[FLOODSTACK] failed: {_pe}\n{traceback.format_exc()}", flush=True)
             except Exception as _pe:
                 print(f"[TORCHPROF] dump failed: {_pe}", flush=True)
             # Always echo to stdout as a fallback (captured in server log).
