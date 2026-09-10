@@ -1313,6 +1313,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 f"tokens={hidden_states.shape[0]} {_parts}",
                 flush=True,
             )
+            if os.environ.get("VLLM_DBG_AR_TIMING") == "1":
+                from vllm.distributed.communication_op import (
+                    ar_timing_snapshot_and_reset,
+                )
+
+                _snap = ar_timing_snapshot_and_reset()
+                if _snap:
+                    print(
+                        f"[AR] rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else -1} "
+                        f"calls={_snap[1]} elapsed={_snap[0]:.1f}ms bytes={_snap[2]}",
+                        flush=True,
+                    )
         if _prof is not None:
             _prof.__exit__(None, None, None)
             torch.cuda.synchronize()
