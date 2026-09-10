@@ -1333,6 +1333,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
             _path = os.environ["VLLM_TORCH_PROF"]
+            try:
+                # [DIAG] chrome trace (含 shapes + 调用点) — 洪流归位用
+                _trace_path = _path + ".trace.json"
+                _prof.export_chrome_trace(_trace_path)
+                print(f"[TORCHPROF] chrome trace dumped to {_trace_path}",
+                      flush=True)
+            except Exception:
+                pass
             if _rank >= 0:
                 _path = _path.replace(".json", f".r{_rank}.json")
             try:
