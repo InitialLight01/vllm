@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
 from typing import cast
 
@@ -251,6 +252,10 @@ class CustomAllreduce:
         IPC-registered. Otherwise, inp is first copied into a pre-registered
         buffer.
         """
+        # [DEBUG] VLLM_DEBUG_NO_ALLREDUCE=1: identity (归因实验专用,
+        # 破坏数值正确性, 不提交主干)
+        if os.environ.get("VLLM_DEBUG_NO_ALLREDUCE") == "1":
+            return inp
         if out is None:
             out = torch.empty_like(inp)
         if registered:

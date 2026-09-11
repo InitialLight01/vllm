@@ -300,6 +300,9 @@ class Step3p5MTPProposer(EagleProposer):
             and not getattr(self, "_spec_prof_done", False)
         ):
             self._spec_prof_done = True
+            print(
+                "[SPECPROF] starting propose profiler", flush=True
+            )
             import torch.profiler as _tp
 
             self._spec_prof = _tp.profile(
