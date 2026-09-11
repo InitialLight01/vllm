@@ -57,8 +57,30 @@ def _inv_rope_sm80_kernel(
         yf = y.to(tl.float32)
         cf = cos.to(tl.float32)
         sf = sin.to(tl.float32)
-        x_inv = xf * cf + yf * sf
-        y_inv = -xf * sf + yf * cf
+        # 逐位对齐 torch 链: 每个 mul/add 独立 IEEE RN 舍入 —
+        # inline asm 防编译器 FMA 融合 (fma ≠ 分开舍入, 近平分决策点
+        # 会翻转 greedy 选择, EXP-062 logits 对拍实证)
+        m1 = tl.inline_asm_elementwise(
+            "mul.rn.f32 $0, $1, $2;", "=r,r,r", [xf, cf],
+            dtype=tl.float32, is_pure=True, pack=1)
+        m2 = tl.inline_asm_elementwise(
+            "mul.rn.f32 $0, $1, $2;", "=r,r,r", [yf, sf],
+            dtype=tl.float32, is_pure=True, pack=1)
+        x_inv = tl.inline_asm_elementwise(
+            "add.rn.f32 $0, $1, $2;", "=r,r,r", [m1, m2],
+            dtype=tl.float32, is_pure=True, pack=1)
+        neg_x = tl.inline_asm_elementwise(
+            "neg.f32 $0, $1;", "=r,r", [xf],
+            dtype=tl.float32, is_pure=True, pack=1)
+        m3 = tl.inline_asm_elementwise(
+            "mul.rn.f32 $0, $1, $2;", "=r,r,r", [neg_x, sf],
+            dtype=tl.float32, is_pure=True, pack=1)
+        m4 = tl.inline_asm_elementwise(
+            "mul.rn.f32 $0, $1, $2;", "=r,r,r", [yf, cf],
+            dtype=tl.float32, is_pure=True, pack=1)
+        y_inv = tl.inline_asm_elementwise(
+            "add.rn.f32 $0, $1, $2;", "=r,r,r", [m3, m4],
+            dtype=tl.float32, is_pure=True, pack=1)
         # 输出 f32: nope 精确提升
         tl.store(out_ptr + base_out + off_n, nope.to(tl.float32), mask=n_mask)
         tl.store(out_ptr + base_out + nope_dim + off_p * 2, x_inv)
