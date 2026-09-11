@@ -498,6 +498,16 @@ def sparse_attn_decode(
 
     # cache shape → compute stride parameters
     main_cache = k_cache.squeeze(2)  # [num_blocks, block_size, head_bytes]
+    if not getattr(sparse_attn_decode, "_zc_dbg", False):
+        sparse_attn_decode._zc_dbg = True
+        print(
+            f"[ZC-DBG] env_zc={os.environ.get('VLLM_SM80_ZEROCOPY_KV')!r} "
+            f"env_cachewbf16={os.environ.get('VLLM_SM80_CACHE_WBF16')!r} "
+            f"env_force_sm80={os.environ.get('VLLM_FORCE_SM80')!r} "
+            f"k_shape={tuple(k_cache.shape)} k_stride={k_cache.stride()} "
+            f"k_contig={k_cache.is_contiguous()}",
+            flush=True,
+        )
     # [PERF] VLLM_SM80_ZEROCOPY_KV=1: 直传视图 + 真实 stride — 分页缓存
     # 视图可能含 block padding (非连续), 原 .contiguous() 每层物化整块
     # 缓存拷贝 (verify 相 85×74.5MB ≈ 12.9ms/步, EXP-071 夜 trace 实证).

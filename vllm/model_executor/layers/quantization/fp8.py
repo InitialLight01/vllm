@@ -464,6 +464,14 @@ class Fp8LinearMethod(LinearMethodBase):
         as well as the grouped BMM path used by ``wo_a`` in DeepSeek-V4
         attention (``is_bmm=True``).
         """
+        if not getattr(Fp8LinearMethod._apply_bf16_sm80, "_dbg_fired", False):
+            Fp8LinearMethod._apply_bf16_sm80._dbg_fired = True
+            print(
+                f"[BF16-SM80-DBG] entered _apply_bf16_sm80: "
+                f"force_sm80={os.environ.get('VLLM_FORCE_SM80')!r} "
+                f"cache_wbf16={os.environ.get('VLLM_SM80_CACHE_WBF16')!r}",
+                flush=True,
+            )
         # ---- dequantize weight -------------------------------------------------
         weight_fp8 = layer.weight  # float8_e4m3fn  [M, K]  (K,N for Marlin after
         #                                process_weights_after_loading swaps dims)
