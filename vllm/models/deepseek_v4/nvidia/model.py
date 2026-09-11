@@ -1173,6 +1173,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 self.hc_dim,
                 dtype=vllm_config.model_config.dtype,
             )
+            # [P4] draft-verify 复用: 每层输出的稳定缓冲 (capture 外分配,
+            # 与 _mtp_hidden_buffer 同模式). draft 阶段写 / verify 阶段读.
+            if os.environ.get("VLLM_SM80_VERIFY_REUSE") == "1":
+                # 缓存只需 spec 批 (1 + num_speculative_tokens) 行;
+                # max_num_batched_tokens 口径会 OOM (8192×43 层 = 11.5GB)
+                _spec_n = (
+                    vllm_config.speculative_config.num_speculative_tokens
+                    if vllm_config.speculative_config
+                    else 0
+                )
+                self._layer_cache = torch.empty(
+                    self.config.num_hidden_layers,
+                    _spec_n + 1,
+                    self.config.hidden_size,
+                    dtype=vllm_config.model_config.dtype,
+                )
+            else:
+                self._layer_cache = None
         else:
             self._mtp_hidden_buffer = None
 
@@ -1286,6 +1304,36 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 res_mix,
                 residual,
             )
+            # [P4] draft-verify 复用缓存写入 (env 门控; T≤5 = draft 阶段
+            # 启发式, E2 换 runner 传参正式区分). 稳定缓冲, capture 安全
+            # (copy_ 静态地址, 与 _mtp_hidden_buffer 同模式).
+            if (
+                self._layer_cache is not None
+                and hidden_states.shape[0] <= 5
+            ):
+                self._layer_cache[idx, : hidden_states.shape[0]].copy_(
+                    hidden_states.detach()
+                )
+            # [P4] 逐位探针: verify 阶段 (T=6) 对比缓存 vs 重算
+            if (
+                os.environ.get("VLLM_SM80_VERIFY_REUSE_DEBUG") == "1"
+                and hidden_states.shape[0] == 6
+                and self._layer_cache is not None
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                if not getattr(self, "_p4dbg_fired", False):
+                    self._p4dbg_fired = True
+                    print(
+                        f"[P4DBG-FIRED] layer={idx} shape={tuple(hidden_states.shape)}",
+                        flush=True,
+                    )
+                _d = (hidden_states[:5] - self._layer_cache[idx, :5]).abs().max()
+                _di = _d.item()
+                if _di > 0:
+                    print(
+                        f"[P4DBG] layer={idx} cache-vs-recompute max_abs={_di:.4e}",
+                        flush=True,
+                    )
             if _timing_evts is not None and not torch.cuda.is_current_stream_capturing():
                 _e1.record()
                 _timing_evts.append((_e0, _e1, idx))
