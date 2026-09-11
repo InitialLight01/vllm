@@ -1355,13 +1355,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 print(f"[TORCHPROF] cpu table dumped to {_path}.cpu", flush=True)
                 # [DIAG] clone/repeat_interleave 的调用栈拆分 (key_averages
                 # 带 stack, 与 function_events 不同)
+                def _fmt_frame(f):
+                    # torch 2.11 栈元素可能是字符串 (M1 树教训: 字符串安全)
+                    if isinstance(f, str):
+                        return f.split("/")[-1]
+                    return f"{f.filename.split('/')[-1]}:{f.line}"
+
                 _cs = []
                 for _e in _ka:
                     if "clone" in _e.key or "repeat_interleave" in _e.key:
-                        _fr = [
-                            f"{f.filename.split('/')[-1]}:{f.line}"
-                            for f in (_e.stack or [])
-                        ]
+                        _fr = [_fmt_frame(f) for f in (_e.stack or [])]
                         _cs.append(
                             f"{_e.key[:34]} cuda={_e.self_device_time_total/1000:.2f}ms "
                             f"x{_e.count} @ {'|'.join(_fr[:3])}"
@@ -1381,7 +1384,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         continue
                     _frames = []
                     for _f in getattr(_e, "stack", []) or []:
-                        _frames.append(f"{_f.filename.split('/')[-1]}:{_f.line}")
+                        if isinstance(_f, str):
+                            _frames.append(_f.split("/")[-1])
+                        else:
+                            _frames.append(
+                                f"{_f.filename.split('/')[-1]}:{_f.line}"
+                            )
                     _key = f"{_n[:30]}@{'|'.join(_frames[:2])}"
                     _a = _agg.setdefault(_key, [0.0, 0])
                     _a[0] += _e.device_time
