@@ -55,29 +55,42 @@ def _o_proj_bf16_sm80(
     assert rope_dim % 2 == 0
     assert cos_sin_cache.shape[-1] == rope_dim
 
-    # Inverse RoPE: follow the same pattern as fused_inv_rope_fp8_quant.
-    # cos_sin_cache layout: [max_pos, rope_dim], first half cos, second half sin.
-    # For GPT-J (interleaved pairs): pair (2i, 2i+1) shares one (cos, sin).
-    half_rope = rope_dim // 2
-    cos = cos_sin_cache[positions][:, :half_rope]   # [T, half_rope]
-    sin = cos_sin_cache[positions][:, half_rope:]   # [T, half_rope]
+    import os
 
-    nope_part = o[..., :nope_dim]                      # [T, H, nope]
-    rope_part = o[..., nope_dim:]                       # [T, H, rope]
-    # Reshape rope to pair format: [T, H, half_rope, 2]
-    rope_pairs = rope_part.reshape(num_tokens, num_heads, half_rope, 2)
-    # cos/sin: [T, 1, half_rope] — broadcast over heads, NOT [T, 1, R, 1]
-    # which would collide with x's token dim when broadcast (→ [T, T, H, R] OOM).
-    cos = cos.view(num_tokens, 1, half_rope)
-    sin = sin.view(num_tokens, 1, half_rope)
-    # Inverse RoPE (GPT-J interleaved): inv(x_2i, x_2i+1) =
-    #   (x_2i*cos + x_2i+1*sin,  -x_2i*sin + x_2i+1*cos)
-    x, y = rope_pairs[..., 0], rope_pairs[..., 1]
-    x_inv = x * cos + y * sin
-    y_inv = -x * sin + y * cos
-    rope_inv = torch.stack([x_inv, y_inv], dim=-1).reshape(num_tokens, num_heads, rope_dim)
+    if os.environ.get("VLLM_SM80_FUSED_INV_ROPE") == "1":
+        # [PERF] 融合逆 RoPE: 单 Triton kernel 替代 ~15 op 链
+        # (645 节点/步); 与 torch 链 1-ulp 级一致 (FMA), 精度闸验收
+        from vllm.models.deepseek_v4.nvidia.sm80_inv_rope import (
+            inv_rope_sm80,
+        )
 
-    o_full = torch.cat([nope_part, rope_inv], dim=-1)
+        o_full = inv_rope_sm80(
+            o, positions, cos_sin_cache, nope_dim, rope_dim
+        )
+    else:
+        # Inverse RoPE: follow the same pattern as fused_inv_rope_fp8_quant.
+        # cos_sin_cache layout: [max_pos, rope_dim], first half cos, second half sin.
+        # For GPT-J (interleaved pairs): pair (2i, 2i+1) shares one (cos, sin).
+        half_rope = rope_dim // 2
+        cos = cos_sin_cache[positions][:, :half_rope]   # [T, half_rope]
+        sin = cos_sin_cache[positions][:, half_rope:]   # [T, half_rope]
+
+        nope_part = o[..., :nope_dim]                      # [T, H, nope]
+        rope_part = o[..., nope_dim:]                       # [T, H, rope]
+        # Reshape rope to pair format: [T, H, half_rope, 2]
+        rope_pairs = rope_part.reshape(num_tokens, num_heads, half_rope, 2)
+        # cos/sin: [T, 1, half_rope] — broadcast over heads, NOT [T, 1, R, 1]
+        # which would collide with x's token dim when broadcast (→ [T, T, H, R] OOM).
+        cos = cos.view(num_tokens, 1, half_rope)
+        sin = sin.view(num_tokens, 1, half_rope)
+        # Inverse RoPE (GPT-J interleaved): inv(x_2i, x_2i+1) =
+        #   (x_2i*cos + x_2i+1*sin,  -x_2i*sin + x_2i+1*cos)
+        x, y = rope_pairs[..., 0], rope_pairs[..., 1]
+        x_inv = x * cos + y * sin
+        y_inv = -x * sin + y * cos
+        rope_inv = torch.stack([x_inv, y_inv], dim=-1).reshape(num_tokens, num_heads, rope_dim)
+
+        o_full = torch.cat([nope_part, rope_inv], dim=-1)
 
     from vllm.model_executor.layers.quantization.fp8 import (
         Fp8LinearMethod,
