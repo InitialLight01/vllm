@@ -15,6 +15,8 @@ hard-code ``_DIM_QK=576``.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -496,6 +498,12 @@ def sparse_attn_decode(
 
     # cache shape → compute stride parameters
     main_cache = k_cache.squeeze(2)  # [num_blocks, block_size, head_bytes]
+    # [PERF] VLLM_SM80_ZEROCOPY_KV=1: 直传视图 + 真实 stride — 分页缓存
+    # 视图可能含 block padding (非连续), 原 .contiguous() 每层物化整块
+    # 缓存拷贝 (verify 相 85×74.5MB ≈ 12.9ms/步, EXP-071 夜 trace 实证).
+    # 内核用裸指针 + stride0 手动索引 (block_ptr = ptr + idx*stride0),
+    # 直传语义等价 (最后维必连续, 否则 view 抛错由 except 兜底回退).
+    _zc_kv = os.environ.get("VLLM_SM80_ZEROCOPY_KV", "0") == "1"
     main_stride0 = main_cache.shape[1] * head_bytes  # block_size * head_bytes
     main_rows = main_cache.shape[0] * main_cache.shape[1]
     main_bs = main_cache.shape[1]
@@ -511,19 +519,33 @@ def sparse_attn_decode(
     BLOCK_H = min(16, triton.next_power_of_2(num_heads))
     BLOCK_K = 16
 
-    # Pass a 1D byte view for FP8, or as bf16 for BF16 cache
-    if is_bf16_cache:
-        main_cache_flat = main_cache.contiguous().view(torch.bfloat16).reshape(-1)
-        extra_cache_flat_u8 = None
-        if has_extra:
-            extra_cache_flat_u8 = extra_cache_flat.contiguous().view(torch.bfloat16).reshape(-1)
-    else:
-        main_cache_flat = main_cache.contiguous().view(torch.uint8).reshape(-1)
-        extra_cache_flat_u8 = None
+    if _zc_kv:
+        # 零拷贝: 直传视图 (无 contiguous/reshape), 真实块间 stride
+        _vt = torch.bfloat16 if is_bf16_cache else torch.uint8
+        try:
+            main_cache_flat = main_cache.view(_vt)
+            main_stride0 = main_cache_flat.stride(0)
+            if has_extra:
+                extra_cache_flat_u8 = extra_cache_flat.view(torch.uint8)
+                extra_stride0 = extra_cache_flat_u8.stride(0)
+            else:
+                extra_cache_flat_u8 = None
+        except Exception:  # noqa: BLE001 — 视图不可行则回退拷贝路径
+            _zc_kv = False
+    if not _zc_kv:
+        # Pass a 1D byte view for FP8, or as bf16 for BF16 cache
+        if is_bf16_cache:
+            main_cache_flat = main_cache.contiguous().view(torch.bfloat16).reshape(-1)
+            extra_cache_flat_u8 = None
+            if has_extra:
+                extra_cache_flat_u8 = extra_cache_flat.contiguous().view(torch.bfloat16).reshape(-1)
+        else:
+            main_cache_flat = main_cache.contiguous().view(torch.uint8).reshape(-1)
+            extra_cache_flat_u8 = None
+            if has_extra:
+                extra_cache_flat_u8 = extra_cache_flat.contiguous().view(torch.uint8).reshape(-1)
         if has_extra:
             extra_cache_flat_u8 = extra_cache_flat.contiguous().view(torch.uint8).reshape(-1)
-    if has_extra:
-        extra_cache_flat_u8 = extra_cache_flat.contiguous().view(torch.uint8).reshape(-1)
 
     grid = (D, triton.cdiv(num_heads, BLOCK_H))
     _decode_kernel[grid](
