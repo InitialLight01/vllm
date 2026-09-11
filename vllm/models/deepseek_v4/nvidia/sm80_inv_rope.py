@@ -24,8 +24,10 @@ def _inv_rope_sm80_kernel(
     nope_dim,
     rope_dim,
     cache_stride,
-    o_stride_t,      # token 维步长 = H*head_dim
-    o_stride_h,      # H 维步长 = head_dim
+    o_stride_t,      # 输入 token 维步长 (padded 视图下 ≠ H*head_dim)
+    o_stride_h,      # 输入 H 维步长
+    out_stride_t,    # 输出 token 维步长 (连续张量 = H*head_dim)
+    out_stride_h,    # 输出 H 维步长
     HALF_ROPE: tl.constexpr,
     IS_F32_CACHE: tl.constexpr,
     BLOCK_HEAD: tl.constexpr,
@@ -33,17 +35,18 @@ def _inv_rope_sm80_kernel(
     t = tl.program_id(0)
     h = tl.program_id(1)
 
-    base = t * o_stride_t + h * o_stride_h
+    base_in = t * o_stride_t + h * o_stride_h
+    base_out = t * out_stride_t + h * out_stride_h
     off_n = tl.arange(0, BLOCK_HEAD)
 
     # nope 段: [nope_dim] (非 2 幂, mask)
     n_mask = off_n < nope_dim
-    nope = tl.load(o_ptr + base + off_n, mask=n_mask, other=0.0)
+    nope = tl.load(o_ptr + base_in + off_n, mask=n_mask, other=0.0)
 
     # rope 段: 偶/奇分量
     off_p = tl.arange(0, HALF_ROPE)
-    x = tl.load(o_ptr + base + nope_dim + off_p * 2)
-    y = tl.load(o_ptr + base + nope_dim + off_p * 2 + 1)
+    x = tl.load(o_ptr + base_in + nope_dim + off_p * 2)
+    y = tl.load(o_ptr + base_in + nope_dim + off_p * 2 + 1)
 
     pos = tl.load(pos_ptr + t)
     cos = tl.load(cache_ptr + pos * cache_stride + off_p)
@@ -57,9 +60,9 @@ def _inv_rope_sm80_kernel(
         x_inv = xf * cf + yf * sf
         y_inv = -xf * sf + yf * cf
         # 输出 f32: nope 精确提升
-        tl.store(out_ptr + base + off_n, nope.to(tl.float32), mask=n_mask)
-        tl.store(out_ptr + base + nope_dim + off_p * 2, x_inv)
-        tl.store(out_ptr + base + nope_dim + off_p * 2 + 1, y_inv)
+        tl.store(out_ptr + base_out + off_n, nope.to(tl.float32), mask=n_mask)
+        tl.store(out_ptr + base_out + nope_dim + off_p * 2, x_inv)
+        tl.store(out_ptr + base_out + nope_dim + off_p * 2 + 1, y_inv)
     else:
         # bf16 逐 op 舍入对齐 (显式 .to 防 FMA 融合)
         xb = x.to(tl.bfloat16)
@@ -72,9 +75,9 @@ def _inv_rope_sm80_kernel(
         m3 = (-xb * sb).to(tl.bfloat16)
         m4 = (yb * cb).to(tl.bfloat16)
         y_inv = (m3 + m4).to(tl.bfloat16)
-        tl.store(out_ptr + base + off_n, nope, mask=n_mask)
-        tl.store(out_ptr + base + nope_dim + off_p * 2, x_inv)
-        tl.store(out_ptr + base + nope_dim + off_p * 2 + 1, y_inv)
+        tl.store(out_ptr + base_out + off_n, nope, mask=n_mask)
+        tl.store(out_ptr + base_out + nope_dim + off_p * 2, x_inv)
+        tl.store(out_ptr + base_out + nope_dim + off_p * 2 + 1, y_inv)
 
 
 def inv_rope_sm80(
@@ -108,6 +111,8 @@ def inv_rope_sm80(
         cos_sin_cache.stride(0),
         o.stride(-3),
         o.stride(-2),
+        out.stride(-3),
+        out.stride(-2),
         HALF_ROPE=half_rope,
         IS_F32_CACHE=is_f32,
         BLOCK_HEAD=triton.next_power_of_2(head_dim),

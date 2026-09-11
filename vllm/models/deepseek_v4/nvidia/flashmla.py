@@ -57,9 +57,15 @@ def _o_proj_bf16_sm80(
 
     import os
 
-    if os.environ.get("VLLM_SM80_FUSED_INV_ROPE") == "1":
+    if (
+        os.environ.get("VLLM_SM80_FUSED_INV_ROPE") == "1"
+        and num_tokens <= 8
+    ):
         # [PERF] 融合逆 RoPE: 单 Triton kernel 替代 ~15 op 链
-        # (645 节点/步); 与 torch 链 1-ulp 级一致 (FMA), 精度闸验收
+        # (645 节点/步); 与 torch 链 1-ulp 级一致 (FMA), 精度闸验收.
+        # 仅 decode 小批 (T≤8): 大 T (prefill/profile_run) 走原链 —
+        # 规避 tilelang profile_run 大形状编译崩溃 (EXP-061 受阻根因
+        # 区间定位).
         from vllm.models.deepseek_v4.nvidia.sm80_inv_rope import (
             inv_rope_sm80,
         )
@@ -67,6 +73,32 @@ def _o_proj_bf16_sm80(
         o_full = inv_rope_sm80(
             o, positions, cos_sin_cache, nope_dim, rope_dim
         )
+        if (
+            os.environ.get("VLLM_SM80_INV_ROPE_DEBUG") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            half_rope = rope_dim // 2
+            cos = cos_sin_cache[positions][:, :half_rope]
+            sin = cos_sin_cache[positions][:, half_rope:]
+            nope_part = o[..., :nope_dim]
+            rope_part = o[..., nope_dim:]
+            rope_pairs = rope_part.reshape(num_tokens, num_heads, half_rope, 2)
+            cos = cos.view(num_tokens, 1, half_rope)
+            sin = sin.view(num_tokens, 1, half_rope)
+            x, y = rope_pairs[..., 0], rope_pairs[..., 1]
+            x_inv = x * cos + y * sin
+            y_inv = -x * sin + y * cos
+            rope_inv = torch.stack([x_inv, y_inv], dim=-1).reshape(num_tokens, num_heads, rope_dim)
+            _ref_full = torch.cat([nope_part, rope_inv], dim=-1)
+            _diff = (o_full.float() - _ref_full.float()).abs().max().item()
+            print(
+                f"[INVROPE-DBG] T={num_tokens} H={num_heads} o_stride={o.stride()} "
+                f"o_contig={o.is_contiguous()} pos_dtype={positions.dtype} "
+                f"pos_max={positions.max().item()} cache_dtype={cos_sin_cache.dtype} "
+                f"cache_shape={tuple(cos_sin_cache.shape)} cache_stride={cos_sin_cache.stride()} "
+                f"max_diff={_diff:.4e}",
+                flush=True,
+            )
     else:
         # Inverse RoPE: follow the same pattern as fused_inv_rope_fp8_quant.
         # cos_sin_cache layout: [max_pos, rope_dim], first half cos, second half sin.
