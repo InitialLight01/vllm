@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from copy import copy
 
 import torch
@@ -289,6 +290,24 @@ class Step3p5MTPProposer(EagleProposer):
     ) -> torch.Tensor:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
+        # [DIAG] VLLM_SPEC_PROF=<path>: 单次 propose (draft 相全包: 首轮并行
+        # target 前向 + DSpark 草稿模型 + 逐 token 草稿前向 + 采样) torch
+        # profiler, 跳过 capture, 一次性 dump chrome trace + kernel 表。
+        self._spec_prof = None
+        if (
+            os.environ.get("VLLM_SPEC_PROF")
+            and not torch.cuda.is_current_stream_capturing()
+            and not getattr(self, "_spec_prof_done", False)
+        ):
+            self._spec_prof_done = True
+            import torch.profiler as _tp
+
+            self._spec_prof = _tp.profile(
+                activities=[_tp.ProfilerActivity.CUDA, _tp.ProfilerActivity.CPU],
+                with_stack=True,
+                record_shapes=True,
+            )
+            self._spec_prof.__enter__()
         batch_size = common_attn_metadata.batch_size()
 
         num_tokens, token_indices_to_sample, common_attn_metadata = (
@@ -458,4 +477,25 @@ class Step3p5MTPProposer(EagleProposer):
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
+        if self._spec_prof is not None:
+            self._spec_prof.__exit__(None, None, None)
+            torch.cuda.synchronize()
+            import json as _json
+
+            _table = self._spec_prof.key_averages().table(
+                sort_by="cuda_time_total", row_limit=80
+            )
+            try:
+                with open(os.environ["VLLM_SPEC_PROF"] + ".cpu", "w") as _pf:
+                    _pf.write(_table)
+                self._spec_prof.export_chrome_trace(
+                    os.environ["VLLM_SPEC_PROF"] + ".trace.json"
+                )
+                print(
+                    f"[SPECPROF] dumped to {os.environ['VLLM_SPEC_PROF']}",
+                    flush=True,
+                )
+            except Exception as _pe:  # noqa: BLE001
+                print(f"[SPECPROF] dump failed: {_pe}", flush=True)
+            self._spec_prof = None
         return draft_token_ids

@@ -1251,9 +1251,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # 1 = any step; skipped during CUDA graph capture). Dumps kernel table.
         _prof = None
         _prof_tok = int(os.environ.get("VLLM_TORCH_PROF_TOKENS", "1"))
+        # VLLM_TORCH_PROF_EXACT=1: 精确 token 数匹配 (T=6 抓 verify 相,
+        # 跳过 draft T=5; 默认 <= 宽松匹配)
+        _prof_exact = os.environ.get("VLLM_TORCH_PROF_EXACT") == "1"
+        _prof_tok_ok = (
+            (hidden_states.shape[0] == _prof_tok)
+            if _prof_exact
+            else (hidden_states.shape[0] <= _prof_tok)
+        )
         if (
             os.environ.get("VLLM_TORCH_PROF")
-            and hidden_states.shape[0] <= _prof_tok
+            and _prof_tok_ok
             and not torch.cuda.is_current_stream_capturing()
             and not getattr(self, "_torch_prof_done", False)
         ):
