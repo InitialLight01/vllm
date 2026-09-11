@@ -58,14 +58,16 @@ def _o_proj_bf16_sm80(
     import os
 
     if (
-        os.environ.get("VLLM_SM80_FUSED_INV_ROPE") == "1"
+        os.environ.get("VLLM_SM80_FUSED_INV_ROPE", "1") != "0"
         and num_tokens <= 8
     ):
         # [PERF] 融合逆 RoPE: 单 Triton kernel 替代 ~15 op 链
-        # (645 节点/步); 与 torch 链 1-ulp 级一致 (FMA), 精度闸验收.
-        # 仅 decode 小批 (T≤8): 大 T (prefill/profile_run) 走原链 —
-        # 规避 tilelang profile_run 大形状编译崩溃 (EXP-061 受阻根因
-        # 区间定位).
+        # (645 节点/步, -5.6ms/步, +9.4% 实测 130.3 tok/s). 逐位对齐
+        # (inline asm mul.rn/add.rn 防 FMA — 近平分点翻转教训).
+        # 精度闸 2026-09-11 全过: smoke30 分布无差异 + 50题 44/50=基线
+        # + 600q 489/600=81.50% 带内 (历史 FORCE 480) → 默认开启,
+        # VLLM_SM80_FUSED_INV_ROPE=0 可关。
+        # 仅 decode 小批 (T≤8): 大 T (prefill/profile_run) 走原链.
         from vllm.models.deepseek_v4.nvidia.sm80_inv_rope import (
             inv_rope_sm80,
         )
