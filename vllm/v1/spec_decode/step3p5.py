@@ -294,6 +294,13 @@ class Step3p5MTPProposer(EagleProposer):
         # target 前向 + DSpark 草稿模型 + 逐 token 草稿前向 + 采样) torch
         # profiler, 跳过 capture, 一次性 dump chrome trace + kernel 表。
         self._spec_prof = None
+        if not getattr(self, "_propose_dbg", False):
+            self._propose_dbg = True
+            print(
+                f"[PROPOSE-DBG] called. env={os.environ.get('VLLM_SPEC_PROF')!r} "
+                f"capturing={torch.cuda.is_current_stream_capturing()}",
+                flush=True,
+            )
         if (
             os.environ.get("VLLM_SPEC_PROF")
             and not torch.cuda.is_current_stream_capturing()
