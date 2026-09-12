@@ -498,22 +498,14 @@ def sparse_attn_decode(
 
     # cache shape → compute stride parameters
     main_cache = k_cache.squeeze(2)  # [num_blocks, block_size, head_bytes]
-    if not getattr(sparse_attn_decode, "_zc_dbg", False):
-        sparse_attn_decode._zc_dbg = True
-        print(
-            f"[ZC-DBG] env_zc={os.environ.get('VLLM_SM80_ZEROCOPY_KV')!r} "
-            f"env_cachewbf16={os.environ.get('VLLM_SM80_CACHE_WBF16')!r} "
-            f"env_force_sm80={os.environ.get('VLLM_FORCE_SM80')!r} "
-            f"k_shape={tuple(k_cache.shape)} k_stride={k_cache.stride()} "
-            f"k_contig={k_cache.is_contiguous()}",
-            flush=True,
-        )
-    # [PERF] VLLM_SM80_ZEROCOPY_KV=1: 直传视图 + 真实 stride — 分页缓存
-    # 视图可能含 block padding (非连续), 原 .contiguous() 每层物化整块
-    # 缓存拷贝 (verify 相 85×74.5MB ≈ 12.9ms/步, EXP-071 夜 trace 实证).
-    # 内核用裸指针 + stride0 手动索引 (block_ptr = ptr + idx*stride0),
-    # 直传语义等价 (最后维必连续, 否则 view 抛错由 except 兜底回退).
-    _zc_kv = os.environ.get("VLLM_SM80_ZEROCOPY_KV", "0") == "1"
+    # [PERF] 零拷贝 KV 直传 (默认开, VLLM_SM80_ZEROCOPY_KV=0 可关): 分页缓存
+    # 视图含 block padding (非连续), 原 .contiguous() 每层物化整块缓存拷贝
+    # (verify 相 85×74.5MB ≈ 12.9ms/步, EXP-071 夜 trace 实证). 内核用裸
+    # 指针 + stride0 手动索引 (block_ptr = ptr + idx*stride0), 直传语义等价
+    # (最后维必连续, 否则 view 抛错由 except 兜底回退). 交付 (EXP-072):
+    # 三级闸全过 — smoke30 21/30 差1 / 60q 50/60 差3 / 600q 488=81.3% 带内;
+    # STEADY 130.3→200.4 (+53.8%); A/B 对拍位级中性 (漂移=DSpark 采样方差).
+    _zc_kv = os.environ.get("VLLM_SM80_ZEROCOPY_KV", "1") != "0"
     main_stride0 = main_cache.shape[1] * head_bytes  # block_size * head_bytes
     main_rows = main_cache.shape[0] * main_cache.shape[1]
     main_bs = main_cache.shape[1]
