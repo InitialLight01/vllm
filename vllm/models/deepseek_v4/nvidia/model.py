@@ -1389,9 +1389,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
             _path = os.environ["VLLM_TORCH_PROF"]
-            # rank 后缀先行 — 双 rank 同路径会互相覆盖丢 trace (22:59 教训)
+            # rank 后缀先行 — 双 rank 同路径会互相覆盖丢 trace (22:59 教训;
+            # 注意路径可能无 ".json" 扩展名, replace 从未生效 → 改为直接拼接)
             if _rank >= 0:
-                _path = _path.replace(".json", f".r{_rank}.json")
+                _path = _path + f".r{_rank}"
             try:
                 # [DIAG] chrome trace (含 shapes + 调用点) — 洪流归位用
                 _trace_path = _path + ".trace.json"

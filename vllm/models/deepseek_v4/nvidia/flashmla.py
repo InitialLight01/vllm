@@ -60,6 +60,7 @@ def _o_proj_bf16_sm80(
     if (
         os.environ.get("VLLM_SM80_FUSED_INV_ROPE", "1") != "0"
         and num_tokens <= 8
+        and current_platform.is_sm80_context()
     ):
         # [PERF] 融合逆 RoPE: 单 Triton kernel 替代 ~15 op 链
         # (645 节点/步, -5.6ms/步, +9.4% 实测 130.3 tok/s). 逐位对齐
@@ -68,6 +69,9 @@ def _o_proj_bf16_sm80(
         # + 600q 489/600=81.50% 带内 (历史 FORCE 480) → 默认开启,
         # VLLM_SM80_FUSED_INV_ROPE=0 可关。
         # 仅 decode 小批 (T≤8): 大 T (prefill/profile_run) 走原链.
+        # 2026-09-12 EXP-073: 加 is_sm80_context() 门控 — 融合在 native
+        # sm120 下替换原生 fused_inv_rope_fp8_quant+fp8_einsum 快路径
+        # 反而 -12.2% (233.3 vs 265.7 tok/s 实测), 现仅 FORCE/SM80 生效。
         from vllm.models.deepseek_v4.nvidia.sm80_inv_rope import (
             inv_rope_sm80,
         )
