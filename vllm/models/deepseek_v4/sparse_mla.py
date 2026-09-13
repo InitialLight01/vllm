@@ -134,8 +134,7 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
 class DeepseekV4FlashMLAMetadataBuilder(
     AttentionMetadataBuilder[DeepseekV4FlashMLAMetadata]
 ):
-    # A800 实验 (2026-09-13): ALWAYS 解锁真 FULL (同 indexer/SWA 实验)。
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(
         self,
