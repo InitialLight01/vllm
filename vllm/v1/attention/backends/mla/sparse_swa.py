@@ -319,7 +319,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             # (nospec 实测, 交付态 12.8ms)。声明 UNIFORM_BATCH 恢复 FULL
             # (warning 降级 FULL_AND_PIECEWISE, decode 仍 FULL)。正确性由
             # smoke30/60q 验证, 分数崩 (<15/30) 即回退 NEVER。
-            return AttentionCGSupport.ALWAYS
+            return AttentionCGSupport.UNIFORM_BATCH
         return cls._cudagraph_support
 
     def __init__(self, *args, **kwargs):

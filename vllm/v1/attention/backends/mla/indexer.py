@@ -267,11 +267,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
-        # A800 实验 (2026-09-13): UNIFORM_BATCH 使 min_cg 无法达到 ALWAYS,
-        # FULL 被降级 FULL_AND_PIECEWISE -> DSpark propose 不在 FULL 图 ->
-        # 接受率 2.18 (SM120 FULL 下 5.4)。声明 ALWAYS 解锁真 FULL。
-        # 风险由 smoke30 闸验证 (单流 max-num-seqs=1 下 batch 结构固定)。
-        return AttentionCGSupport.ALWAYS
+        return AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
