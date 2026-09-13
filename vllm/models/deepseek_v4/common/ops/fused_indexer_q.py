@@ -294,6 +294,68 @@ def _fused_indexer_q_rope_mxfp4_kernel(
     )
 
 
+
+def _fused_indexer_q_rope_quant_torch(
+    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    index_q_cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
+    index_q_fp8: torch.Tensor,
+    index_weights_out: torch.Tensor,
+    fp8_max: float,
+) -> None:
+    """SM80 fallback: Triton on sm80 has no fp8e4nv (only fp8e4b15, and its
+    encoding differs: bias 15 vs 7). Pure-torch path reproduces the Triton
+    kernel semantics bit-exactly: the quant scale is a power of two, so the
+    div_rn is exact and torch's RN ops match Triton's.
+
+    Semantics copied from _fused_indexer_q_rope_quant_kernel:
+      - GPT-J interleaved RoPE on the last 2*half dims; nope prefix untouched
+      - rot values: fp32 -> bf16 -> fp32 (reference numerics)
+      - amax over [nope(f32), r_even, r_odd(bf16-rounded)]
+      - scale = exp2(ceil(log2(div_rn(max(amax,1e-4), fp8_max))))  (power of 2)
+      - q_fp8 = (x / scale).to(fp8e4m3fn)   (saturating cast; |x/scale|<=fp8_max)
+      - weights_out = weights * scale * softmax_scale * head_scale
+    """
+    assert not use_fnuz  # fnuz is AMD-only
+    half = index_q_cos_sin_cache.shape[-1] // 2
+    head_dim = index_q.shape[-1]
+    nope = head_dim - 2 * half
+    T, H = index_q.shape[0], index_q.shape[1]
+
+    cos_sin = index_q_cos_sin_cache[positions]  # (T, 2*half)
+    cos = cos_sin[:, :half].float()             # (T, half)
+    sin = cos_sin[:, half:].float()
+
+    q = index_q.float()                         # (T, H, head_dim)
+    q_rot = q[:, :, nope:]                      # (T, H, 2*half)
+    even = q_rot[..., 0::2]                     # (T, H, half)
+    odd = q_rot[..., 1::2]
+    r_even = (even * cos[:, None, :] - odd * sin[:, None, :]).to(torch.bfloat16).float()
+    r_odd = (odd * cos[:, None, :] + even * sin[:, None, :]).to(torch.bfloat16).float()
+
+    amax = torch.maximum(r_even.abs().amax(dim=-1), r_odd.abs().amax(dim=-1))
+    if nope > 0:
+        x_nope = q[:, :, :nope]
+        amax = torch.maximum(amax, x_nope.abs().amax(dim=-1))
+    s = torch.clamp(amax, min=1e-4) / fp8_max
+    s = torch.exp2(torch.ceil(torch.log2(s)))   # power of two -> division exact
+
+    fp8_dtype = index_q_fp8.dtype
+    if nope > 0:
+        index_q_fp8[:, :, :nope] = (q[:, :, :nope] / s[..., None]).to(fp8_dtype)
+    out_rot = torch.empty_like(q_rot)
+    out_rot[..., 0::2] = r_even / s[..., None]
+    out_rot[..., 1::2] = r_odd / s[..., None]
+    index_q_fp8[:, :, nope:] = out_rot.to(fp8_dtype)
+
+    index_weights_out.copy_(
+        index_weights.float() * s * index_weights_softmax_scale * index_weights_head_scale
+    )
+
+
 def fused_indexer_q_rope_quant(
     positions: torch.Tensor,
     index_q: torch.Tensor,
@@ -432,7 +494,23 @@ def fused_indexer_q_rope_quant(
             index_weights_out,
         )
     else:
-        _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
+        if current_platform.is_sm80_context():
+            # A800 sm80: Triton lacks fp8e4nv (fp8e4b15 encodes differently);
+            # torch fallback reproduces kernel semantics (power-of-two scale
+            # keeps the division exact, so the fp8 cast is bit-identical).
+            _fused_indexer_q_rope_quant_torch(
+                positions,
+                index_q,
+                index_q_cos_sin_cache,
+                index_weights,
+                index_weights_softmax_scale,
+                index_weights_head_scale,
+                index_q_fp8,
+                index_weights_out,
+                fp8_max,
+            )
+        else:
+            _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
             positions,
             index_q,
             index_q.stride(0),
