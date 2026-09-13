@@ -18,6 +18,7 @@ Ported from codex/ds4-sm120-min-enable (LLMDeploySpeed commits f4b5be183d +
 import os
 
 import torch
+from vllm.models.deepseek_v4.common.ops.fp8_emu import u8_e4m3fn_to_f32
 import triton
 import triton.language as tl
 
@@ -65,7 +66,8 @@ def _paged_mqa_logits_kernel(
     k = tl.load(
         kv_base + (tok0 + offs_n[:, None]) * D + offs_d[None, :],
         mask=tok_valid[:, None], other=0,
-    ).to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+    )
+    k = u8_e4m3fn_to_f32(k).to(tl.bfloat16)
 
     scale_base = kv_f32_ptr + page * (page_stride_bytes // 4) + BLOCK_SIZE * D // 4
     k_scale = tl.load(scale_base + tok0 + offs_n, mask=tok_valid, other=0.0)
