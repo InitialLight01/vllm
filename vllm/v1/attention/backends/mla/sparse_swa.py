@@ -313,7 +313,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             getattr(kv_cache_spec, "model_version", None) == "deepseek_v4"
             and is_triton_sparse_mla_enabled_for_platform()
         ):
-            return AttentionCGSupport.NEVER
+            # A800 实验 (2026-09-13): H2A 在 SM120 上判 NEVER (Triton sparse MLA
+            # metadata 不含图捕获所需结构), 但该判据未经 sm80 实机验证。A800 上
+            # NEVER 锁死全部 FULL 系 cudagraph -> PIECEWISE -> 步长 158ms
+            # (nospec 实测, 交付态 12.8ms)。声明 UNIFORM_BATCH 恢复 FULL
+            # (warning 降级 FULL_AND_PIECEWISE, decode 仍 FULL)。正确性由
+            # smoke30/60q 验证, 分数崩 (<15/30) 即回退 NEVER。
+            return AttentionCGSupport.UNIFORM_BATCH
         return cls._cudagraph_support
 
     def __init__(self, *args, **kwargs):
