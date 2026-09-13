@@ -358,7 +358,7 @@ def fused_indexer_q_rope_quant(
             dtype=torch.uint8,
             device=index_q.device,
         )
-        if has_cutedsl():
+        if has_cutedsl() and not current_platform.is_sm80_context():  # A800 sm80: cutedsl 4.5.x 不支持 sm80 目标 (FP8 cvt 需 sm89+), 走 Triton
             # lazily import, otherwise some tests fail due to CUDA driver init failure.
             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
                 fused_indexer_q_rope_quant_mxfp4_cutedsl,
@@ -415,7 +415,7 @@ def fused_indexer_q_rope_quant(
     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
     fp8_max = 224.0 if use_fnuz else 448.0
     index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
-    if has_cutedsl():
+    if has_cutedsl() and not current_platform.is_sm80_context():  # A800 sm80: 同上, Triton fallback
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
             fused_indexer_q_rope_quant_fp8_cutedsl,
