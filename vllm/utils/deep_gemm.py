@@ -507,7 +507,10 @@ def fp8_fp4_mqa_topk_indices(
     """Write SM120 FP8 MQA top-k indices without materializing full logits."""
     if not (
         current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
+        and (
+            current_platform.is_device_capability_family(120)
+            or current_platform.is_sm80_context()
+        )
         and q[1] is None
     ):
         return False
@@ -570,7 +573,10 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
-    if current_platform.is_device_capability_family(120) and q[1] is None:
+    if (
+        current_platform.is_device_capability_family(120)
+        or current_platform.is_sm80_context()
+    ) and q[1] is None:
         return _fp8_mqa_logits_sm12x(
             q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
         )
@@ -635,7 +641,10 @@ def fp8_fp4_paged_mqa_topk_indices(
     """Write SM120 FP8 paged MQA top-k indices without full logits."""
     if not (
         current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
+        and (
+            current_platform.is_device_capability_family(120)
+            or current_platform.is_sm80_context()
+        )
         and q[1] is None
     ):
         return False
@@ -691,7 +700,10 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
-    if current_platform.is_device_capability_family(120) and q[1] is None:
+    if (
+        current_platform.is_device_capability_family(120)
+        or current_platform.is_sm80_context()
+    ) and q[1] is None:
         return _fp8_paged_mqa_logits_sm12x(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
         )
