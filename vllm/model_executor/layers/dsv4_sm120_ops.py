@@ -18,6 +18,7 @@ Ported from codex/ds4-sm120-min-enable (LLMDeploySpeed commits f4b5be183d +
 import os
 
 import torch
+from vllm.platforms import current_platform
 from vllm.models.deepseek_v4.common.ops.fp8_emu import u8_e4m3fn_to_f32
 import triton
 import triton.language as tl
@@ -116,6 +117,10 @@ def fp8_paged_mqa_logits_triton(
     q3 = q.reshape(R, H, D)
     if not q3.is_contiguous():
         q3 = q3.contiguous()
+    if current_platform.is_sm80_context():
+        # SM80: Triton has no fp8e4nv tensor param support; decode Q on host
+        # (bit-exact fp8->f32->bf16, same rounding as the in-kernel path).
+        q3 = q3.to(torch.bfloat16)
     w = weights[:R]
     if not w.is_contiguous():
         w = w.contiguous()
