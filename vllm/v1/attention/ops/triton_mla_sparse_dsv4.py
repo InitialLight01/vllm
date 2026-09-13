@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 
 import torch
+from vllm.models.deepseek_v4.common.ops.fp8_emu import u8_e4m3fn_to_f32
 import triton
 import triton.language as tl
 
@@ -261,7 +262,7 @@ def _decode_kernel(
         else:
             x_uint8 = tl.load(token_data[:, None] + nope_offsets[None, :],
                               mask=valid[:, None] & nope_mask[None, :], other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_fp8 = u8_e4m3fn_to_f32(x_uint8)
             scale_ptr = block_ptr + BLOCK_SIZE * TOKEN_STRIDE + pos_in_block * SCALE_DIM
             encoded = tl.load(scale_ptr[:, None] + nope_offsets[None, :] // 64,
                               mask=valid[:, None] & nope_mask[None, :], other=127)
@@ -312,7 +313,7 @@ def _decode_kernel(
 
             x_uint8 = tl.load(token_data[:, None] + nope_offsets[None, :],
                               mask=valid[:, None] & nope_mask[None, :], other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_fp8 = u8_e4m3fn_to_f32(x_uint8)
             # extra cache uses the SAME fp8_ds_mla block layout as the main
             # cache (scales live in a per-block region AFTER the data
             # region) — the old inline-scale formula read garbage scales

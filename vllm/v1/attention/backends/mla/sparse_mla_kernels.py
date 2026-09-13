@@ -7,6 +7,7 @@ import math
 import torch
 
 from vllm.triton_utils import LOG2E, LOGE2, tl, triton
+from vllm.models.deepseek_v4.common.ops.fp8_emu import u8_e4m3fn_to_f32
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     triton_sparse_mla_head_block_size,
 )
@@ -1607,6 +1608,7 @@ def _accumulate_fp8ds_global_slots_attention_chunk_kernel(
     candidate_offset,
     scale: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    USE_SW_FP8: tl.constexpr = False,
 ):
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -1658,8 +1660,11 @@ def _accumulate_fp8ds_global_slots_attention_chunk_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
+            if USE_SW_FP8:
+                x_float = u8_e4m3fn_to_f32(x_uint8)
+            else:
+                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                x_float = x_fp8.to(tl.float32)
             scale_offsets = offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -1765,7 +1770,8 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk(
         candidate_offset,
         scale,
         BLOCK_D=block_d,
-        # num_warps / num_stages supplied by @triton.autotune above.
+        # num_warps / num_stages supplied by @triton.autotune above.,
+        USE_SW_FP8=use_sw_fp8,
     )
 
 
@@ -1801,7 +1807,10 @@ def _accumulate_fp8ds_global_slots_attention_chunk_multihead_kernel(
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    USE_SW_FP8: tl.constexpr = False,
 ):
+
+    use_sw_fp8 = torch.cuda.get_device_capability()[0] == 8  # A800 sm80: 软件 fp8 解码
     token_idx = tl.program_id(0)
     head_block_idx = tl.program_id(1)
     head_offsets = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
@@ -1870,8 +1879,11 @@ def _accumulate_fp8ds_global_slots_attention_chunk_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
+            if USE_SW_FP8:
+                x_float = u8_e4m3fn_to_f32(x_uint8)
+            else:
+                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                x_float = x_fp8.to(tl.float32)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -1984,6 +1996,7 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
         HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
         num_warps=8,
+        USE_SW_FP8=use_sw_fp8,
     )
 
 
@@ -2027,7 +2040,10 @@ def _accumulate_fp8ds_paged_attention_chunk_kernel(
     candidate_offset,
     scale: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    USE_SW_FP8: tl.constexpr = False,
 ):
+
+    use_sw_fp8 = torch.cuda.get_device_capability()[0] == 8  # A800 sm80: 软件 fp8 解码
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
     offsets = tl.arange(0, BLOCK_D)
@@ -2078,8 +2094,11 @@ def _accumulate_fp8ds_paged_attention_chunk_kernel(
         )
 
         x_uint8 = tl.load(token_data_ptr + offsets, mask=fp8_mask, other=0)
-        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        x_float = x_fp8.to(tl.float32)
+        if USE_SW_FP8:
+            x_float = u8_e4m3fn_to_f32(x_uint8)
+        else:
+            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_float = x_fp8.to(tl.float32)
         scale_offsets = offsets // quant_block
         encoded_scale = tl.load(
             token_scale_ptr + scale_offsets,
@@ -2184,7 +2203,8 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk(
         candidate_offset,
         scale,
         BLOCK_D=block_d,
-        # num_warps / num_stages supplied by @triton.autotune above.
+        # num_warps / num_stages supplied by @triton.autotune above.,
+        USE_SW_FP8=use_sw_fp8,
     )
 
 
@@ -2220,7 +2240,10 @@ def _accumulate_fp8ds_paged_attention_chunk_multihead_kernel(
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    USE_SW_FP8: tl.constexpr = False,
 ):
+
+    use_sw_fp8 = torch.cuda.get_device_capability()[0] == 8  # A800 sm80: 软件 fp8 解码
     token_idx = tl.program_id(0)
     head_block_idx = tl.program_id(1)
     head_offsets = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
@@ -2289,8 +2312,11 @@ def _accumulate_fp8ds_paged_attention_chunk_multihead_kernel(
         )
 
         x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        x_float = x_fp8.to(tl.float32)
+        if USE_SW_FP8:
+            x_float = u8_e4m3fn_to_f32(x_uint8)
+        else:
+            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_float = x_fp8.to(tl.float32)
         scale_offsets = dim_offsets // quant_block
         encoded_scale = tl.load(
             token_scale_ptr + scale_offsets,
@@ -2402,6 +2428,7 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
         HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
         num_warps=8,
+        USE_SW_FP8=use_sw_fp8,
     )
 
 
@@ -2434,7 +2461,10 @@ def _fp8ds_paged_attention_with_sink_multihead_kernel(
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    USE_SW_FP8: tl.constexpr = False,
 ):
+
+    use_sw_fp8 = torch.cuda.get_device_capability()[0] == 8  # A800 sm80: 软件 fp8 解码
     token_idx = tl.program_id(0)
     head_block_idx = tl.program_id(1)
     head_offsets = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
@@ -2490,8 +2520,11 @@ def _fp8ds_paged_attention_with_sink_multihead_kernel(
         )
 
         x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        x_float = x_fp8.to(tl.float32)
+        if USE_SW_FP8:
+            x_float = u8_e4m3fn_to_f32(x_uint8)
+        else:
+            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_float = x_fp8.to(tl.float32)
         scale_offsets = dim_offsets // quant_block
         encoded_scale = tl.load(
             token_scale_ptr + scale_offsets,
@@ -2619,6 +2652,7 @@ def fp8ds_paged_sparse_mla_attention_with_sink_multihead(
         HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
         num_warps=8,
+        USE_SW_FP8=use_sw_fp8,
     )
 
 
@@ -2658,7 +2692,10 @@ def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    USE_SW_FP8: tl.constexpr = False,
 ):
+
+    use_sw_fp8 = torch.cuda.get_device_capability()[0] == 8  # A800 sm80: 软件 fp8 解码
     token_idx = tl.program_id(0)
     head_block_idx = tl.program_id(1)
     head_offsets = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
@@ -2704,8 +2741,11 @@ def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
+            if USE_SW_FP8:
+                x_float = u8_e4m3fn_to_f32(x_uint8)
+            else:
+                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                x_float = x_fp8.to(tl.float32)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -2755,8 +2795,11 @@ def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
+            if USE_SW_FP8:
+                x_float = u8_e4m3fn_to_f32(x_uint8)
+            else:
+                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                x_float = x_fp8.to(tl.float32)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -2902,6 +2945,7 @@ def fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
         HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
         num_warps=8,
+        USE_SW_FP8=use_sw_fp8,
     )
 
 
@@ -2926,6 +2970,8 @@ def _finish_attention_state_kernel(
     head_dim: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
+
+    use_sw_fp8 = torch.cuda.get_device_capability()[0] == 8  # A800 sm80: 软件 fp8 解码
     token_head = tl.program_id(0)
     block_d = tl.program_id(1)
     token_idx = token_head // num_heads

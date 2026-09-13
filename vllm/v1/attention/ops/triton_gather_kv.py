@@ -1,6 +1,7 @@
 """Triton kernel: gather KV cache entries (FP8 NOPE + BF16 ROPE) to BF16."""
 import torch
 import triton
+from vllm.models.deepseek_v4.common.ops.fp8_emu import u8_e4m3fn_to_f32
 import triton.language as tl
 
 NOPE_DIM = 448
@@ -57,7 +58,7 @@ def _gather_kv_kernel(
     for g in range(7):
         fp8_off = data_off + g * 64 + nope_offs
         fp8_bytes = tl.load(cache_ptr + fp8_off, mask=valid, other=0)
-        fp8_vals = fp8_bytes.to(tl.float8e4nv, bitcast=True)
+        fp8_vals = u8_e4m3fn_to_f32(fp8_bytes)
 
         scale_byte = tl.load(cache_ptr + scale_base + g, mask=valid, other=127)
         scale_val = tl.exp2(scale_byte.to(tl.float32) - 127.0)

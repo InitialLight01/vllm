@@ -22,6 +22,7 @@ and N_QUANT_BLOCKS ue8m0 bytes.
 from typing import Any
 
 import torch
+from vllm.models.deepseek_v4.common.ops.fp8_emu import f32_to_e4m3fn_u8
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
