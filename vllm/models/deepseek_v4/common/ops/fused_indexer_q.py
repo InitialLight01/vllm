@@ -319,7 +319,6 @@ def _fused_indexer_q_rope_quant_torch(
       - q_fp8 = (x / scale).to(fp8e4m3fn)   (saturating cast; |x/scale|<=fp8_max)
       - weights_out = weights * scale * softmax_scale * head_scale
     """
-    assert not use_fnuz  # fnuz is AMD-only
     half = index_q_cos_sin_cache.shape[-1] // 2
     head_dim = index_q.shape[-1]
     nope = head_dim - 2 * half
