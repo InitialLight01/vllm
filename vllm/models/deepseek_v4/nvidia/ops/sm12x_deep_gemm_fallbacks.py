@@ -401,7 +401,10 @@ def fp8_fp4_mqa_topk_indices(
     """Write SM120 FP8 MQA top-k indices without materializing full logits."""
     if not (
         current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
+        and (
+            current_platform.is_device_capability_family(120)
+            or current_platform.is_sm80_context()
+        )
         and q[1] is None
     ):
         return False
@@ -575,7 +578,10 @@ def fp8_fp4_paged_mqa_topk_indices(
     q_values, q_scale = q
     if not (
         current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
+        and (
+            current_platform.is_device_capability_family(120)
+            or current_platform.is_sm80_context()
+        )
         and q_scale is None
         and q_values.dim() == 4
         and kv_cache.dtype == torch.uint8
