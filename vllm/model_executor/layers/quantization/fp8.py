@@ -512,12 +512,28 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_fp8.to(torch.float32) * _bcast_scale()
                 ).to(x.dtype)
         else:
-            # Per-tensor FP8 (no block scales).
-            weight_scale = getattr(layer, "weight_scale", None)
-            if weight_scale is not None and weight_scale.numel() == 1:
-                w_bf16 = (weight_fp8.to(torch.float32) * weight_scale.to(torch.float32)).to(x.dtype)
+            # Per-tensor FP8 (no block scales). Same w_bf16 cache as the
+            # block-wise branch (v2 pattern) — per-tensor layers (e.g. wo_b)
+            # previously re-dequantized every step (43-86 elementwise/step,
+            # part of the 4.6ms fp8.py replay cost).
+            _wcache = None
+            if os.environ.get("VLLM_SM80_CACHE_WBF16") == "1":
+                _wcache = getattr(layer, "_sm80_wbf16_cache", None)
+                if _wcache is not None and _wcache[0] is weight_fp8:
+                    w_bf16 = _wcache[1]
+                else:
+                    weight_scale = getattr(layer, "weight_scale", None)
+                    if weight_scale is not None and weight_scale.numel() == 1:
+                        w_bf16 = (weight_fp8.to(torch.float32) * weight_scale.to(torch.float32)).to(x.dtype)
+                    else:
+                        w_bf16 = weight_fp8.to(x.dtype)
+                    layer._sm80_wbf16_cache = (weight_fp8, w_bf16)
             else:
-                w_bf16 = weight_fp8.to(x.dtype)
+                weight_scale = getattr(layer, "weight_scale", None)
+                if weight_scale is not None and weight_scale.numel() == 1:
+                    w_bf16 = (weight_fp8.to(torch.float32) * weight_scale.to(torch.float32)).to(x.dtype)
+                else:
+                    w_bf16 = weight_fp8.to(x.dtype)
 
         # ---- quantize activation like the SM120 native FP8 path --------------
         # SM120's Fp8BlockScaledMMLinearKernel quantizes activations to FP8
