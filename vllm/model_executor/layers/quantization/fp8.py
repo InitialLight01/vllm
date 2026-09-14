@@ -468,6 +468,23 @@ class Fp8LinearMethod(LinearMethodBase):
         weight_fp8 = layer.weight  # float8_e4m3fn  [M, K]  (K,N for Marlin after
         #                                process_weights_after_loading swaps dims)
         scale_inv = getattr(layer, "weight_scale_inv", None)
+        # [DIAG] VLLM_SM80_DUMP_WCACHE: 缓存命中/未命中计数, 进程退出时打印一次
+        if os.environ.get("VLLM_SM80_DUMP_WCACHE") and not getattr(
+            self, "_wc_diag_printed", False
+        ):
+            try:
+                self._wc_hits = getattr(self, "_wc_hits", 0)
+                self._wc_misses = getattr(self, "_wc_misses", 0)
+                self._wc_n = getattr(self, "_wc_n", 0) + 1
+                if self._wc_n % 500 == 0:
+                    import sys
+                    sys.stderr.write(
+                        f"[WCACHE] n={self._wc_n} hits={self._wc_hits} "
+                        f"misses={self._wc_misses}\n"
+                    )
+                    sys.stderr.flush()
+            except Exception:
+                pass
 
         if scale_inv is not None:
             # Block-wise FP8 with UE8M0 scales (common in DeepSeek-V4 / DSv3).
@@ -502,11 +519,15 @@ class Fp8LinearMethod(LinearMethodBase):
                 _wcache = getattr(layer, "_sm80_wbf16_cache", None)
                 if _wcache is not None and _wcache[0] is weight_fp8:
                     w_bf16 = _wcache[1]
+                    if os.environ.get("VLLM_SM80_DUMP_WCACHE"):
+                        self._wc_hits = getattr(self, "_wc_hits", 0) + 1
                 else:
                     w_bf16 = (
                         weight_fp8.to(torch.float32) * _bcast_scale()
                     ).to(x.dtype)
                     layer._sm80_wbf16_cache = (weight_fp8, w_bf16)
+                    if os.environ.get("VLLM_SM80_DUMP_WCACHE"):
+                        self._wc_misses = getattr(self, "_wc_misses", 0) + 1
             else:
                 w_bf16 = (
                     weight_fp8.to(torch.float32) * _bcast_scale()
