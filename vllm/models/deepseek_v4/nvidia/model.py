@@ -1259,22 +1259,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if _prof_exact
             else (hidden_states.shape[0] <= _prof_tok)
         )
+        # VLLM_TORCH_PROF_SKIP=N: 跳过前 N 个匹配前向再抓 (第 N+1 个 = 缓存全热)
+        _prof_skip = int(os.environ.get("VLLM_TORCH_PROF_SKIP", "0"))
         if (
             os.environ.get("VLLM_TORCH_PROF")
             and _prof_tok_ok
             and not torch.cuda.is_current_stream_capturing()
             and not getattr(self, "_torch_prof_done", False)
         ):
-            self._torch_prof_done = True
-            import torch.profiler as _tp
+            _cnt = getattr(self, "_torch_prof_count", 0)
+            self._torch_prof_count = _cnt + 1
+            if _cnt >= _prof_skip:
+                self._torch_prof_done = True
+                import torch.profiler as _tp
 
-            _prof = _tp.profile(
-                activities=[_tp.ProfilerActivity.CUDA, _tp.ProfilerActivity.CPU],
-                with_stack=True,
-                record_shapes=True,
-                experimental_config=_tp._ExperimentalConfig(verbose=True),
-            )
-            _prof.__enter__()
+                _prof = _tp.profile(
+                    activities=[_tp.ProfilerActivity.CUDA, _tp.ProfilerActivity.CPU],
+                    with_stack=True,
+                    record_shapes=True,
+                    experimental_config=_tp._ExperimentalConfig(verbose=True),
+                )
+                _prof.__enter__()
         _timing_evts = None
         if os.environ.get("VLLM_DUMP_TIMING"):
             _timing_evts = []  # (start_evt, end_evt, idx)
