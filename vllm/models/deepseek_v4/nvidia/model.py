@@ -1226,10 +1226,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     ) -> torch.Tensor | IntermediateTensors:
         from vllm.platforms import current_platform
         _force_tl_m = os.environ.get("VLLM_FORCE_TILELANG_MHC") == "1"
-        _sm80_m = (not _force_tl_m) and (
-            current_platform.is_sm80_context() or not _has_tilelang_kernels
-        )
-        _post_m = mhc_post_torch if _sm80_m else mhc_post_tilelang
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1239,6 +1235,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+        _sm80_m = (not _force_tl_m) and (
+            current_platform.is_sm80_context() or not _has_tilelang_kernels
+        )
+        _post_m = mhc_post_torch if _sm80_m else mhc_post_tilelang
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
@@ -1280,6 +1280,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     experimental_config=_tp._ExperimentalConfig(verbose=True),
                 )
                 _prof.__enter__()
+        # [DIAG] VLLM_FWD_COUNT=1: per-forward census. FULL cudagraph replay
+        # never re-runs Python, so all lines come from capture/warmup — the
+        # call structure mirrors the replay structure.
+        if os.environ.get("VLLM_FWD_COUNT") == "1":
+            _fc = getattr(self, "_fwd_cnt", 0) + 1
+            self._fwd_cnt = _fc
+            print(
+                f"[FWDCNT-TGT] n={_fc} tokens={hidden_states.shape[0]} "
+                f"layers={self.start_layer}:{self.end_layer} "
+                f"capturing={torch.cuda.is_current_stream_capturing()}",
+                flush=True,
+            )
         _timing_evts = None
         if os.environ.get("VLLM_DUMP_TIMING"):
             _timing_evts = []  # (start_evt, end_evt, idx)

@@ -487,6 +487,8 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        _probe = os.environ.get("VLLM_STEP_PROBE") == "1"
+        _w0 = time.perf_counter() if _probe else 0.0
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
@@ -504,6 +506,17 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+
+        if _probe:
+            _n = getattr(self, "_step_probe_cnt", 0)
+            self._step_probe_cnt = _n + 1
+            if _n % 8 == 0:
+                logger.info(
+                    "[STEPWALL] total=%.2fms ntoks=%d nreqs=%d",
+                    (time.perf_counter() - _w0) * 1000,
+                    scheduler_output.total_num_scheduled_tokens,
+                    len(scheduler_output.num_scheduled_tokens),
+                )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -1301,12 +1314,23 @@ class EngineCoreProc(EngineCore):
         """Called only when there are unfinished local requests."""
 
         # Step the engine core.
+        _probe = os.environ.get("VLLM_STEP_PROBE") == "1"
+        _w0 = time.perf_counter() if _probe else 0.0
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
+        if _probe:
+            _n = getattr(self, "_step_probe_cnt", 0)
+            self._step_probe_cnt = _n + 1
+            if _n % 8 == 0:
+                logger.info(
+                    "[STEPWALL] total=%.2fms executed=%d",
+                    (time.perf_counter() - _w0) * 1000,
+                    int(model_executed),
+                )
 
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield

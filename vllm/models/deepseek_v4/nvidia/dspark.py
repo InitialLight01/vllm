@@ -537,6 +537,16 @@ class DSparkDeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # [DIAG] VLLM_FWD_COUNT=1: draft-backbone forward census (capture-time).
+        if os.environ.get("VLLM_FWD_COUNT") == "1":
+            _fc = getattr(self, "_fwd_cnt", 0) + 1
+            self._fwd_cnt = _fc
+            print(
+                f"[FWDCNT-DRAFT] n={_fc} tokens={input_ids.shape[0]} "
+                f"layers={len(self.layers)} "
+                f"capturing={torch.cuda.is_current_stream_capturing()}",
+                flush=True,
+            )
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).

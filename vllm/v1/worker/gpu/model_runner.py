@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -1284,6 +1285,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # Run model.
+        _probe = os.environ.get("VLLM_STEP_PROBE") == "1"
+        if _probe:
+            _w0 = time.perf_counter()
+            _ev0 = torch.cuda.Event(enable_timing=True)
+            _ev0.record()
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1291,6 +1297,55 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            # [CAPTURE-TIMING] 首次 run_fullgraph 内含图捕获；捕获期记录的
+            # 每层事件在此 flush（捕获结束、sync 合法）。事件池在 model
+            # __init__ 预分配（capture 内创建事件非法，06:02 教训）。
+            if _probe:
+                _m = getattr(self.model, "model", None)
+                _pend = (
+                    getattr(_m, "_pending_capture_evts", None)
+                    if _m is not None
+                    else None
+                )
+                if _pend:
+                    # 捕获期记录的事件只在【重放】时更新时间戳（CUDA 语义：
+                    # capture 内事件记录成为图节点）→ 第一次 FULL 调用=捕获
+                    # （时间戳无效），第二次=重放，其后 flush 才有效。
+                    _seen = getattr(self, "_cap_flush_seen", 0) + 1
+                    self._cap_flush_seen = _seen
+                    if _seen >= 2:
+                        _m._pending_capture_evts = None
+                        try:
+                            torch.cuda.synchronize()
+                            _cum3: dict[str, float] = {}
+                            for _e0, _e1, _idx in _pend:
+                                _ly = _m.layers[_idx]
+                                try:
+                                    _ratio = getattr(_ly.attn, "compress_ratio", 0)
+                                except Exception:
+                                    _ratio = 0
+                                _cat = (
+                                    "swa"
+                                    if _ratio <= 1
+                                    else ("c4a" if _ratio == 4 else "c128a")
+                                )
+                                _cum3[_cat] = _cum3.get(_cat, 0.0) + _e0.elapsed_time(_e1)
+                            _ptok = getattr(_m, "_pending_capture_tokens", -1)
+                            _parts3 = " ".join(
+                                f"{k}={v:.1f}ms" for k, v in sorted(_cum3.items())
+                            )
+                            logger.info(
+                                "[TIMING-CAPTURE] tokens=%d total=%.2fms %s",
+                                _ptok,
+                                sum(_cum3.values()),
+                                _parts3,
+                            )
+                        except Exception as _pe:
+                            logger.info(
+                                "[TIMING-CAPTURE-FAIL] %s (pending=%d)",
+                                _pe,
+                                len(_pend) if _pend is not None else -1,
+                            )
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1322,6 +1377,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        if _probe:
+            _ev1 = torch.cuda.Event(enable_timing=True)
+            _ev1.record()
+            _n = getattr(self, "_step_probe_cnt", 0)
+            self._step_probe_cnt = _n + 1
+            if _n % 8 == 0:
+                _ev1.synchronize()
+                _rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else -1
+                )
+                _d0, _d1 = getattr(self, "_probe_draft_evts", (None, None))
+                _draft_ms = -1.0
+                if _d0 is not None and _d1 is not None:
+                    _draft_ms = _d0.elapsed_time(_d1)
+                logger.info(
+                    "[MDLWALL] rank=%d wall=%.2fms gpu=%.2fms draft_gpu=%.2fms "
+                    "mode=%s ntoks=%d",
+                    _rank,
+                    (time.perf_counter() - _w0) * 1000,
+                    _ev0.elapsed_time(_ev1),
+                    _draft_ms,
+                    batch_desc.cg_mode,
+                    batch_desc.num_tokens,
+                )
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1463,6 +1545,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            _probe = os.environ.get("VLLM_STEP_PROBE") == "1"
+            if _probe:
+                _ev_d0 = torch.cuda.Event(enable_timing=True)
+                _ev_d0.record()
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1478,6 +1564,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if _probe:
+                _ev_d1 = torch.cuda.Event(enable_timing=True)
+                _ev_d1.record()
+                self._probe_draft_evts = (_ev_d0, _ev_d1)
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

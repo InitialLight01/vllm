@@ -7,6 +7,8 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
+from vllm.models.deepseek_v4.common.ops.fp8_emu import f32_to_e4m3fn_u8
+
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
 
@@ -171,6 +173,102 @@ def _fused_indexer_q_rope_quant_kernel(
     # apply per-token Q scale inline. See the MXFP4 kernel below for the
     # contrasting convention (scales live with the Q values, weights are NOT
     # q-scaled).
+    index_weights = tl.load(
+        index_weights_ptr + tok_idx * index_weights_stride + head_idx
+    )
+    index_weights = index_weights.to(tl.float32)
+    index_weights *= index_q_scale
+    index_weights *= index_weights_softmax_scale
+    index_weights *= index_weights_head_scale
+    tl.store(
+        index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
+        index_weights,
+    )
+
+
+@triton.jit
+def _fused_indexer_q_rope_quant_kernel_sm80(
+    pos_ptr,
+    # Index Q RoPE
+    index_q_ptr,
+    index_q_stride0,
+    index_q_stride1,
+    index_q_cos_sin_ptr,
+    index_q_cos_sin_stride,
+    INDEX_Q_HALF_ROT_DIM: tl.constexpr,
+    # Index Q Quantize — 输出以 uint8 视图传入: sm80 无原生 fp8e4nv,
+    # 用 fp8_emu 位级编码 (e4m3fn, 与 torch cast 位级一致) 后按字节存
+    index_q_u8_ptr,
+    index_q_u8_stride0,
+    index_q_u8_stride1,
+    INDEX_Q_HEAD_DIM: tl.constexpr,
+    # Index weights
+    index_weights_ptr,
+    index_weights_stride,
+    index_weights_softmax_scale,
+    index_weights_head_scale,
+    index_weights_out_ptr,
+    index_weights_out_stride,
+    FP8_MAX: tl.constexpr = 448.0,
+):
+    """[EXP-A800-014 §5] sm80 融合版: 与 SM120 内核逐语义一致
+    (GPT-J interleaved RoPE + 参考数值 bf16 往返 + power-of-two scale),
+    仅 fp8 存储换成 emu 编码的 uint8 写。目的: 消除 torch 回退链的
+    252 次拷贝/前向 (copy 链 57% 归属)。
+    """
+    INDEX_Q_ROT_DIM: tl.constexpr = 2 * INDEX_Q_HALF_ROT_DIM
+    INDEX_Q_NOPE_DIM: tl.constexpr = INDEX_Q_HEAD_DIM - INDEX_Q_ROT_DIM
+    tl.static_assert(INDEX_Q_NOPE_DIM >= 0)
+
+    tok_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    pos = tl.load(pos_ptr + tok_idx)
+    cos, sin = _get_cos_sin(
+        index_q_cos_sin_ptr,
+        index_q_cos_sin_stride,
+        pos,
+        INDEX_Q_HALF_ROT_DIM,
+    )
+    half_offset = tl.arange(0, INDEX_Q_HALF_ROT_DIM)
+    base_ptr = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
+
+    rot_base = base_ptr + INDEX_Q_NOPE_DIM
+    x_even = tl.load(rot_base + half_offset * 2).to(tl.float32)
+    x_odd = tl.load(rot_base + half_offset * 2 + 1).to(tl.float32)
+    r_even = x_even * cos - x_odd * sin
+    r_odd = x_odd * cos + x_even * sin
+
+    # Match reference numerics: fp32 → bf16 → fp32 before the ue8m0 absmax.
+    r_even = r_even.to(tl.bfloat16).to(tl.float32)
+    r_odd = r_odd.to(tl.bfloat16).to(tl.float32)
+
+    amax = tl.maximum(tl.max(tl.abs(r_even)), tl.max(tl.abs(r_odd)))
+    if INDEX_Q_NOPE_DIM > 0:
+        nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
+        x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
+        amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
+    index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), FP8_MAX)
+    index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
+
+    u8_base_ptr = (
+        index_q_u8_ptr + tok_idx * index_q_u8_stride0 + head_idx * index_q_u8_stride1
+    )
+    if INDEX_Q_NOPE_DIM > 0:
+        tl.store(
+            u8_base_ptr + nope_offset,
+            f32_to_e4m3fn_u8(tl.div_rn(x_nope, index_q_scale)),
+        )
+    u8_rot_base = u8_base_ptr + INDEX_Q_NOPE_DIM
+    tl.store(
+        u8_rot_base + half_offset * 2,
+        f32_to_e4m3fn_u8(tl.div_rn(r_even, index_q_scale)),
+    )
+    tl.store(
+        u8_rot_base + half_offset * 2 + 1,
+        f32_to_e4m3fn_u8(tl.div_rn(r_odd, index_q_scale)),
+    )
+
     index_weights = tl.load(
         index_weights_ptr + tok_idx * index_weights_stride + head_idx
     )
@@ -494,19 +592,31 @@ def fused_indexer_q_rope_quant(
         )
     else:
         if current_platform.is_sm80_context():
-            # A800 sm80: Triton lacks fp8e4nv (fp8e4b15 encodes differently);
-            # torch fallback reproduces kernel semantics (power-of-two scale
-            # keeps the division exact, so the fp8 cast is bit-identical).
-            _fused_indexer_q_rope_quant_torch(
+            # [EXP-A800-014 §5] sm80 融合内核: 消除 torch 回退链的 252 次
+            # 拷贝/前向 (copy 链 57%)。fp8 存储 = fp8_emu 位级编码后按
+            # uint8 视图写 (与 torch cast 位级一致, 对拍验证)。
+            _fused_indexer_q_rope_quant_kernel_sm80[
+                (num_tokens, num_index_q_heads)
+            ](
                 positions,
                 index_q,
+                index_q.stride(0),
+                index_q.stride(1),
                 index_q_cos_sin_cache,
+                index_q_cos_sin_cache.stride(0),
+                index_q_cos_sin_cache.shape[-1] // 2,
+                index_q_fp8.view(torch.uint8),
+                index_q_fp8.stride(0),
+                index_q_fp8.stride(1),
+                index_q_head_dim,
                 index_weights,
+                index_weights.stride(0),
                 index_weights_softmax_scale,
                 index_weights_head_scale,
-                index_q_fp8,
                 index_weights_out,
-                fp8_max,
+                index_weights_out.stride(0),
+                FP8_MAX=fp8_max,
+                num_warps=1,
             )
         else:
             _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
