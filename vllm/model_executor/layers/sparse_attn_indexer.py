@@ -49,6 +49,20 @@ SM120_SHORT_ROW_TOPK_MAX_WIDTH = 12288
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
+# EXP-078 诊断 dump 共享模块 (fused dump 位于 common/ops/fused_indexer_q.py,
+# 两者共用一个 fused counter 以对齐层与文件)
+from vllm.utils import indexer_diag as diag  # noqa: E402
+
+# EXP-078 F1: decode 复用问题 token 的 topk (env 门控, 实验性)
+# 证据: 问题 token (prefill 路径) 检索正确, 答案 token (decode 路径) 每步
+# 重打分漂移向干扰 needle → 标题写错。复用 = 跳过 decode 打分, 全答案
+# token 共享问题 token 的 topk (spec 草稿步共享同源设计)。
+_REUSE_TOPK: dict[str, torch.Tensor] = {}
+
+
+def _reuse_enabled() -> bool:
+    return os.getenv("VLLM_INDEXER_DECODE_REUSE") == "1"
+
 
 def _assert_cutedsl_dcp_merge_supported(
     logits: torch.Tensor,
@@ -504,7 +518,7 @@ def sparse_attn_indexer(
                     q_slice_cast = q_slice
                     k_quant_cast = k_quant
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-                if not current_platform.is_xpu() and fp8_fp4_mqa_topk_indices(
+                if not current_platform.is_xpu() and not diag.enabled() and fp8_fp4_mqa_topk_indices(
                     (q_slice_cast, q_scale_slice),
                     (k_quant_cast, k_scale_cast),
                     weights[chunk.token_start : chunk.token_end],
@@ -559,6 +573,44 @@ def sparse_attn_indexer(
                         row_starts=chunk.cu_seqlen_ks,
                     )
 
+            # EXP-078: 仅抓 问题 token (请求末 token, 其行覆盖整个上下文:
+            # cu_seqlen_ke[-1] == total_seq_lens) 的 prefill 打分输入/输出
+            if (
+                chunk.token_end == num_tokens
+                and chunk.total_seq_lens > 20000
+                and int(chunk.cu_seqlen_ke[-1].item()) == chunk.total_seq_lens
+            ):
+                if _reuse_enabled():
+                    _REUSE_TOPK[k_cache_prefix] = topk_indices[-1].clone()
+            if (
+                diag.enabled()
+                and chunk.token_end == num_tokens
+                and chunk.total_seq_lens > 20000
+                and int(chunk.cu_seqlen_ke[-1].item()) == chunk.total_seq_lens
+            ):
+                diag.save(
+                    k_cache_prefix,
+                    "prefill",
+                    {
+                        "k_quant": k_quant[: chunk.total_seq_lens].detach().cpu(),
+                        "k_scale": k_scale[: chunk.total_seq_lens].detach().cpu(),
+                        "q_quant_last": q_slice[-1:].detach().cpu(),
+                        "weights_last": weights[chunk.token_start : chunk.token_end][
+                            -1:
+                        ]
+                        .detach()
+                        .cpu(),
+                        "logits_last": logits[-1:].detach().cpu(),
+                        "topk_last": topk_indices[-1:].detach().cpu(),
+                        "cu_seqlen_ks": chunk.cu_seqlen_ks.detach().cpu(),
+                        "cu_seqlen_ke": chunk.cu_seqlen_ke.detach().cpu(),
+                        "token_end": chunk.token_end,
+                        "num_tokens": num_tokens,
+                        "fused_counter": diag.fused_counter(),
+                    },
+                    logger=logger,
+                )
+
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -611,6 +663,8 @@ def sparse_attn_indexer(
             else padded_q_quant_decode_tokens
         )
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        # EXP-078 F1: decode 复用问题 token 的 topk — 跳过重打分
+        reuse_hit = _reuse_enabled() and k_cache_prefix in _REUSE_TOPK
         logits_width = _decode_topk_logits_width(
             max_model_len, attn_metadata_narrowed.max_seq_len, topk_tokens
         )
@@ -618,6 +672,7 @@ def sparse_attn_indexer(
         used_direct_topk = False
         if (
             not current_platform.is_xpu()
+            and not reuse_hit
             and logits_bytes > sparse_indexer_max_logits_bytes()
         ):
             used_direct_topk = fp8_fp4_paged_mqa_topk_indices(
@@ -628,7 +683,9 @@ def sparse_attn_indexer(
                 decode_metadata.block_table,
                 logits_width,
             )
-        if not used_direct_topk:
+        if reuse_hit:
+            topk_indices[:] = _REUSE_TOPK[k_cache_prefix]
+        if not used_direct_topk and not reuse_hit:
             if current_platform.is_xpu():
                 if padded_q_scale is not None:
                     raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
@@ -741,6 +798,29 @@ def sparse_attn_indexer(
                     dcp_rank,
                     dcp_world_size,
                     cp_kv_cache_interleave_size,
+                )
+
+            # EXP-078: 答案 token 的 decode 检索抓取 (前 30 步/层);
+            # logits 行序 = 压缩槽位序, 与 prefill 抓取的 gathered K 同序,
+            # 分析侧复用 prefill k_quant/k_scale
+            if (
+                diag.enabled()
+                and not torch.cuda.is_current_stream_capturing()
+                and batch_size == 1
+                and not used_direct_topk
+                and not reuse_hit
+                and diag.decode_ok(k_cache_prefix)
+            ):
+                diag.save(
+                    k_cache_prefix,
+                    "decode",
+                    {
+                        "logits_last": logits[-1:].detach().cpu(),
+                        "topk_last": topk_indices[-1:].detach().cpu(),
+                        "seq_lens": decode_metadata.seq_lens.detach().cpu(),
+                        "fused_counter": diag.fused_counter(),
+                    },
+                    logger=logger,
                 )
 
         if decode_metadata.requires_padding:

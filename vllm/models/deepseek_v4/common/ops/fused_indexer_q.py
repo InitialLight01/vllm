@@ -406,6 +406,24 @@ def fused_indexer_q_rope_quant(
         # from (T, H, 1) to (T, H) to match DeepGEMM's expected q_sf rank
         # (prefill wants 2-D (seq_len, num_heads); decode reshapes this to
         # 3-D (batch, next_n, num_heads)).
+        from vllm.utils import indexer_diag as diag
+        if diag.enabled() and not torch.cuda.is_current_stream_capturing():
+            diag.save(
+                "fused", "fused",
+                {
+                    "q_last": index_q[-1:].detach().cpu(),
+                    "q_quant_last": index_q_packed[-1:].detach().cpu(),
+                    "cos_sin_last": index_q_cos_sin_cache[
+                        positions[-1] : positions[-1] + 1
+                    ].detach().cpu(),
+                    "weights_raw_last": index_weights[-1:].detach().cpu(),
+                    "weights_out_last": index_weights_out[-1:].detach().cpu(),
+                    "pos_last": positions[-1:].detach().cpu(),
+                    "softmax_scale": index_weights_softmax_scale,
+                    "head_scale": index_weights_head_scale,
+                    "use_fp4": True,
+                },
+            )
         return (
             index_q_packed,
             index_q_scale.view(torch.int32).squeeze(-1),
@@ -453,5 +471,24 @@ def fused_indexer_q_rope_quant(
             FP8_MAX=fp8_max,
             USE_FNUZ=use_fnuz,
             # num_warps supplied by @triton.autotune above.
+        )
+    from vllm.utils import indexer_diag as diag
+    if diag.enabled() and not torch.cuda.is_current_stream_capturing():
+        # 末 token 切片 (问题 token 是请求末 token), 供离线对比 bf16-Q 打分
+        diag.save(
+            "fused", "fused",
+            {
+                "q_last": index_q[-1:].detach().cpu(),
+                "q_quant_last": index_q_fp8[-1:].detach().cpu(),
+                "cos_sin_last": index_q_cos_sin_cache[
+                    positions[-1] : positions[-1] + 1
+                ].detach().cpu(),
+                "weights_raw_last": index_weights[-1:].detach().cpu(),
+                "weights_out_last": index_weights_out[-1:].detach().cpu(),
+                "pos_last": positions[-1:].detach().cpu(),
+                "softmax_scale": index_weights_softmax_scale,
+                "head_scale": index_weights_head_scale,
+                "use_fp4": False,
+            },
         )
     return index_q_fp8, index_weights_out
